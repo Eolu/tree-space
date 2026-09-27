@@ -1,0 +1,184 @@
+# tree-space configuration
+#
+# Written automatically on first launch. Edit freely - the file is reloaded on
+# the next start. Every section and key is optional; anything omitted falls back
+# to a default value.
+
+# ── Startup ──────────────────────────────────────────────────────────────────
+# Where the panel opens when launched without a path argument. One of:
+#   "home"  - always open the home directory (the default)
+#   "last"  - reopen the last-used directory
+#   { path = "/some/dir" }  - always open that directory (a leading ~ = $HOME)
+startup = "home"
+
+# ── Panel ────────────────────────────────────────────────────────────────────
+[panel]
+side = "left"        # screen edge to dock to: "left" | "right"
+layer = "bottom"     # stacking layer: "background" | "bottom" | "top" | "overlay"
+width = 300          # panel width in px (clamped to 160–2000)
+margin = 0           # gap from the screen edge in px (clamped to 0–200)
+
+# ── Tree ─────────────────────────────────────────────────────────────────────
+[tree]
+dirs_first = true     # list directories above files
+sort_key = "name"     # primary sort: "name" | "size" | "modified" | "type"
+sort_ascending = true # sort ascending (A→Z) rather than descending
+show_hidden = false   # shww dotfiles by default
+font_size = 13        # row label size in pt (clamped to 6–40)
+icon_size = 18        # row icon size in px (clamped to 12–128)
+confirm_drop_move = false # ask before a drag-and-drop move (Ctrl+drag copies freely)
+
+# ── Context menus ────────────────────────────────────────────────────────────
+#
+# Right-click menus are an ordered list of rules. The first rule whose
+# `matches` claims a row provides that row's entire menu; rows no rule claims
+# use the two rules below. `matches` accepts "dir", "noext", "ext:NAME",
+# "regex:PATTERN", "fallback", and "multi". A "multi" rule applies instead of
+# the per-path rules whenever more than one row is selected; its actions and
+# custom commands then run over every selected row.
+#
+# A rule may instead be an include, pulling rules out of separate files so more
+# specific rules can be added without editing this file. Write `include = "DIR"`
+# (relative to this file, or absolute) in place of `matches`; every *.toml in
+# that directory contributes its [[context_menu.rules]] here, in filename order.
+# This is how you add rules *before* the "fallback" rule below without touching
+# this file:
+#
+#   [[context_menu.rules]]
+#   include = "rules.d"
+#
+# A missing directory is fine (it just adds nothing); an unparsable drop-in is
+# reported and skipped.
+#
+# Each `items` entry is one of:
+#
+#   "Open"                                       a built-in action
+#   { action = "Cut", shortcut = "Ctrl+x" }      built-in + shortcut/label override
+#   { command = "code {path}", label = "Edit" }  a custom command
+#   { label = "...", items = [ ... ] }            submenus (which may nest further).
+#   "---"                                        a divider
+#
+# Any item may carry a `shortcut` (GTK accelerator syntax, e.g. "Ctrl+x" or
+# "F2"). While the tree is focused it fires that action on the row under the
+# keyboard cursor.
+#
+# Any table item may also carry `hidden = true`: it is not drawn in the menu,
+# but its shortcut still fires — handy for binding a key without adding a row.
+# A plain-string built-in cannot be hidden; write it as a table instead, e.g.
+#   { action = "Up One Level", hidden = true }
+
+# A multi-row selection (two or more rows). This rule wins over the per-path
+# rules below whenever more than one row is selected. Actions that only make
+# sense for a single row (Open, Rename, Duplicate, ...) are ignored here; the
+# ones listed act on every selected row. A custom command runs once per row, in
+# visual top-to-bottom order.
+[[context_menu.rules]]
+matches = ["multi"]
+items = [
+    { action = "Cut", shortcut = "Ctrl+x" },
+    { action = "Copy", shortcut = "Ctrl+c" },
+
+    "---",
+    "Copy Path",
+    "Copy Relative Path",
+
+    "---",
+    "Properties",
+    { action = "Move to Trash", shortcut = "Delete" },
+    { action = "Delete Permanently", shortcut = "Shift+Delete" },
+]
+
+# Directories.
+[[context_menu.rules]]
+matches = ["dir"]
+items = [
+    { label = "Open", items = [ 
+        { action = "Open", label = "In same panel" },
+        { action = "In new panel", label = "In split view" },
+        "In opposite panel",
+        { action = "Open With...", label = "With..." },
+    ]},
+    { label = "New", items = [ 
+        { action = "New Folder", label = "Folder", shortcut = "Ctrl+Shift+n" },
+        { action = "New File", label = "File", shortcut = "Ctrl+n" },
+    ]},
+    { action = "View Thumbnail", label = "View Thumbnails", shortcut = "Ctrl+t" },
+
+    "---",
+    { command = "foot -D {dir}", label = "Open in Terminal" },
+
+    "---",
+    { action = "Cut", shortcut = "Ctrl+x" },
+    { action = "Copy", shortcut = "Ctrl+c" },
+    { action = "Paste", shortcut = "Ctrl+v" },
+    { action = "Duplicate", shortcut = "Ctrl+d" },
+    { action = "Create Link", shortcut = "Ctrl+Shift+m" },
+
+    "---",
+    { action = "Rename", shortcut = "F2" },
+    "Copy Path",
+    "Copy Relative Path",
+
+    "---",
+    "Properties",
+    { action = "Move to Trash", shortcut = "Delete" },
+    { action = "Delete Permanently", shortcut = "Shift+Delete" },
+]
+
+# Files, and anything else not matched above.
+[[context_menu.rules]]
+matches = ["fallback"]
+items = [
+    { label = "Open", items = [ 
+        { action = "Open", label = "With Default" },
+        { action = "Open With...", label = "With..." },
+    ]},  
+    { action = "View Thumbnail", shortcut = "Ctrl+t" },
+
+    "---",
+    { action = "Cut", shortcut = "Ctrl+x" },
+    { action = "Copy", shortcut = "Ctrl+c" },
+    { action = "Paste", shortcut = "Ctrl+v" },
+    { action = "Duplicate", shortcut = "Ctrl+d" },
+    { action = "Create Link", shortcut = "Ctrl+Shift+m" },
+
+    "---",
+    { action = "Rename", shortcut = "F2" },
+    "Copy Path",
+    "Copy Relative Path",
+
+    "---",
+    "Properties",
+    { action = "Move to Trash", shortcut = "Delete" },
+    { action = "Delete Permanently", shortcut = "Shift+Delete" },
+]
+
+# The hamburger menu in each pane's toolbar. Unlike the context menus above
+# these items act on the whole pane (open a folder, change the sort order, close
+# the pane, ...), not on one row. Same item syntax as the context menus:
+# builtin names as plain strings, `{ action = "...", shortcut = "..." }` tables,
+# `{ command = "...", label = "..." }` custom commands, or
+# `{ label = "...", items = [ ... ] }` submenus (which may nest further).
+[pane_menu]
+items = [
+    "Open Folder...",
+    "Filter...",
+    { action = "Split View", shortcut = "Ctrl+s" },
+
+    "---",
+    { action = "Back", shortcut = "Alt+Left" },
+    { action = "Forward", shortcut = "Alt+Right" },
+    { action = "Up One Level", shortcut = "Alt+Up" },
+
+    "---",
+    { action = "Toggle Hidden Files", shortcut = "Ctrl+h" },
+    { action = "Sort by Name", shortcut = "Ctrl+1" },
+    { action = "Sort by Size", shortcut = "Ctrl+2" },
+    { action = "Sort by Modified", shortcut = "Ctrl+3" },
+    { action = "Sort by Type", shortcut = "Ctrl+4" },
+    { action = "Reverse Sort Order", shortcut = "Ctrl+Shift+r" },
+
+    "---",
+    "Collapse",
+    { action = "Close Pane", shortcut = "Ctrl+w" },
+]

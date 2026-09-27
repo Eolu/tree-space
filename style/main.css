@@ -1,0 +1,356 @@
+/* Omarchy "Tokyo Night" palette (mirrors
+   ~/.local/state/omarchy/current/theme/colors.toml, core bg #191a24). */
+@define-color tn_bg #191a24;
+@define-color tn_bg_dark #13141c;
+@define-color tn_bg_darker #0e0e14;
+@define-color tn_bg_light #24283b;
+@define-color tn_fg #a9b1d6;
+@define-color tn_fg_bright #c0caf5;
+@define-color tn_fg_dim #565f89;
+@define-color tn_muted #414868;
+@define-color tn_selection #292e42;
+@define-color tn_blue #7aa2f7;
+
+.panel {
+    background-color: @tn_bg;
+    color: @tn_fg;
+    font-family: "JetBrainsMono Nerd Font";
+}
+
+/* ── toolbar ──────────────────────────────────────────────────────────────── */
+.toolbar {
+    padding: 6px 8px 5px 8px;
+    border-bottom: 1px solid alpha(@tn_muted, 0.4);
+    background-color: @tn_bg_dark;
+}
+
+.toolbar button {
+    min-height: 28px;
+    min-width: 32px;
+    border-radius: 6px;
+    color: @tn_fg;
+}
+
+.toolbar button:hover {
+    background-color: alpha(@tn_selection, 0.6);
+}
+
+.toolbar entry,
+.toolbar text {
+    min-height: 28px;
+    border-radius: 6px;
+    background-color: @tn_bg_darker;
+    color: @tn_fg;
+    caret-color: @tn_blue;
+}
+
+.path-entry, .filter-entry {
+    padding: 0 8px;
+}
+
+/* ── filter bar (context-menu triggered, below the toolbar) ──────────────── */
+.filter-bar {
+    padding: 4px 8px;
+    border-bottom: 1px solid alpha(@tn_muted, 0.4);
+    background-color: @tn_bg_dark;
+}
+
+.filter-bar entry,
+.filter-bar text {
+    min-height: 28px;
+    border-radius: 6px;
+    background-color: @tn_bg_darker;
+    color: @tn_fg;
+    caret-color: @tn_blue;
+}
+
+.filter-bar button {
+    min-height: 28px;
+    min-width: 28px;
+    padding: 0;
+    border-radius: 6px;
+    color: @tn_fg;
+}
+
+.filter-bar button:hover {
+    background-color: alpha(@tn_selection, 0.6);
+}
+
+.filter-bar .filter-entry {
+    padding: 0 8px;
+}
+
+/* ── status bar ───────────────────────────────────────────────────────────── */
+.status-bar {
+    padding: 3px 8px;
+    font-size: 10px;
+    color: alpha(@tn_fg, 0.65);
+    border-top: 1px solid alpha(@tn_muted, 0.4);
+    background-color: @tn_bg_dark;
+}
+
+/* ── popovers (context + hamburger menus) ────────────────────────────────── */
+/* The theme paints the popover's rounded frame, border and arrow on these
+   child nodes (and gives plain buttons a grey fill). Style them explicitly so
+   the menus match the panel palette instead of the default theme. */
+popover.tree-menu-popover > contents,
+popover.hamburger-popover > contents {
+    background-color: @tn_bg;
+    border: 1px solid alpha(@tn_muted, 0.5);
+    border-radius: 8px;
+    box-shadow: 0 6px 18px alpha(black, 0.35);
+    padding: 0;
+}
+
+popover.tree-menu-popover > arrow,
+popover.hamburger-popover > arrow {
+    background-color: @tn_bg;
+    border: 1px solid alpha(@tn_muted, 0.5);
+}
+
+/* Flat menu items: the theme's default button fill/border is replaced by our
+   own palette, with a selected-colour hover. */
+.tree-menu button,
+.hamburger-menu button {
+    background: none;
+    border: none;
+    box-shadow: none;
+    outline: none;
+    border-radius: 6px;
+    color: @tn_fg;
+}
+
+.tree-menu button:hover,
+.hamburger-menu button:hover {
+    background-color: alpha(@tn_selection, 0.7);
+}
+
+/* ── hamburger popover ────────────────────────────────────────────────────── */
+.hamburger-menu {
+    padding: 4px;
+}
+
+/* ── path-entry completion dropdown ───────────────────────────────────────── */
+/* An in-surface overlay child (not a popover), so it stays on top of the tree
+   without stealing keyboard focus from the entry. */
+.path-completion {
+    background-color: @tn_bg;
+    border: 1px solid alpha(@tn_muted, 0.5);
+    border-radius: 8px;
+    box-shadow: 0 6px 18px alpha(black, 0.35);
+    padding: 4px;
+}
+
+.path-completion viewport,
+.path-completion-list {
+    background: none;
+    padding: 0;
+}
+
+.path-completion-list button.path-completion-item {
+    background: none;
+    border: none;
+    box-shadow: none;
+    outline: none;
+    border-radius: 6px;
+    color: @tn_fg;
+    padding: 2px 8px;
+    min-height: 24px;
+}
+
+.path-completion-list button.path-completion-item:hover {
+    background-color: alpha(@tn_selection, 0.6);
+}
+
+.path-completion-list button.path-completion-item.active {
+    background-color: alpha(@tn_selection, 0.9);
+}
+
+/* ── tree ─────────────────────────────────────────────────────────────────── */
+/* Make the scrolled window and its viewport/list adopt the panel background so
+   the theme's light-gray `@theme_bg_color` never shows through. */
+.tree-scroll,
+.tree-scroll viewport,
+.tree-scroll list {
+    background-color: @tn_bg;
+}
+
+.tree-scroll scrollbar range {
+    background-color: alpha(@tn_muted, 0.35);
+}
+
+.tree-row {
+    min-height: 26px;
+    padding: 1px 6px;
+    border-radius: 6px;
+    margin: 1px 4px;
+    color: @tn_fg;
+}
+
+.tree-row:hover {
+    background-color: alpha(@tn_selection, 0.6);
+}
+
+.tree-row label {
+    caret-color: @tn_blue;
+}
+
+.tree-row-selected,
+.tree-row-selected:hover {
+    background-color: @tn_selection;
+}
+
+.tree-row-selected label,
+.tree-row-selected image {
+    color: @tn_fg_bright;
+}
+
+/* Filter-as-you-type: highlight rows whose name matched the current filter
+   (directories kept only because a descendant matched do not get this). */
+.tree-row-match label {
+    color: @tn_blue;
+    font-weight: bold;
+}
+
+.tree-row-selected.tree-row-match label {
+    color: @tn_fg_bright;
+}
+
+.tree-rename-entry {
+    min-height: 22px;
+    padding: 1px 4px;
+    border-radius: 4px;
+    background: @tn_bg_darker;
+    color: @tn_fg;
+    caret-color: @tn_blue;
+}
+
+/* ── context menu ─────────────────────────────────────────────────────────── */
+.tree-menu {
+    margin: 4px;
+}
+
+.tree-menu button {
+    padding: 5px 12px;
+}
+
+.hamburger-menu button {
+    padding: 5px 12px;
+}
+
+.tree-menu-separator {
+    margin: 3px 6px;
+    background-color: alpha(@tn_selection, 0.35);
+}
+
+/* Submenu rows show a trailing ▸ marker instead of a shortcut. */
+.tree-menu-submenu-arrow {
+    color: alpha(@tn_fg, 0.6);
+    padding: 0 8px 0 0;
+}
+
+/* The floating label that follows the pointer while rows are being dragged. */
+.tree-drag-badge {
+    background-color: alpha(@tn_bg, 0.9);
+    color: @tn_fg;
+    border: 1px solid alpha(@tn_accent, 0.8);
+    border-radius: 6px;
+    padding: 2px 8px;
+    font-size: 12px;
+}
+
+/* Shortcut hints read as a subtle keycap, so they stand out against the row
+   background rather than blending into it. */
+.tree-menu-shortcut {
+    color: alpha(@tn_fg, 0.75);
+    background-color: alpha(@tn_fg, 0.08);
+    border: 1px solid alpha(@tn_muted, 0.5);
+    border-radius: 4px;
+    padding: 1px 7px;
+    margin: 0 8px 0 0;
+    font-size: 0.9em;
+}
+
+/* ── inline thumbnails ───────────────────────────────────────────────────── */
+.tree-thumbnail {
+    border-radius: 4px;
+    background-color: alpha(@tn_fg, 0.05);
+}
+
+/* ── inline audio player ─────────────────────────────────────────────────── */
+.tree-audio {
+    padding: 2px 4px;
+}
+
+.tree-audio-time {
+    font-size: 0.85em;
+    opacity: 0.8;
+    font-feature-settings: "tnum";
+}
+/* ── properties dialog ───────────────────────────────────────────────────── */
+.props {
+    background-color: @tn_bg;
+    color: @tn_fg;
+    font-family: "JetBrainsMono Nerd Font";
+}
+
+.props-header {
+    padding: 12px 14px;
+    background-color: @tn_bg_dark;
+}
+
+.props-title {
+    font-size: 1.15em;
+    font-weight: 600;
+    color: @tn_fg_bright;
+}
+
+.props-grid {
+    background-color: @tn_bg;
+}
+
+.props-label {
+    color: @tn_fg_dim;
+}
+
+.props-value {
+    color: @tn_fg;
+}
+
+.props-name {
+    background-color: @tn_bg_darker;
+    color: @tn_fg;
+    caret-color: @tn_blue;
+}
+
+.props-status {
+    color: @tn_fg_dim;
+    font-size: 0.9em;
+    padding-left: 4px;
+}
+
+.props-footer {
+    padding: 10px 14px;
+    background-color: @tn_bg_dark;
+}
+
+.props-access-header .props-label {
+    color: @tn_fg_dim;
+    font-size: 0.9em;
+}
+
+.props-special checkbutton {
+    color: @tn_fg;
+}
+
+.props notebook > header {
+    background-color: @tn_bg_dark;
+}
+
+.props notebook > header tab {
+    color: @tn_fg_dim;
+}
+
+.props notebook > header tab:checked {
+    color: @tn_fg_bright;
+}

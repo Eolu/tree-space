@@ -1,0 +1,22 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Tree Space
+GenericName=File Manager
+Comment=Dockable, keyboard-first file manager panel
+Exec=tree-space --select %u
+Icon=system-file-manager
+Terminal=false
+Categories=System;FileManager;FileTools;
+Keywords=folder;manager;explore;disk;filesystem;
+StartupNotify=false
+# We are a persistent, single-instance layer-shell panel. There is no D-Bus
+# service file for org.tree_space.panel, so activation must go through Exec
+# (whose %u argument is forwarded to the running panel over its instance
+# socket). DBusActivatable must stay false or xdg-open would try — and fail —
+# to start us over the session bus.
+DBusActivatable=false
+# Register as a handler for folders and the generic file:// scheme so
+# `xdg-open <dir>`, portal "Show in folder" requests, and double-clicking a
+# folder in another app all route here.
+MimeType=inode/directory;x-scheme-handler/file;

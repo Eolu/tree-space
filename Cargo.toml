@@ -1,0 +1,40 @@
+[package]
+name = "tree-space"
+version = "0.1.0"
+edition = "2024"
+description = "A dockable, keyboard-first file manager panel for Wayland/Hyprland"
+license = "MIT"
+
+[dependencies]
+# Elm-style GTK4 framework. Re-exports gtk/gdk/gio/glib as relm4::gtk::*
+relm4 = "0.11"
+# GTK4 bindings pinned to the same minor as relm4; feature enables FileDialog /
+# AlertDialog / CssProvider::load_from_string (GTK >= 4.12).
+gtk4 = { version = "0.11", features = ["v4_12"] }
+# wlr-layer-shell protocol bindings; v1_3 matches the system library (>= 1.3).
+gtk4-layer-shell = { version = "0.8.1", features = ["v1_3"] }
+# inotify-backed file watching (RecommendedWatcher on Linux).
+notify = "8"
+serde = { version = "1", features = ["derive"] }
+toml = "1"
+regex = "1"
+# Inline audio playback. Optional: disabling the `audio` feature drops this
+# binding dependency entirely (GTK still links libgstreamer itself), at the cost
+# of no inline audio player. See the `audio` feature below.
+gstreamer = { version = "0.25.4", optional = true }
+
+[features]
+# `audio` is on by default; build with `--no-default-features` to drop the
+# `gstreamer` dependency (audio files then have no inline player).
+default = ["audio"]
+audio = ["dep:gstreamer"]
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.dev]
+# GTK dependency tree is large; optimize deps even in dev builds.
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
