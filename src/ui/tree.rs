@@ -1167,10 +1167,12 @@ impl Tree {
                 let _ = sender.output(TreeOutput::OpenOpposite(path));
             }
             TreeMsg::OpenWith(path) => open_with_dialog(&self.parent.clone(), &path, &sender),
-            TreeMsg::OpenWithDefault(path) => {
-                open_in_app(&path);
-                self.status(format!("Opened {} with its default app", path.display()), &sender);
-            }
+            TreeMsg::OpenWithDefault(path) => match open_in_app(&path) {
+                Ok(app) => {
+                    self.status(format!("Opened {} with {app}", path.display()), &sender);
+                }
+                Err(err) => self.status(err, &sender),
+            },
             TreeMsg::CreateLink(path) => match self.ops.create_link(&path) {
                 Ok(new_path) => {
                     self.apply_change(Change::Created { path: new_path.clone() });
@@ -2986,8 +2988,8 @@ impl Tree {
             // replacing the current one. Expanding/collapsing stays on the
             // plain left click (and the arrow keys).
             self.open_root(path, sender);
-        } else {
-            open_in_app(path);
+        } else if let Err(err) = open_in_app(path) {
+            self.status(err, sender);
         }
     }
 
@@ -3447,9 +3449,23 @@ fn fresh_name(dir: &Path, stem: &str) -> String {
     unreachable!("the loop above always finds a free name")
 }
 
-fn open_in_app(path: &Path) {
+/// Open `path` with its registered default application.
+///
+/// Resolves the app from the file's *content type* instead of going through
+/// `launch_default_for_uri`. The latter falls back to the handler for the
+/// generic `file:` URI scheme when no app is registered for the type, and
+/// tree-space itself is often that handler (it registers `x-scheme-handler/file`
+/// so "Show in folder" requests arrive here) — which turned every open of an
+/// unassociated file into a new pane. Returns the app's display name.
+fn open_in_app(path: &Path) -> Result<String, String> {
+    let content_type = content_type_for(path)
+        .ok_or_else(|| format!("Could not determine the type of {}", path.display()))?;
+    let app = gio::AppInfo::default_for_type(&content_type, false)
+        .ok_or_else(|| format!("No application is registered to open {}", path.display()))?;
     let file = gio::File::for_path(path);
-    let _ = gio::AppInfo::launch_default_for_uri(&file.uri(), None::<&gio::AppLaunchContext>);
+    app.launch(&[file], None::<&gio::AppLaunchContext>)
+        .map_err(|err| format!("Could not open {}: {err}", path.display()))?;
+    Ok(app.display_name().to_string())
 }
 
 /// The content type GIO reports for `path` (e.g. `text/plain`), or `None` if the
@@ -3475,7 +3491,7 @@ fn content_type_for(path: &Path) -> Option<glib::GString> {
 /// default is registered.
 fn default_app_label(path: &Path) -> Option<String> {
     let content_type = content_type_for(path)?;
-    gio::AppInfo::default_for_type(&content_type, true).map(|app| {
+    gio::AppInfo::default_for_type(&content_type, false).map(|app| {
         format!("Open With {}", app.display_name())
     })
 }
