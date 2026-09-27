@@ -45,11 +45,13 @@ use relm4::prelude::*;
 
 use crate::cmd::{Command, WidthArg};
 use crate::config::{
-    BuiltinAction, Config, ContextAction, PANEL_MAX_WIDTH, PANEL_MIN_WIDTH, PanelConfig,
-    PanelLayer, PanelSide, SessionState, ShortcutTarget, StartupRoot, load_stylesheet,
+    Bookmark, BookmarkPosition, BuiltinAction, Config, ContextAction, PANEL_MAX_WIDTH,
+    PANEL_MIN_WIDTH, PanelConfig, PanelLayer, PanelSide, PaneMenu, SessionState, ShortcutTarget,
+    StartupRoot, bookmark_file_path, load_stylesheet, save_bookmarks_to_path,
 };
 use crate::fs::SortKey;
 use crate::ipc;
+use crate::ui::bookmarks::{self, BookmarkEvent};
 use crate::ui::toolbar::{PaneShortcuts, Toolbar, ToolbarInit, ToolbarMsg, ToolbarOutput};
 use crate::ui::tree::{Tree, TreeInit, TreeOutput, TreeMsg};
 
@@ -167,6 +169,10 @@ struct Dock {
     /// The vertical box holding the pane stack (for the primary dock this is
     /// `App::pane_container`, referenced by `view!`).
     container: gtk::Box,
+    /// The bookmarks section, when it is shown in this dock. Parented in the
+    /// dock's outer box (not `container`) so rebuilding the pane stack never
+    /// disturbs it.
+    bookmarks: Option<gtk::Widget>,
     panes: Vec<Pane>,
     /// Id of the pane most recently interacted with in this dock.
     active_pane: Option<u64>,
@@ -323,6 +329,12 @@ pub enum AppMsg {
     ResizeCommit,
     /// Move keyboard focus into pane `id`'s tree (after it is allocated).
     FocusPane { id: u64 },
+    /// The bookmarks section in `side`'s dock reported a user action.
+    BookmarkEvent { side: PanelSide, event: BookmarkEvent },
+    /// The bookmark editor for index `index` was saved with the new values.
+    BookmarkEditSaved { index: usize, name: String, path: PathBuf },
+    /// Show or hide the bookmarks section in every dock (hamburger item).
+    ToggleBookmarks,
 }
 
 /// The init payload: the parsed invocation plus the instance socket, if this
@@ -354,6 +366,13 @@ pub struct App {
     widths: HashMap<PanelSide, u32>,
     /// Most recently opened root, kept so a width save never drops it.
     last_root: Option<PathBuf>,
+    /// Whether the bookmarks section is currently shown in every dock. Starts
+    /// from `[bookmarks] show` (or a `startup = "bookmarks"` launch) and is
+    /// toggled at runtime from the hamburger menu.
+    show_bookmarks: bool,
+    /// The saved directory shortcuts, loaded from the bookmarks file and written
+    /// back whenever they change.
+    bookmarks: Vec<Bookmark>,
     /// Monotonic id for the debounced width save: a scheduled save only writes
     /// if it is still the latest (no `SourceId` juggling — removing a one-shot
     /// source that has already fired panics).
@@ -397,6 +416,13 @@ impl SimpleComponent for App {
         let mut config = loaded.config;
         let parent = root.clone();
 
+        // Bookmarks are runtime data kept in their own file beside the config.
+        // Materialize it (home by default) on first launch.
+        let (bookmarks, bookmark_problem) = crate::config::load_bookmarks(&config.bookmarks);
+        if let Err(problem) = crate::config::ensure_bookmarks_file(&config.bookmarks, &bookmarks) {
+            eprintln!("tree-space: could not create bookmarks file: {problem:?}");
+        }
+
         let session = SessionState::load();
         // An interactive resize is sticky across launches; the configured
         // `[panel] width` is only the initial default for each side.
@@ -418,10 +444,18 @@ impl SimpleComponent for App {
         // Keep `config.panel.width` meaningful for the primary dock.
         config.panel.width = widths[&primary_side];
         let primary_width = config.panel.width;
+        // A `startup = "bookmarks"` launch opens with the section showing and no
+        // directory pane; the hamburger or a bookmark click adds panes later.
+        let bookmarks_startup = config.startup.is_bookmarks();
+        let show_bookmarks = config.bookmarks.show || bookmarks_startup;
         // Build the primary dock's initial panes from the invocation. When the
         // invocation carries no roots, resolve the configured startup directory
         // (last-used, home, or a fixed path), falling back to home.
-        let roots = if init.command.roots.is_empty() {
+        let roots = if !init.command.roots.is_empty() {
+            init.command.roots.clone()
+        } else if bookmarks_startup {
+            Vec::new()
+        } else {
             let last = session.last_root.clone().filter(|p| p.is_dir());
             let fallback = config
                 .startup
@@ -429,8 +463,6 @@ impl SimpleComponent for App {
                 .filter(|p| p.is_dir())
                 .or_else(home_dir);
             if let Some(p) = fallback { vec![p] } else { Vec::new() }
-        } else {
-            init.command.roots.clone()
         };
 
         let mut panes: Vec<Pane> = Vec::new();
@@ -443,8 +475,9 @@ impl SimpleComponent for App {
             panes.last_mut().unwrap().set_root(root.clone());
             next_id += 1;
         }
-        // Guarantee at least one pane.
-        if panes.is_empty() {
+        // Guarantee at least one pane, unless the bookmarks view is the whole
+        // initial content.
+        if panes.is_empty() && !bookmarks_startup {
             panes.push(make_pane(
                 &config,
                 parent.clone(),
@@ -463,9 +496,11 @@ impl SimpleComponent for App {
         let mut status = String::new();
         if let Some(problem) = loaded.problem {
             status = format!("config: {problem:?}");
+        } else if let Some(problem) = bookmark_problem {
+            status = format!("bookmarks: {problem:?}");
         }
 
-        let model = App {
+        let mut model = App {
             config,
             status,
             window: root.clone(),
@@ -474,6 +509,7 @@ impl SimpleComponent for App {
                 side: primary_side,
                 window: root.clone(),
                 container: pane_container.clone(),
+                bookmarks: None,
                 panes,
                 active_pane: None,
             }],
@@ -483,11 +519,14 @@ impl SimpleComponent for App {
             visible: !init.command.hidden,
             widths,
             last_root: session.last_root.clone(),
+            show_bookmarks,
+            bookmarks,
             save_generation: Rc::new(Cell::new(0)),
         };
 
         init_layer_window(&model.window, &model.config, primary_side, primary_width);
         install_css(&model.config);
+        attach_bookmarks_shortcut(&model.window, &model.config.pane_menu, &sender);
         // Interactive resize only makes sense for a docked layer surface; a
         // plain fallback window is resized like any other window.
         if layer_shell_available() {
@@ -507,6 +546,9 @@ impl SimpleComponent for App {
         }
 
         let widgets = view_output!();
+
+        // The primary dock's outer box now exists; mount the bookmarks section.
+        model.refresh_bookmarks(0, &sender);
 
         // Quitting while a video thumbnail is playing is a shutdown race:
         // `GtkMediaFile` renders through GStreamer's GL sink, and exiting with
@@ -591,6 +633,11 @@ impl SimpleComponent for App {
                 TreeOutput::PaneAction(action) => {
                     self.dispatch_pane_builtin(id, action, &sender);
                 }
+                TreeOutput::AddBookmark(path) => {
+                    self.set_active(id);
+                    self.add_bookmark(path);
+                    self.refresh_all_bookmarks(&sender);
+                }
                 TreeOutput::RootChanged(root) => {
                     self.set_active(id);
                     if let Some((di, pi)) = self.dock_pane_of(id) {
@@ -656,15 +703,20 @@ impl SimpleComponent for App {
                 if self.docks[di].active_pane == Some(id) {
                     self.docks[di].active_pane = self.docks[di].panes.last().map(|p| p.id);
                 }
-                // The program only exits once the *last* pane anywhere closes.
+                // The program only exits once the *last* pane anywhere closes,
+                // unless the bookmarks section is showing (which keeps the panel
+                // alive on its own).
                 let panes_left: usize = self.docks.iter().map(|d| d.panes.len()).sum();
-                if panes_left == 0 {
+                if panes_left == 0 && !self.show_bookmarks {
                     self.window.close();
                     return;
                 }
                 if self.docks[di].panes.is_empty() {
-                    // This dock lost its only pane but other panes remain alive.
-                    if di == 0 {
+                    if self.show_bookmarks {
+                        // Keep the dock for its bookmarks section; just clear the
+                        // (now empty) pane stack.
+                        fill_pane_container(&self.docks[di].container.clone(), &[]);
+                    } else if di == 0 {
                         // The primary dock is the relm4 root window; closing it
                         // tears the whole app down. Hide it instead, and show it
                         // again on the next launch/toggle.
@@ -723,6 +775,28 @@ impl SimpleComponent for App {
 
             AppMsg::ResizeBy { side, delta } => self.resize_by(side, delta),
             AppMsg::ResizeCommit => self.persist_session(),
+
+            AppMsg::BookmarkEvent { side, event } => match event {
+                BookmarkEvent::Open(path) => self.open_bookmark(side, path, &sender),
+                BookmarkEvent::Edit(index) => self.edit_bookmark(side, index, &sender),
+                BookmarkEvent::Delete(index) => {
+                    if index < self.bookmarks.len() {
+                        self.bookmarks.remove(index);
+                        self.save_bookmarks();
+                        self.refresh_all_bookmarks(&sender);
+                    }
+                }
+                BookmarkEvent::Hide => self.set_bookmarks_visible(false, &sender),
+            },
+            AppMsg::BookmarkEditSaved { index, name, path } => {
+                if let Some(bookmark) = self.bookmarks.get_mut(index) {
+                    bookmark.name = name;
+                    bookmark.path = path;
+                    self.save_bookmarks();
+                    self.refresh_all_bookmarks(&sender);
+                }
+            }
+            AppMsg::ToggleBookmarks => self.set_bookmarks_visible(!self.show_bookmarks, &sender),
         }
     }
 }
@@ -853,6 +927,133 @@ impl App {
         }
     }
 
+    /// Append `path` to the bookmarks (skipping a duplicate path) and persist.
+    fn add_bookmark(&mut self, path: PathBuf) {
+        if self.bookmarks.iter().any(|b| b.path == path) {
+            self.status = format!("{} is already bookmarked", path.display());
+            return;
+        }
+        self.bookmarks.push(Bookmark {
+            name: Bookmark::default_name(&path),
+            path: path.clone(),
+        });
+        self.save_bookmarks();
+        self.status = format!("Bookmarked {}", path.display());
+    }
+
+    /// Open a new pane at a bookmark's directory in `side`'s dock.
+    fn open_bookmark(&mut self, side: PanelSide, path: PathBuf, sender: &ComponentSender<Self>) {
+        let path = crate::config::expand_bookmark_path(&path);
+        if !path.is_dir() {
+            self.status = format!("{} is not a directory", path.display());
+            return;
+        }
+        // Already open somewhere? Focus that pane instead of duplicating it.
+        if let Some((di, pi)) = self.find_pane_with_dir(&path) {
+            let id = self.docks[di].panes[pi].id;
+            self.set_active(id);
+            self.docks[di].panes[pi].tree.emit(TreeMsg::Focus);
+            self.set_docks_visible(true);
+            return;
+        }
+        let di = self.dock_of_side(side).unwrap_or(0);
+        self.add_pane(di, Some(path), sender);
+    }
+
+    /// Open the bookmark editor for the bookmark at `index` in `side`'s dock.
+    fn edit_bookmark(&mut self, side: PanelSide, index: usize, sender: &ComponentSender<Self>) {
+        let Some(bookmark) = self.bookmarks.get(index).cloned() else {
+            return;
+        };
+        let Some(di) = self.dock_of_side(side) else { return };
+        let parent = self.docks[di].window.clone();
+        let sender = sender.clone();
+        let path = crate::config::expand_bookmark_path(&bookmark.path);
+        bookmarks::show_bookmark_editor(&parent, &bookmark.name, &path, move |name, path| {
+            sender.input(AppMsg::BookmarkEditSaved { index, name, path });
+        });
+    }
+
+    /// Save the bookmarks list to its file, reporting any failure.
+    fn save_bookmarks(&mut self) {
+        let path = bookmark_file_path(&self.config.bookmarks.file);
+        if let Err(err) = save_bookmarks_to_path(&path, &self.bookmarks) {
+            self.status = format!("Could not save bookmarks: {err:?}");
+        }
+    }
+
+    /// Rebuild the bookmarks section in every dock (after a list change or a
+    /// show/hide toggle).
+    fn refresh_all_bookmarks(&mut self, sender: &ComponentSender<Self>) {
+        for di in 0..self.docks.len() {
+            self.refresh_bookmarks(di, sender);
+        }
+    }
+
+    /// Show or hide the bookmarks strip everywhere. Hiding it when nothing else
+    /// is open closes the panel, so it never leaves a blank surface behind.
+    fn set_bookmarks_visible(&mut self, show: bool, sender: &ComponentSender<Self>) {
+        self.show_bookmarks = show;
+        self.refresh_all_bookmarks(sender);
+        if !show {
+            self.prune_empty_docks();
+        }
+    }
+
+    /// Drop secondary docks that no longer show anything, and close the app if
+    /// no pane is left anywhere.
+    fn prune_empty_docks(&mut self) {
+        let mut di = self.docks.len();
+        while di > 1 {
+            di -= 1;
+            if self.docks[di].panes.is_empty() {
+                let dock = self.docks.remove(di);
+                dock.window.close();
+            }
+        }
+        // The primary dock is the root window and cannot be removed; if nothing
+        // is left to show anywhere, quit.
+        if self.docks.iter().all(|dock| dock.panes.is_empty()) {
+            self.window.close();
+        }
+    }
+
+    /// Rebuild dock `di`'s bookmarks section. Mounts a freshly-built widget in
+    /// the dock's outer box (above or below the pane stack) or removes it when
+    /// the section is hidden.
+    fn refresh_bookmarks(&mut self, di: usize, sender: &ComponentSender<Self>) {
+        let widget = if self.show_bookmarks {
+            let list = self.bookmarks.clone();
+            let side = self.docks[di].side;
+            let sender = sender.clone();
+            let on_event: Rc<dyn Fn(BookmarkEvent)> =
+                Rc::new(move |event| sender.input(AppMsg::BookmarkEvent { side, event }));
+            Some(bookmarks::bookmarks_section(&list, on_event))
+        } else {
+            None
+        };
+        self.place_bookmark_widget(di, widget);
+    }
+
+    /// Install (or remove) dock `di`'s bookmarks widget at the configured
+    /// top/bottom position.
+    fn place_bookmark_widget(&mut self, di: usize, widget: Option<gtk::Widget>) {
+        if let Some(old) = self.docks[di].bookmarks.take() {
+            remove_from_parent(&old);
+        }
+        let Some(widget) = widget else { return };
+        let stack = self.docks[di].container.clone();
+        let outer = stack
+            .parent()
+            .and_downcast::<gtk::Box>()
+            .unwrap_or_else(|| stack.clone());
+        match self.config.bookmarks.position {
+            BookmarkPosition::Top => outer.prepend(&widget),
+            BookmarkPosition::Bottom => outer.insert_child_after(&widget, Some(&stack)),
+        }
+        self.docks[di].bookmarks = Some(widget);
+    }
+
     /// Run a pane-level builtin (`Split View`, `Open Folder...`, `Filter...`,
     /// `Collapse`, `Close Pane`) against pane `id`. Shared by the toolbar and by
     /// keyboard shortcuts forwarded up from the tree.
@@ -872,6 +1073,7 @@ impl App {
             BuiltinAction::Forward => self.go_forward(id),
             BuiltinAction::Collapse => self.collapse_dock(id),
             BuiltinAction::ClosePane => sender.input(AppMsg::ClosePane { id }),
+            BuiltinAction::ToggleBookmarks => sender.input(AppMsg::ToggleBookmarks),
             _ => {}
         }
     }
@@ -1093,15 +1295,23 @@ impl App {
         if layer_shell_available() {
             attach_resize_controls(&window, side, sender);
         }
+        attach_bookmarks_shortcut(&window, &config.pane_menu, sender);
+        // The window's child is an outer box holding the pane stack; the
+        // bookmarks section (when shown) is parented here too, so resetting the
+        // stack never disturbs it.
+        let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
+        outer.set_vexpand(true);
         let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
         container.set_vexpand(true);
-        window.set_child(Some(&container));
+        outer.append(&container);
+        window.set_child(Some(&outer));
 
         let di = self.docks.len();
         self.docks.push(Dock {
             side,
             window,
             container,
+            bookmarks: None,
             panes: Vec::new(),
             active_pane: None,
         });
@@ -1111,6 +1321,7 @@ impl App {
                 self.add_pane(di, Some(root), sender);
             }
         }
+        self.refresh_bookmarks(di, sender);
         di
     }
 
@@ -1424,6 +1635,28 @@ fn apply_window_width(window: &gtk::Window, width: u32) {
     window.set_default_size(width as i32, if height > 0 { height } else { -1 });
 }
 
+/// Wire a dock window's configurable bookmarks shortcut. It lives on the window
+/// (capture phase) so it fires from anywhere in the dock — including when the
+/// bookmarks strip is the only thing shown and no pane is focused.
+fn attach_bookmarks_shortcut(window: &gtk::Window, menu: &PaneMenu, sender: &ComponentSender<App>) {
+    let shortcuts = Rc::new(PaneShortcuts::compile(menu));
+    let s = sender.clone();
+    let keys = gtk::EventControllerKey::new();
+    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
+    keys.connect_key_pressed(move |_, key, _, state| {
+        if matches!(
+            shortcuts.action_for(key, state),
+            Some(ContextAction::Builtin(BuiltinAction::ToggleBookmarks))
+        ) {
+            s.input(AppMsg::ToggleBookmarks);
+            glib::Propagation::Stop
+        } else {
+            glib::Propagation::Proceed
+        }
+    });
+    window.add_controller(keys);
+}
+
 /// Wire the interactive width controls into a dock window: Super+right-drag to
 /// resize and Super+plus/minus to step the width.
 fn attach_resize_controls(window: &gtk::Window, side: PanelSide, sender: &ComponentSender<App>) {
@@ -1652,6 +1885,10 @@ fn home_dir() -> Option<PathBuf> {
 /// The root a freshly-seeded dock should show, resolved from the `[startup]`
 /// config (last-used directory, home, or a fixed path), falling back to home.
 fn default_root(startup: &StartupRoot) -> Option<PathBuf> {
+    // A bookmarks launch opens no directory pane; seeding one would defeat it.
+    if startup.is_bookmarks() {
+        return None;
+    }
     let last = SessionState::load().last_root.filter(|p| p.is_dir());
     startup.resolve(last).filter(|p| p.is_dir()).or_else(home_dir)
 }

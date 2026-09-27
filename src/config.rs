@@ -30,6 +30,9 @@ pub const CONFIG_FILE: &str = "config.toml";
 pub const STATE_FILE: &str = "state.toml";
 /// Name of the user stylesheet inside [`APP_DIR`].
 pub const STYLE_FILE: &str = "main.css";
+/// Default name of the bookmarks list file inside [`APP_DIR`]. The config's
+/// `[bookmarks] file` may point elsewhere.
+pub const BOOKMARKS_FILE: &str = "bookmarks.toml";
 
 /// The shipping default config, written out on first launch. This is the
 /// **single source of truth** for every default value: [`Config::default`] and
@@ -62,6 +65,7 @@ fn builtin() -> &'static Config {
             startup: raw.startup.unwrap_or_default(),
             context_menu: raw.context_menu.unwrap_or_default(),
             pane_menu: raw.pane_menu.unwrap_or_default(),
+            bookmarks: raw.bookmarks.unwrap_or_default(),
         }
     })
 }
@@ -81,6 +85,8 @@ struct ShippedRaw {
     context_menu: Option<ContextMenu>,
     #[serde(default)]
     pane_menu: Option<PaneMenu>,
+    #[serde(default)]
+    bookmarks: Option<BookmarksConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -139,6 +145,37 @@ pub fn state_file() -> PathBuf {
 /// Absolute path of the user stylesheet for the current environment.
 pub fn style_file() -> PathBuf {
     app_path(&config_home_from_env(), STYLE_FILE)
+}
+
+/// Absolute path of the bookmarks list for the current environment, given the
+/// configured `[bookmarks] file` (relative to the config directory, or
+/// absolute).
+pub fn bookmark_file_path(configured: &Path) -> PathBuf {
+    resolve_bookmarks_path(&config_home_from_env().join(APP_DIR), configured)
+}
+
+/// Resolve a `[bookmarks] file` against `base` (the config file's directory).
+fn resolve_bookmarks_path(base: &Path, configured: &Path) -> PathBuf {
+    if configured.is_absolute() { configured.to_path_buf() } else { base.join(configured) }
+}
+
+/// Expand a leading `~` in a bookmark path (a no-op for ordinary paths). Stored
+/// paths are absolute in practice, but a hand-written `~/notes` still works.
+pub fn expand_bookmark_path(path: &Path) -> PathBuf {
+    match path.to_str().and_then(expand_tilde) {
+        Some(expanded) => expanded,
+        None => path.to_path_buf(),
+    }
+}
+
+/// The bookmark list a fresh install starts with: one entry for the home
+/// directory. Empty only when `$HOME` is unknown.
+pub fn default_bookmarks() -> Vec<Bookmark> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|home| !home.as_os_str().is_empty())
+        .map(|home| vec![Bookmark { name: Bookmark::default_name(&home), path: home }])
+        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -223,6 +260,15 @@ fn default_icon_size() -> u32 {
 fn default_confirm_drop_move() -> bool {
     builtin().tree.confirm_drop_move
 }
+fn default_bookmarks_show() -> bool {
+    builtin().bookmarks.show
+}
+fn default_bookmarks_position() -> BookmarkPosition {
+    builtin().bookmarks.position
+}
+fn default_bookmarks_file() -> PathBuf {
+    builtin().bookmarks.file.clone()
+}
 
 /// Dock/panel configuration. Field-level serde defaults keep a partially
 /// written `[panel]` table valid without consulting `Self::default()` (which
@@ -297,9 +343,10 @@ impl TreeConfig {
 
 /// Where the panel opens when launched without an explicit path argument.
 ///
-/// In TOML this is a single `root` value: `"home"` (the default), `"last"`, or
-/// a table naming a fixed directory — `{ path = "/some/dir" }`. A leading `~` in
-/// the path expands to `$HOME`.
+/// In TOML this is a single value: `"home"` (the default), `"last"`,
+/// `"bookmarks"` (open with the bookmarks section showing and no directory
+/// pane), or a table naming a fixed directory — `{ path = "/some/dir" }`. A
+/// leading `~` in the path expands to `$HOME`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum StartupRoot {
     /// Always open the user's home directory.
@@ -309,6 +356,8 @@ pub enum StartupRoot {
     Last,
     /// Always open the named directory.
     Path(String),
+    /// Open with the bookmarks section as the initial view and no directory pane.
+    Bookmarks,
 }
 
 impl StartupRoot {
@@ -319,7 +368,14 @@ impl StartupRoot {
             StartupRoot::Last => last,
             StartupRoot::Home => None,
             StartupRoot::Path(path) => expand_tilde(path),
+            // Bookmarks opens no directory pane; the app shows the section.
+            StartupRoot::Bookmarks => None,
         }
+    }
+
+    /// Whether this selects the bookmarks view rather than a directory.
+    pub fn is_bookmarks(&self) -> bool {
+        matches!(self, StartupRoot::Bookmarks)
     }
 }
 
@@ -329,6 +385,7 @@ impl Serialize for StartupRoot {
         match self {
             StartupRoot::Last => serializer.serialize_str("last"),
             StartupRoot::Home => serializer.serialize_str("home"),
+            StartupRoot::Bookmarks => serializer.serialize_str("bookmarks"),
             StartupRoot::Path(path) => {
                 let mut map = serializer.serialize_map(Some(1))?;
                 map.serialize_entry("path", path)?;
@@ -353,8 +410,9 @@ impl<'de> Deserialize<'de> for StartupRoot {
             Repr::Keyword(word) => match word.to_ascii_lowercase().as_str() {
                 "last" => Ok(StartupRoot::Last),
                 "home" => Ok(StartupRoot::Home),
+                "bookmarks" => Ok(StartupRoot::Bookmarks),
                 other => Err(D::Error::custom(format!(
-                    "unknown startup root {other:?} (expected \"last\", \"home\", or {{ path = \"...\" }})"
+                    "unknown startup root {other:?} (expected \"last\", \"home\", \"bookmarks\", or {{ path = \"...\" }})"
                 ))),
             },
             Repr::Path { path } => Ok(StartupRoot::Path(path)),
@@ -548,6 +606,8 @@ pub enum BuiltinAction {
     CopyPath,
     /// Copy the row's path relative to the tree root.
     CopyRelativePath,
+    /// Add the directory row to the bookmarks list.
+    AddBookmark,
     /// Cut the selection (moved on the next paste).
     Cut,
     /// Copy the selection (duplicated on the next paste).
@@ -591,6 +651,8 @@ pub enum BuiltinAction {
     Collapse,
     /// Pane-level: close this pane.
     ClosePane,
+    /// Pane-level: show or hide the bookmarks section in this dock.
+    ToggleBookmarks,
     /// A menu divider; never does anything.
     Separator,
 }
@@ -613,6 +675,7 @@ impl BuiltinAction {
             BuiltinAction::Duplicate => "Duplicate",
             BuiltinAction::CopyPath => "Copy Path",
             BuiltinAction::CopyRelativePath => "Copy Relative Path",
+            BuiltinAction::AddBookmark => "Add Bookmark",
             BuiltinAction::Cut => "Cut",
             BuiltinAction::Copy => "Copy",
             BuiltinAction::Paste => "Paste",
@@ -634,6 +697,7 @@ impl BuiltinAction {
             BuiltinAction::Forward => "Forward",
             BuiltinAction::Collapse => "Collapse",
             BuiltinAction::ClosePane => "Close Pane",
+            BuiltinAction::ToggleBookmarks => "Bookmarks",
             BuiltinAction::Separator => "---",
         }
     }
@@ -664,6 +728,7 @@ impl BuiltinAction {
             BuiltinAction::Back => Some("Alt+Left"),
             BuiltinAction::Forward => Some("Alt+Right"),
             BuiltinAction::ClosePane => Some("Ctrl+w"),
+            BuiltinAction::ToggleBookmarks => Some("Ctrl+b"),
             _ => None,
         }
     }
@@ -687,13 +752,20 @@ impl BuiltinAction {
                 | BuiltinAction::Rename
                 | BuiltinAction::Duplicate
                 | BuiltinAction::CreateLink
+                | BuiltinAction::AddBookmark
         )
     }
 
     /// Whether this action only makes sense for directories (the menu drops
     /// it from file rows).
     pub fn is_directory_only(&self) -> bool {
-        matches!(self, BuiltinAction::OpenSplit | BuiltinAction::InNewPanel | BuiltinAction::InOppositePanel)
+        matches!(
+            self,
+            BuiltinAction::OpenSplit
+                | BuiltinAction::InNewPanel
+                | BuiltinAction::InOppositePanel
+                | BuiltinAction::AddBookmark
+        )
     }
 
     /// Whether this is a pane-level action (open a folder, filter, split,
@@ -710,6 +782,7 @@ impl BuiltinAction {
                 | BuiltinAction::Forward
                 | BuiltinAction::Collapse
                 | BuiltinAction::ClosePane
+                | BuiltinAction::ToggleBookmarks
         )
     }
 
@@ -741,6 +814,7 @@ impl BuiltinAction {
             Self::Duplicate,
             Self::CopyPath,
             Self::CopyRelativePath,
+            Self::AddBookmark,
             Self::Cut,
             Self::Copy,
             Self::Paste,
@@ -762,6 +836,7 @@ impl BuiltinAction {
             Self::Forward,
             Self::Collapse,
             Self::ClosePane,
+            Self::ToggleBookmarks,
             Self::Separator,
         ]
         .into_iter()
@@ -1118,6 +1193,65 @@ impl Default for PaneMenu {
     }
 }
 
+/// Where the bookmarks section sits relative to the pane stack in each dock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum BookmarkPosition {
+    /// Above every pane.
+    #[default]
+    Top,
+    /// Below every pane.
+    Bottom,
+}
+
+/// The `[bookmarks]` options table: whether the section starts shown, where it
+/// sits, and which file holds the list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BookmarksConfig {
+    /// Show the bookmarks section on launch (the hamburger can toggle it either
+    /// way at runtime).
+    #[serde(default = "default_bookmarks_show")]
+    pub show: bool,
+    /// Whether the section is placed above or below the pane stack.
+    #[serde(default = "default_bookmarks_position")]
+    pub position: BookmarkPosition,
+    /// The bookmarks list file, relative to the config directory (or absolute).
+    /// Created with a single home bookmark when missing.
+    #[serde(default = "default_bookmarks_file")]
+    pub file: PathBuf,
+}
+
+impl Default for BookmarksConfig {
+    fn default() -> Self {
+        builtin().bookmarks.clone()
+    }
+}
+
+/// One saved directory shortcut.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Bookmark {
+    pub name: String,
+    pub path: PathBuf,
+}
+
+impl Bookmark {
+    /// The default label for a bookmark pointing at `path`: the directory's own
+    /// name (falling back to the full path for roots and odd spellings).
+    pub fn default_name(path: &Path) -> String {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| path.display().to_string())
+    }
+}
+
+/// The on-disk shape of the bookmarks file: a top-level `[[bookmarks]]` array.
+#[derive(Debug, Default, Serialize, Deserialize)]
+struct BookmarksFile {
+    #[serde(default)]
+    bookmarks: Vec<Bookmark>,
+}
+
 /// Top-level configuration.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
@@ -1127,6 +1261,7 @@ pub struct Config {
     pub startup: StartupRoot,
     pub context_menu: ContextMenu,
     pub pane_menu: PaneMenu,
+    pub bookmarks: BookmarksConfig,
 }
 
 impl Default for Config {
@@ -1351,6 +1486,76 @@ impl Config {
 /// Maximum include nesting, so a cycle (`a.toml` inside the directory it
 /// includes) cannot recurse forever.
 const MAX_INCLUDE_DEPTH: usize = 8;
+
+/// Read the bookmarks list named by `config` for the current environment. A
+/// missing file yields [`default_bookmarks`] with no problem; an unreadable or
+/// unparsable one yields the default list plus the problem, so a broken file
+/// never takes the section down.
+pub fn load_bookmarks(config: &BookmarksConfig) -> (Vec<Bookmark>, Option<LoadProblem>) {
+    load_bookmarks_from_path(&bookmark_file_path(&config.file))
+}
+
+/// Read a bookmarks list from an explicit path (tests).
+pub fn load_bookmarks_from_path(path: &Path) -> (Vec<Bookmark>, Option<LoadProblem>) {
+    match std::fs::read_to_string(path) {
+        Ok(text) => match toml::from_str::<BookmarksFile>(&text) {
+            Ok(file) => (file.bookmarks, None),
+            Err(err) => (default_bookmarks(), Some(LoadProblem::Parse(path.to_path_buf(), err))),
+        },
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => (default_bookmarks(), None),
+        Err(err) => (default_bookmarks(), Some(LoadProblem::Io(path.to_path_buf(), err.kind()))),
+    }
+}
+
+/// Write `bookmarks` to `path` atomically, creating parent directories. Mirrors
+/// [`SessionState::save_to_path`]: temp file plus rename, so a crash mid-write
+/// never truncates the existing list.
+pub fn save_bookmarks_to_path(path: &Path, bookmarks: &[Bookmark]) -> Result<(), LoadProblem> {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        return Err(LoadProblem::Io(parent.to_path_buf(), err.kind()));
+    }
+    let body = toml::to_string_pretty(&BookmarksFile { bookmarks: bookmarks.to_vec() })
+        .map_err(|_| LoadProblem::Io(path.to_path_buf(), std::io::ErrorKind::InvalidData))?;
+    let tmp = path.with_extension("toml.tmp");
+    std::fs::write(&tmp, body).map_err(|err| LoadProblem::Io(tmp.clone(), err.kind()))?;
+    std::fs::rename(&tmp, path).map_err(|err| LoadProblem::Io(path.to_path_buf(), err.kind()))
+}
+
+/// Create the bookmarks file for `config` (containing `list`) on first launch,
+/// so the user has something to edit. Never clobbers an existing file; a
+/// read-only directory is treated as "nothing to write" (as with the config).
+pub fn ensure_bookmarks_file(
+    config: &BookmarksConfig,
+    list: &[Bookmark],
+) -> Result<(), LoadProblem> {
+    ensure_bookmarks_at(&bookmark_file_path(&config.file), list)
+}
+
+/// [`ensure_bookmarks_file`] against an explicit path (tests).
+pub fn ensure_bookmarks_at(path: &Path, list: &[Bookmark]) -> Result<(), LoadProblem> {
+    if path.exists() {
+        return Ok(());
+    }
+    let Some(parent) = path.parent() else {
+        return Err(LoadProblem::Io(path.to_path_buf(), std::io::ErrorKind::NotFound));
+    };
+    if !parent.as_os_str().is_empty()
+        && !parent.exists()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        return Err(LoadProblem::Io(parent.to_path_buf(), err.kind()));
+    }
+    if let Ok(metadata) = std::fs::metadata(parent)
+        && metadata.permissions().readonly()
+    {
+        return Ok(());
+    }
+    save_bookmarks_to_path(path, list)
+}
+
 
 /// The shape of a drop-in file pulled in by an include rule: the same
 /// `[[context_menu.rules]]` table as the main config, nothing else.
@@ -1604,6 +1809,7 @@ icon_size = 20
         assert_eq!(TreeConfig::default(), shipped.tree);
         assert_eq!(ContextMenu::default(), shipped.context_menu);
         assert_eq!(PaneMenu::default(), shipped.pane_menu);
+        assert_eq!(BookmarksConfig::default(), shipped.bookmarks);
         // A partial *section* falls back to the shipped value of the missing key.
         let partial = parse("[tree]\nfont_size = 21\n");
         assert_eq!(partial.tree.font_size, 21);
@@ -2130,6 +2336,68 @@ items = [
     }
 
     #[test]
+    fn startup_bookmarks_selects_the_bookmarks_view() {
+        let root = parse("startup = \"bookmarks\"\n").startup;
+        assert_eq!(root, StartupRoot::Bookmarks);
+        assert!(root.is_bookmarks());
+        // It opens no directory pane, even with a usable last root.
+        assert_eq!(root.resolve(Some(PathBuf::from("/tmp/last"))), None);
+    }
+
+    #[test]
+    fn bookmark_builtins_parse_and_classify() {
+        assert_eq!(BuiltinAction::parse("Add Bookmark"), Some(BuiltinAction::AddBookmark));
+        assert!(BuiltinAction::AddBookmark.is_directory_only());
+        assert!(BuiltinAction::AddBookmark.is_single_row_only());
+        assert_eq!(BuiltinAction::parse("Bookmarks"), Some(BuiltinAction::ToggleBookmarks));
+        assert!(BuiltinAction::ToggleBookmarks.is_pane_action());
+    }
+
+    #[test]
+    fn bookmarks_list_round_trips_through_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bookmarks.toml");
+        let list = vec![
+            Bookmark { name: "Home".to_owned(), path: PathBuf::from("/home/x") },
+            Bookmark { name: "Code".to_owned(), path: PathBuf::from("/srv/code") },
+        ];
+        save_bookmarks_to_path(&path, &list).unwrap();
+        let (loaded, problem) = load_bookmarks_from_path(&path);
+        assert!(problem.is_none());
+        assert_eq!(loaded, list);
+    }
+
+    #[test]
+    fn missing_bookmarks_file_falls_back_to_default_without_problem() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nope.toml");
+        let (loaded, problem) = load_bookmarks_from_path(&path);
+        assert!(problem.is_none());
+        assert_eq!(loaded, default_bookmarks());
+    }
+
+    #[test]
+    fn ensure_bookmarks_creates_and_never_clobbers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bookmarks.toml");
+        let list = vec![Bookmark { name: "Home".to_owned(), path: PathBuf::from("/home/x") }];
+        ensure_bookmarks_at(&path, &list).unwrap();
+        let (loaded, _) = load_bookmarks_from_path(&path);
+        assert_eq!(loaded, list);
+        // A second call must leave the existing file untouched.
+        let other = vec![Bookmark { name: "Other".to_owned(), path: PathBuf::from("/tmp") }];
+        ensure_bookmarks_at(&path, &other).unwrap();
+        let (loaded, _) = load_bookmarks_from_path(&path);
+        assert_eq!(loaded, list);
+    }
+
+    #[test]
+    fn bookmark_name_defaults_to_the_directory_name() {
+        assert_eq!(Bookmark::default_name(Path::new("/home/eolu/notes")), "notes");
+        assert_eq!(Bookmark::default_name(Path::new("/")), "/");
+    }
+
+    #[test]
     fn startup_tilde_expands_to_home() {
         // SAFETY: single-threaded test setup; HOME is read-only here.
         unsafe { std::env::set_var("HOME", "/home/tester") };
@@ -2149,6 +2417,7 @@ items = [
     fn startup_parses_from_toml() {
         assert_eq!(parse("startup = \"home\"\n").startup, StartupRoot::Home);
         assert_eq!(parse("startup = \"last\"\n").startup, StartupRoot::Last);
+        assert_eq!(parse("startup = \"bookmarks\"\n").startup, StartupRoot::Bookmarks);
         assert_eq!(
             parse("startup = { path = \"/srv\" }\n").startup,
             StartupRoot::Path("/srv".to_owned())

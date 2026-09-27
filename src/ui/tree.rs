@@ -430,6 +430,8 @@ pub enum TreeMsg {
     TypeAhead(char),
     CopyPath(PathBuf),
     CopyRelativePath(PathBuf),
+    /// Add the directory row to the app's bookmarks list.
+    AddBookmark(PathBuf),
 
     RenameCommit,
     RenameCancel,
@@ -485,6 +487,8 @@ pub enum TreeOutput {
     /// from a keyboard shortcut. The tree cannot perform it, so it forwards the
     /// action upward for the app to handle.
     PaneAction(BuiltinAction),
+    /// The user asked to bookmark `path` (a directory).
+    AddBookmark(PathBuf),
 }
 
 /// Rendered state of the tree component.
@@ -1152,6 +1156,9 @@ impl Tree {
                     .unwrap_or_else(|| path.display().to_string());
                 set_clipboard_text(&relative);
                 self.status("Copied relative path to clipboard".to_string(), &sender);
+            }
+            TreeMsg::AddBookmark(path) => {
+                let _ = sender.output(TreeOutput::AddBookmark(path));
             }
             TreeMsg::RunCommand { command, path } => {
                 let cmd = action_command(&command, &path);
@@ -2123,6 +2130,7 @@ fn builtin_message(action: BuiltinAction, path: &Path) -> TreeMsg {
         BuiltinAction::Rename => TreeMsg::RenameAt(path.to_path_buf()),
         BuiltinAction::CopyPath => TreeMsg::CopyPath(path.to_path_buf()),
         BuiltinAction::CopyRelativePath => TreeMsg::CopyRelativePath(path.to_path_buf()),
+        BuiltinAction::AddBookmark => TreeMsg::AddBookmark(path.to_path_buf()),
         BuiltinAction::Properties => TreeMsg::Properties(path.to_path_buf()),
         BuiltinAction::Trash => TreeMsg::Trash(path.to_path_buf()),
         BuiltinAction::DeletePermanently => TreeMsg::PermanentDelete(path.to_path_buf()),
@@ -2140,7 +2148,8 @@ fn builtin_message(action: BuiltinAction, path: &Path) -> TreeMsg {
         | BuiltinAction::Back
         | BuiltinAction::Forward
         | BuiltinAction::Collapse
-        | BuiltinAction::ClosePane => unreachable!("pane action in a row context menu"),
+        | BuiltinAction::ClosePane
+        | BuiltinAction::ToggleBookmarks => unreachable!("pane action in a row context menu"),
         BuiltinAction::Separator => unreachable!("separators are rendered, not dispatched"),
     }
 }

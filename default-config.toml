@@ -8,6 +8,7 @@
 # Where the panel opens when launched without a path argument. One of:
 #   "home"  - always open the home directory (the default)
 #   "last"  - reopen the last-used directory
+#   "bookmarks" - open with the bookmarks section showing and no directory pane
 #   { path = "/some/dir" }  - always open that directory (a leading ~ = $HOME)
 startup = "home"
 
@@ -17,6 +18,17 @@ side = "left"        # screen edge to dock to: "left" | "right"
 layer = "bottom"     # stacking layer: "background" | "bottom" | "top" | "overlay"
 width = 300          # panel width in px (clamped to 160–2000)
 margin = 0           # gap from the screen edge in px (clamped to 0–200)
+
+# ── Bookmarks ────────────────────────────────────────────────────────────────
+# A bookmarks strip docked above or below every pane. Click an entry to open a
+# pane at that directory; right-click it to edit (name/path) or delete it. The
+# list itself lives in `file` below (created with a single home bookmark on
+# first launch). `startup = "bookmarks"` opens with the section as the initial
+# view; the hamburger menu's "Bookmarks" item toggles it at any time.
+[bookmarks]
+show = false          # show the section on launch
+position = "top"      # "top" | "bottom" - above or below the pane stack
+file = "bookmarks.toml" # list file, relative to this config (or absolute)
 
 # ── Tree ─────────────────────────────────────────────────────────────────────
 [tree]
@@ -120,6 +132,7 @@ items = [
     "Copy Relative Path",
 
     "---",
+    "Add Bookmark",
     "Properties",
     { action = "Move to Trash", shortcut = "Delete" },
     { action = "Delete Permanently", shortcut = "Shift+Delete" },
@@ -180,5 +193,6 @@ items = [
 
     "---",
     "Collapse",
+    { action = "Bookmarks", shortcut = "Ctrl+b" },
     { action = "Close Pane", shortcut = "Ctrl+w" },
 ]
