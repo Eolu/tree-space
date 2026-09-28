@@ -80,12 +80,158 @@
     padding: 0 8px;
 }
 
+/* ── navigation toolbar (optional, below the path bar) ───────────────────── */
+.nav-toolbar {
+    padding: 3px 8px;
+    border-bottom: 1px solid alpha(@tn_muted, 0.4);
+    background-color: @tn_bg_dark;
+}
+
+.nav-toolbar button {
+    min-height: 28px;
+    min-width: 32px;
+    padding: 0;
+    border: none;
+    border-radius: 6px;
+    background: none;
+    box-shadow: none;
+    outline: none;
+    color: @tn_fg;
+    -gtk-icon-size: 18px;
+}
+
+.nav-toolbar button:hover {
+    background-color: alpha(@tn_selection, 0.6);
+    color: @tn_fg_bright;
+}
+
+.nav-toolbar button:disabled {
+    color: alpha(@tn_fg, 0.35);
+}
+
 /* ── status bar ───────────────────────────────────────────────────────────── */
 .status-bar {
     padding: 3px 8px;
     font-size: 10px;
     color: alpha(@tn_fg, 0.65);
     border-top: 1px solid alpha(@tn_muted, 0.4);
+    background-color: @tn_bg_dark;
+}
+
+/* ── bookmarks pane view ──────────────────────────────────────────────────── */
+/* The body of a pane opened without a directory: a list of suggested places to
+   jump to. It uses the same panel palette as the tree. */
+.bookmarks-view {
+    background-color: @tn_bg;
+}
+
+.bookmark-icon {
+    color: @tn_blue;
+}
+
+.bookmark-arrow {
+    color: alpha(@tn_fg, 0.7);
+}
+
+.bookmarks-list {
+    background: none;
+    padding: 6px 8px;
+}
+
+.bookmark-row {
+    min-height: 24px;
+    padding: 1px 8px;
+    border-radius: 6px;
+    margin: 1px 4px;
+    background: none;
+    border: none;
+    box-shadow: none;
+    outline: none;
+    color: @tn_fg;
+}
+
+.bookmark-row:hover {
+    background-color: alpha(@tn_selection, 0.6);
+}
+
+/* The row under the keyboard cursor (mirrors the tree's selected row). */
+.bookmark-row-selected,
+.bookmark-row-selected:hover {
+    background-color: @tn_selection;
+}
+
+.bookmark-row-selected label,
+.bookmark-row-selected image {
+    color: @tn_fg_bright;
+}
+
+.bookmarks-empty {
+    padding: 4px 10px;
+    color: @tn_fg_dim;
+    font-size: 0.9em;
+}
+
+/* Match the context/hamburger popovers (the theme otherwise paints a grey
+   frame and arrow). */
+popover.bookmark-menu-popover > contents {
+    background-color: @tn_bg;
+    border: 1px solid alpha(@tn_muted, 0.5);
+    border-radius: 8px;
+    box-shadow: 0 6px 18px alpha(black, 0.35);
+    padding: 0;
+}
+
+popover.bookmark-menu-popover > arrow {
+    background-color: @tn_bg;
+    border: 1px solid alpha(@tn_muted, 0.5);
+}
+
+.bookmark-menu {
+    padding: 4px;
+}
+
+.bookmark-menu button {
+    padding: 5px 12px;
+    background: none;
+    border: none;
+    box-shadow: none;
+    outline: none;
+    border-radius: 6px;
+    color: @tn_fg;
+}
+
+.bookmark-menu button:hover {
+    background-color: alpha(@tn_selection, 0.7);
+}
+
+/* ── bookmark editor dialog ───────────────────────────────────────────────── */
+.bookmark-editor-root {
+    background-color: @tn_bg;
+    color: @tn_fg;
+    font-family: "JetBrainsMono Nerd Font";
+    border: 2px solid white;
+}
+
+.bookmark-editor {
+    padding: 14px;
+}
+
+.bookmark-field-label {
+    color: @tn_fg_dim;
+    font-size: 0.9em;
+}
+
+.bookmark-editor entry,
+.bookmark-editor text {
+    min-height: 28px;
+    border-radius: 6px;
+    background-color: @tn_bg_darker;
+    color: @tn_fg;
+    caret-color: @tn_blue;
+}
+
+.bookmark-editor-footer {
+    padding: 10px 14px;
     background-color: @tn_bg_dark;
 }
 
@@ -292,6 +438,7 @@ popover.hamburger-popover > arrow {
     background-color: @tn_bg;
     color: @tn_fg;
     font-family: "JetBrainsMono Nerd Font";
+    border: 2px solid white;
 }
 
 .props-header {

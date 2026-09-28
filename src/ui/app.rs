@@ -51,7 +51,7 @@ use crate::config::{
 };
 use crate::fs::SortKey;
 use crate::ipc;
-use crate::ui::bookmarks::{self, BookmarkEvent};
+use crate::ui::bookmarks::{self, BookmarkEvent, MoveTarget};
 use crate::ui::toolbar::{PaneShortcuts, Toolbar, ToolbarInit, ToolbarMsg, ToolbarOutput};
 use crate::ui::tree::{Tree, TreeInit, TreeOutput, TreeMsg};
 
@@ -160,12 +160,26 @@ pub struct Pane {
     /// Case-insensitive filter applied to the bookmarks list. Kept per pane so
     /// the filter bar works on the bookmarks view too.
     bookmark_filter: String,
+    /// Shared drag state for the bookmarks list (survives row rebuilds).
+    bookmark_drag: Rc<bookmarks::BookmarkDrag>,
+    /// Keyboard cursor and selection for the bookmarks list.
+    bookmark_nav: Rc<bookmarks::BookmarkNav>,
     /// The pane overlay: its main child is the `{ toolbar, filter_bar?, body }`
     /// vertical box, and its overlay children hold panes' popovers (e.g. the
     /// path-entry completion dropdown). Built once and reused across split/close
     /// rebuilds, so the tree and toolbar widgets never need to be reparented
     /// (which would trip `gtk_box_append: child has a parent`).
     widget: gtk::Overlay,
+    /// The navigation-toolbar buttons when `[panel] nav_toolbar` is enabled;
+    /// their enabled state tracks the pane's root and history.
+    nav_buttons: Option<NavButtons>,
+}
+
+/// The optional navigation toolbar's buttons.
+struct NavButtons {
+    up: gtk::Button,
+    back: gtk::Button,
+    forward: gtk::Button,
 }
 
 impl Pane {
@@ -174,23 +188,41 @@ impl Pane {
     fn set_root(&mut self, root: PathBuf) {
         self.canonical_root = std::fs::canonicalize(&root).ok();
         self.root = Some(root);
+        self.refresh_nav();
     }
 
     /// Show the bookmarks view in this pane's body (and switch its hamburger).
     fn show_bookmarks(&self) {
         self.body.set_visible_child_name("bookmarks");
         self.toolbar.emit(ToolbarMsg::SetBookmarks(true));
+        self.refresh_nav();
     }
 
     /// Show the tree in this pane's body (and switch its hamburger).
     fn show_tree(&self) {
         self.body.set_visible_child_name("tree");
         self.toolbar.emit(ToolbarMsg::SetBookmarks(false));
+        self.refresh_nav();
     }
 
     /// Whether this pane is currently on the bookmarks view.
     fn on_bookmarks(&self) -> bool {
         self.body.visible_child_name().as_deref() == Some("bookmarks")
+    }
+
+    /// Enable the navigation toolbar's buttons to match what the pane can
+    /// actually do: Up needs a parent directory and a tree (not the bookmarks
+    /// view); Back/Forward need history in that direction. A no-op when the
+    /// toolbar is disabled.
+    fn refresh_nav(&self) {
+        let Some(nav) = &self.nav_buttons else {
+            return;
+        };
+        let has_parent = !self.on_bookmarks()
+            && self.root.as_deref().and_then(Path::parent).is_some();
+        nav.up.set_sensitive(has_parent);
+        nav.back.set_sensitive(self.history.can_back());
+        nav.forward.set_sensitive(self.history.can_forward());
     }
 }
 
@@ -359,10 +391,17 @@ pub enum AppMsg {
     ResizeCommit,
     /// Move keyboard focus into pane `id`'s tree (after it is allocated).
     FocusPane { id: u64 },
+    /// Focus the active pane of every visible dock (a window was just mapped,
+    /// e.g. the launch surface), so the keyboard works without a click.
+    FocusVisible,
     /// The bookmarks view in pane `id` reported a user action.
     BookmarkEvent { id: u64, event: BookmarkEvent },
-    /// The bookmark editor for index `index` was saved with the new values.
-    BookmarkEditSaved { index: usize, name: String, path: PathBuf },
+    /// The bookmark editor for the entry at `index_path` was saved.
+    BookmarkEditSaved { index_path: Vec<usize>, name: String, path: Option<PathBuf> },
+    /// A new leaf bookmark was created from the bookmarks view.
+    BookmarkAdded { name: String, path: PathBuf },
+    /// A new (empty) bookmark folder was created from the bookmarks view.
+    BookmarkFolderAdded { name: String },
 }
 
 /// The init payload: the parsed invocation plus the instance socket, if this
@@ -401,6 +440,10 @@ pub struct App {
     /// if it is still the latest (no `SourceId` juggling — removing a one-shot
     /// source that has already fired panics).
     save_generation: Rc<Cell<u64>>,
+    /// A handle to this component's own input, kept so helpers can schedule a
+    /// deferred [`AppMsg::FocusPane`] (focus must land after the newly-shown
+    /// body page is laid out).
+    sender: ComponentSender<App>,
 }
 
 #[relm4::component(pub)]
@@ -508,6 +551,7 @@ impl SimpleComponent for App {
             );
             pane.show_bookmarks();
             pane.history.record(ViewEntry::Bookmarks);
+            pane.refresh_nav();
             panes.push(pane);
             next_id += 1;
         }
@@ -543,6 +587,7 @@ impl SimpleComponent for App {
             last_root: session.last_root.clone(),
             bookmarks,
             save_generation: Rc::new(Cell::new(0)),
+            sender: sender.clone(),
         };
 
         init_layer_window(&model.window, &model.config, primary_side, primary_width);
@@ -566,6 +611,17 @@ impl SimpleComponent for App {
         }
 
         let widgets = view_output!();
+
+        // A mapped surface takes keyboard focus, so launching the panel leaves
+        // the keyboard on the first row without a click (the compositor grants
+        // the layer's keyboard on map; this focuses the row within it).
+        {
+            let sender = sender.clone();
+            model.window.connect_map(move |_| {
+                let sender = sender.clone();
+                glib::idle_add_local_once(move || sender.input(AppMsg::FocusVisible));
+            });
+        }
 
         // Populate every pane's bookmarks list now that the order is settled.
         model.refresh_all_bookmarks(&sender);
@@ -764,8 +820,18 @@ impl SimpleComponent for App {
             }
 
             AppMsg::FocusPane { id } => {
-                if let Some((di, pi)) = self.dock_pane_of(id) {
-                    self.docks[di].panes[pi].tree.emit(TreeMsg::Focus);
+                self.focus_pane(id);
+            }
+
+            AppMsg::FocusVisible => {
+                let ids: Vec<u64> = self
+                    .docks
+                    .iter()
+                    .filter(|dock| dock.window.is_visible())
+                    .filter_map(|dock| dock.panes.last().map(|pane| pane.id))
+                    .collect();
+                for id in ids {
+                    self.focus_pane(id);
                 }
             }
 
@@ -796,25 +862,55 @@ impl SimpleComponent for App {
 
             AppMsg::BookmarkEvent { id, event } => match event {
                 BookmarkEvent::Open(path) => self.open_bookmark(id, path, &sender),
-                BookmarkEvent::Edit(index) => self.edit_bookmark(id, index, &sender),
+                BookmarkEvent::Toggle(index_path) => {
+                    if let Some(entry) = Bookmark::get_mut(&mut self.bookmarks, &index_path) {
+                        entry.expanded = !entry.expanded;
+                    }
+                    self.refresh_all_bookmarks(&sender);
+                }
+                BookmarkEvent::Edit(index_path) => self.edit_bookmark(id, index_path, &sender),
+                BookmarkEvent::NewBookmark => self.new_bookmark(id, &sender),
+                BookmarkEvent::NewBookmarkFolder => self.new_bookmark_folder(id, &sender),
                 BookmarkEvent::Action { path, target } => {
                     self.run_bookmark_action(id, path, target);
                 }
-                BookmarkEvent::Delete(index) => {
-                    if index < self.bookmarks.len() {
-                        self.bookmarks.remove(index);
+                BookmarkEvent::Move { from, to } => self.move_bookmark(from, to, &sender),
+                BookmarkEvent::Delete(index_path) => {
+                    if Bookmark::remove(&mut self.bookmarks, &index_path) {
                         self.save_bookmarks();
                         self.refresh_all_bookmarks(&sender);
                     }
                 }
             },
-            AppMsg::BookmarkEditSaved { index, name, path } => {
-                if let Some(bookmark) = self.bookmarks.get_mut(index) {
-                    bookmark.name = name;
-                    bookmark.path = path;
+            AppMsg::BookmarkEditSaved { index_path, name, path } => {
+                if let Some(entry) = Bookmark::get_mut(&mut self.bookmarks, &index_path) {
+                    entry.name = name;
+                    // A folder has no path; a leaf always sets one.
+                    if path.is_some() {
+                        entry.path = path;
+                    }
                     self.save_bookmarks();
                     self.refresh_all_bookmarks(&sender);
                 }
+            }
+            AppMsg::BookmarkAdded { name, path } => {
+                if Bookmark::contains_path(&self.bookmarks, &path) {
+                    self.status = format!("{} is already bookmarked", path.display());
+                    return;
+                }
+                self.bookmarks.push(Bookmark::leaf(name, path));
+                self.save_bookmarks();
+                self.refresh_all_bookmarks(&sender);
+            }
+            AppMsg::BookmarkFolderAdded { name } => {
+                self.bookmarks.push(Bookmark {
+                    name,
+                    path: None,
+                    items: Vec::new(),
+                    expanded: false,
+                });
+                self.save_bookmarks();
+                self.refresh_all_bookmarks(&sender);
             }
         }
     }
@@ -915,14 +1011,16 @@ impl App {
         self.refresh_visible();
         // When a side was just shown, hand keyboard focus to its top pane so
         // the panel is immediately usable.
-        let focus = plan
+        let focus: Vec<u64> = plan
             .show
             .iter()
             .filter_map(|side| self.dock_of_side(*side))
             .filter_map(|di| self.docks[di].panes.last())
-            .map(|pane| pane.tree.emit(TreeMsg::Focus))
-            .next();
-        let _ = focus;
+            .map(|pane| pane.id)
+            .collect();
+        for id in focus {
+            self.focus_pane(id);
+        }
     }
 
     /// Set `id` as the active pane in whichever dock holds it.
@@ -930,6 +1028,30 @@ impl App {
         if let Some((di, _pi)) = self.dock_pane_of(id) {
             self.docks[di].active_pane = Some(id);
         }
+    }
+
+    /// Hand keyboard focus to pane `id`: the bookmark cursor when the bookmarks
+    /// view is showing, otherwise the tree's current row. Used on launch, on
+    /// show, and when a pane becomes active so the keyboard works without a
+    /// click.
+    fn focus_pane(&mut self, id: u64) {
+        let Some((di, pi)) = self.dock_pane_of(id) else {
+            return;
+        };
+        let pane = &self.docks[di].panes[pi];
+        if pane.on_bookmarks() {
+            pane.bookmark_nav.focus_start();
+        } else {
+            pane.tree.emit(TreeMsg::Focus);
+        }
+    }
+
+    /// Focus pane `id` on the next idle. Used after a body switch: the new page
+    /// (and its freshly-loaded tree rows) is not laid out until then, so an
+    /// immediate `grab_focus` would land on the now-hidden page.
+    fn focus_pane_later(&self, id: u64) {
+        let sender = self.sender.clone();
+        glib::idle_add_local_once(move || sender.input(AppMsg::FocusPane { id }));
     }
 
     /// Show the filter bar for pane `id` and focus its entry. The bar was just
@@ -946,16 +1068,14 @@ impl App {
         }
     }
 
-    /// Append `path` to the bookmarks (skipping a duplicate path) and persist.
+    /// Append `path` to the bookmarks (skipping a duplicate path, at any depth)
+    /// and persist.
     fn add_bookmark(&mut self, path: PathBuf) {
-        if self.bookmarks.iter().any(|b| b.path == path) {
+        if Bookmark::contains_path(&self.bookmarks, &path) {
             self.status = format!("{} is already bookmarked", path.display());
             return;
         }
-        self.bookmarks.push(Bookmark {
-            name: Bookmark::default_name(&path),
-            path: path.clone(),
-        });
+        self.bookmarks.push(Bookmark::leaf(Bookmark::default_name(&path), path.clone()));
         self.save_bookmarks();
         self.status = format!("Bookmarked {}", path.display());
     }
@@ -968,6 +1088,7 @@ impl App {
             self.docks[di].panes[pi].tree.emit(TreeMsg::OpenRoot(path));
             self.set_active(id);
         }
+        self.focus_pane_later(id);
     }
 
     /// Jump pane `id` to a bookmark's directory, replacing its bookmarks view
@@ -1016,23 +1137,104 @@ impl App {
         if let Some((di, pi)) = self.dock_pane_of(id) {
             self.docks[di].panes[pi].show_bookmarks();
             self.docks[di].panes[pi].history.record(ViewEntry::Bookmarks);
+            self.docks[di].panes[pi].refresh_nav();
             self.set_active(id);
         }
+        self.focus_pane_later(id);
     }
 
-    /// Open the bookmark editor for the bookmark at `index`, parented to the
+    /// Open the bookmark editor for the entry at `index_path`, parented to the
     /// window of pane `id`.
-    fn edit_bookmark(&mut self, id: u64, index: usize, sender: &ComponentSender<Self>) {
-        let Some(bookmark) = self.bookmarks.get(index).cloned() else {
+    fn edit_bookmark(&mut self, id: u64, index_path: Vec<usize>, sender: &ComponentSender<Self>) {
+        let Some(bookmark) = Bookmark::get(&self.bookmarks, &index_path).cloned() else {
             return;
         };
         let Some((di, _pi)) = self.dock_pane_of(id) else { return };
         let parent = self.docks[di].window.clone();
         let sender = sender.clone();
-        let path = crate::config::expand_bookmark_path(&bookmark.path);
-        bookmarks::show_bookmark_editor(&parent, &bookmark.name, &path, move |name, path| {
-            sender.input(AppMsg::BookmarkEditSaved { index, name, path });
+        let path = bookmark.path.as_deref().map(crate::config::expand_bookmark_path);
+        let title = if bookmark.is_folder() { "Edit Folder" } else { "Edit Bookmark" };
+        bookmarks::show_bookmark_dialog(
+            &parent,
+            title,
+            &bookmark.name,
+            path.as_deref(),
+            move |name, path| {
+                sender.input(AppMsg::BookmarkEditSaved { index_path: index_path.clone(), name, path });
+            },
+        );
+    }
+
+    /// Open the "new bookmark" dialog for pane `id`: a name and a path (with a
+    /// folder picker), matching the edit dialog.
+    fn new_bookmark(&mut self, id: u64, sender: &ComponentSender<Self>) {
+        let Some((di, _pi)) = self.dock_pane_of(id) else { return };
+        let parent = self.docks[di].window.clone();
+        let sender = sender.clone();
+        bookmarks::show_bookmark_dialog(
+            &parent,
+            "New Bookmark",
+            "",
+            Some(Path::new("")),
+            move |name, path| {
+                if let Some(path) = path {
+                    sender.input(AppMsg::BookmarkAdded { name, path });
+                }
+            },
+        );
+    }
+
+    /// Open the "new folder" dialog for pane `id`: a name only.
+    fn new_bookmark_folder(&mut self, id: u64, sender: &ComponentSender<Self>) {
+        let Some((di, _pi)) = self.dock_pane_of(id) else { return };
+        let parent = self.docks[di].window.clone();
+        let sender = sender.clone();
+        bookmarks::show_bookmark_dialog(&parent, "New Folder", "", None, move |name, _path| {
+            sender.input(AppMsg::BookmarkFolderAdded { name });
         });
+    }
+
+    /// Move the bookmark entry at `from` to `to` (drag and drop), then persist.
+    /// Moving an entry into itself or one of its descendants is refused.
+    fn move_bookmark(&mut self, from: Vec<usize>, to: MoveTarget, sender: &ComponentSender<Self>) {
+        if from.is_empty() {
+            return;
+        }
+        // Resolve the destination against the tree *after* the entry is removed,
+        // so index shifts from the removal are accounted for.
+        let (parent, index) = match &to {
+            MoveTarget::Root => (Vec::new(), usize::MAX),
+            MoveTarget::Into(folder) => {
+                if folder.starts_with(&from) {
+                    return;
+                }
+                (adjust_path_after_removal(&from, folder), usize::MAX)
+            }
+            MoveTarget::Before(leaf) => {
+                if leaf.is_empty() || leaf.starts_with(&from) {
+                    return;
+                }
+                let parent_orig = leaf[..leaf.len() - 1].to_vec();
+                let parent = adjust_path_after_removal(&from, &parent_orig);
+                let mut index = leaf[leaf.len() - 1];
+                // A removal earlier in the same sibling list shifts the target.
+                if from.len() == leaf.len()
+                    && from[..from.len() - 1] == parent_orig[..]
+                    && from[from.len() - 1] < index
+                {
+                    index -= 1;
+                }
+                (parent, index)
+            }
+        };
+        let Some(entry) = Bookmark::take(&mut self.bookmarks, &from) else {
+            return;
+        };
+        if !Bookmark::insert(&mut self.bookmarks, &parent, index, entry) {
+            return;
+        }
+        self.save_bookmarks();
+        self.refresh_all_bookmarks(sender);
     }
 
     /// Save the bookmarks list to its file, reporting any failure.
@@ -1063,7 +1265,15 @@ impl App {
                 let sender = sender.clone();
                 let on_event: Rc<dyn Fn(BookmarkEvent)> =
                     Rc::new(move |event| sender.input(AppMsg::BookmarkEvent { id, event }));
-                bookmarks::fill_bookmarks(&pane.bookmarks_list, &bookmarks, &filter, &menu, on_event);
+                bookmarks::fill_bookmarks(
+                    &pane.bookmarks_list,
+                    &bookmarks,
+                    &filter,
+                    &menu,
+                    &pane.bookmark_drag,
+                    &pane.bookmark_nav,
+                    on_event,
+                );
             }
         }
     }
@@ -1088,6 +1298,8 @@ impl App {
             BuiltinAction::Collapse => self.collapse_dock(id),
             BuiltinAction::ClosePane => sender.input(AppMsg::ClosePane { id }),
             BuiltinAction::ToggleBookmarks => self.show_bookmarks_view(id),
+            BuiltinAction::NewBookmark => self.new_bookmark(id, sender),
+            BuiltinAction::NewBookmarkFolder => self.new_bookmark_folder(id, sender),
             _ => {}
         }
     }
@@ -1107,6 +1319,7 @@ impl App {
             return;
         };
         self.docks[di].panes[pi].tree.emit(TreeMsg::OpenRoot(parent));
+        self.focus_pane_later(id);
     }
 
     /// Step pane `id` back one entry in its history and show it.
@@ -1144,9 +1357,11 @@ impl App {
             ViewEntry::Bookmarks => {
                 self.docks[di].panes[pi].show_bookmarks();
                 self.docks[di].panes[pi].history.finish_navigation();
+                self.docks[di].panes[pi].refresh_nav();
             }
         }
         self.set_active(id);
+        self.focus_pane_later(id);
     }
 
     /// Run a pane-menu shortcut resolved anywhere in pane `id`. Pane builtins go
@@ -1223,16 +1438,23 @@ impl App {
 
     /// Show/hide every dock window.
     fn set_docks_visible(&mut self, visible: bool) {
+        let focus: Vec<u64> = self
+            .docks
+            .iter()
+            .filter_map(|dock| dock.panes.last().map(|pane| pane.id))
+            .collect();
         for dock in &self.docks {
             dock.window.set_visible(visible);
-            // When the panel is shown, hand keyboard focus to its active pane.
-            if visible
-                && let Some(pane) = dock.panes.last()
-            {
-                pane.tree.emit(TreeMsg::Focus);
-            }
         }
         self.visible = visible;
+        // Hand keyboard focus to each dock's active pane. The window-map handler
+        // also does this once the surface is realized, so a just-shown panel
+        // gets focus even though the grab here may precede allocation.
+        if visible {
+            for id in focus {
+                self.focus_pane(id);
+            }
+        }
     }
 
     /// Recomputed flag: true while at least one dock is shown. Drives the
@@ -1326,6 +1548,15 @@ impl App {
         let window = gtk::Window::new();
         init_layer_window(&window, config, side, width);
         window.set_default_size(width as i32, 520);
+        // As with the primary dock, hand focus to this dock's pane once its
+        // surface is mapped (grab_focus before that no-ops).
+        {
+            let sender = sender.clone();
+            window.connect_map(move |_| {
+                let sender = sender.clone();
+                glib::idle_add_local_once(move || sender.input(AppMsg::FocusVisible));
+            });
+        }
         if layer_shell_available() {
             attach_resize_controls(&window, side, sender);
         }
@@ -1372,6 +1603,7 @@ impl App {
             None => {
                 pane.show_bookmarks();
                 pane.history.record(ViewEntry::Bookmarks);
+                pane.refresh_nav();
             }
         }
         if let Some(root) = &root {
@@ -1428,6 +1660,49 @@ fn pane_item_message(target: &ShortcutTarget) -> Option<TreeMsg> {
     }
 }
 
+/// Build the optional navigation toolbar: Up One Level, Back, Forward. Each
+/// button dispatches its pane builtin through the same path as the hamburger,
+/// so no new message type is needed.
+fn build_nav_bar(id: u64, sender: &ComponentSender<App>) -> (gtk::Box, NavButtons) {
+    let bar = gtk::Box::new(gtk::Orientation::Horizontal, 2);
+    bar.add_css_class("nav-toolbar");
+
+    let up = nav_button("pan-up-symbolic", "Up One Level", BuiltinAction::Up, id, sender);
+    let back = nav_button("pan-start-symbolic", "Back", BuiltinAction::Back, id, sender);
+    let forward = nav_button("pan-end-symbolic", "Forward", BuiltinAction::Forward, id, sender);
+
+    bar.append(&up);
+    bar.append(&back);
+    bar.append(&forward);
+    (bar, NavButtons { up, back, forward })
+}
+
+/// One flat icon button in the navigation toolbar. Not focusable, so clicking it
+/// never pulls the keyboard out of the tree or bookmarks list.
+fn nav_button(
+    icon: &str,
+    tooltip: &str,
+    action: BuiltinAction,
+    id: u64,
+    sender: &ComponentSender<App>,
+) -> gtk::Button {
+    let button = gtk::Button::from_icon_name(icon);
+    button.add_css_class("nav-button");
+    button.add_css_class("flat");
+    button.set_tooltip_text(Some(tooltip));
+    button.set_focusable(false);
+    button.set_can_focus(false);
+    button.set_valign(gtk::Align::Center);
+    let sender = sender.clone();
+    button.connect_clicked(move |_| {
+        sender.input(AppMsg::PaneToolbar {
+            id,
+            out: ToolbarOutput::PaneItem(ShortcutTarget::Builtin(action)),
+        });
+    });
+    button
+}
+
 fn make_pane(
     config: &Config,
     parent: gtk::Window,
@@ -1458,6 +1733,15 @@ fn make_pane(
 
     let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
     widget.append(toolbar.widget());
+
+    // ── optional navigation toolbar (up one level / back / forward) ─────────
+    let nav_buttons = if config.panel.nav_toolbar {
+        let (bar, buttons) = build_nav_bar(id, &sender);
+        widget.append(&bar);
+        Some(buttons)
+    } else {
+        None
+    };
 
     // ── per-pane filter row (hidden until requested) ────────────────────────
     let filter_bar = gtk::Box::new(gtk::Orientation::Horizontal, 4);
@@ -1505,6 +1789,17 @@ fn make_pane(
     bookmarks_scroll.set_vexpand(true);
     bookmarks_scroll.add_css_class("bookmarks-view");
     bookmarks_scroll.set_child(Some(&bookmarks_list));
+    let bookmark_drag = bookmarks::BookmarkDrag::new();
+    let bookmark_nav = bookmarks::BookmarkNav::new(&bookmarks_list);
+    // The blank-area menu and the drag-and-drop wiring (reorder/move entries,
+    // including in and out of folders).
+    {
+        let items = config.bookmarks.blank.clone();
+        let sender = sender.clone();
+        let on_event: Rc<dyn Fn(BookmarkEvent)> =
+            Rc::new(move |event| sender.input(AppMsg::BookmarkEvent { id, event }));
+        bookmarks::attach_bookmarks_scroller(&bookmarks_scroll, &items, side, &bookmark_drag, &bookmark_nav, on_event);
+    }
 
     let body = gtk::Stack::new();
     body.set_vexpand(true);
@@ -1551,6 +1846,9 @@ fn make_pane(
         body,
         bookmarks_list,
         bookmark_filter: String::new(),
+        bookmark_drag,
+        bookmark_nav,
+        nav_buttons,
         widget: overlay,
     }
 }
@@ -1934,6 +2232,42 @@ fn default_root(startup: &StartupRoot) -> Option<PathBuf> {
     let last = SessionState::load().last_root.filter(|p| p.is_dir());
     startup.resolve(last).filter(|p| p.is_dir()).or_else(home_dir)
 }
+
+/// Translate an index `path` into the tree that remains after the entry at
+/// `from` is removed. Index paths that diverge from `from` deeper in a different
+/// subtree are unaffected; a sibling before the removed entry shifts down one.
+fn adjust_path_after_removal(from: &[usize], path: &[usize]) -> Vec<usize> {
+    let mut out = path.to_vec();
+    for level in 0..path.len().min(from.len()) {
+        if from[level] < path[level] {
+            out[level] -= 1;
+            return out;
+        } else if from[level] > path[level] {
+            return out;
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod adjust_path_tests {
+    use super::adjust_path_after_removal;
+
+    #[test]
+    fn adjusts_sibling_indices_after_a_removal() {
+        // Removing index 0: later siblings shift down.
+        assert_eq!(adjust_path_after_removal(&[0], &[2]), vec![1]);
+        // Removing index 2: earlier siblings are unaffected.
+        assert_eq!(adjust_path_after_removal(&[2], &[0]), vec![0]);
+        // A deeper path in a sibling subtree shifts at the first level only.
+        assert_eq!(adjust_path_after_removal(&[0], &[1, 3]), vec![0, 3]);
+        // An ancestor of the removed node is unaffected.
+        assert_eq!(adjust_path_after_removal(&[1, 2], &[1]), vec![1]);
+        // Diverge at the second level: only that index shifts.
+        assert_eq!(adjust_path_after_removal(&[1, 0], &[1, 2]), vec![1, 1]);
+    }
+}
+
 #[cfg(test)]
 mod visibility_tests {
     use super::*;

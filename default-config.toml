@@ -18,13 +18,16 @@ side = "left"        # screen edge to dock to: "left" | "right"
 layer = "bottom"     # stacking layer: "background" | "bottom" | "top" | "overlay"
 width = 300          # panel width in px (clamped to 160–2000)
 margin = 0           # gap from the screen edge in px (clamped to 0–200)
+nav_toolbar = false  # show a nav toolbar (up, back, forward) below the path bar
 
 # -- Bookmarks ----------------------------------------------------------------
 # Bookmarks are a pane view: a panel opened without a directory shows them as
 # suggested places to jump to, and clicking one replaces the view with that
 # directory. The list lives in `file` below (created with a single home bookmark
-# on first launch); each entry can be renamed or removed from its right-click
-# menu, and "Add Bookmark" in a directory's menu adds one.
+# on first launch) as a compact array of entries; an entry with nested `items` is
+# a folder, expanded/collapsed like a tree directory (set `expanded = true` to
+# start it open). Each entry can be renamed or removed from its right-click menu,
+# and "Add Bookmark" in a directory's menu adds one.
 [bookmarks]
 file = "bookmarks.toml" # list file, relative to this config (or absolute)
 
@@ -33,6 +36,10 @@ file = "bookmarks.toml" # list file, relative to this config (or absolute)
 # Collapse, Close Pane) apply. "Up One Level" would be a no-op here, so it is
 # left out.
 menu = [
+    "New Bookmark",
+    "New Bookmark Folder",
+
+    "---",
     "Open Folder...",
     "Filter...",
     "Split View",
@@ -54,6 +61,12 @@ context = [
     "---",
     "Edit Bookmark",
     "Delete Bookmark",
+]
+
+# The menu opened by right-clicking the empty area below the bookmarks.
+blank = [
+    "New Bookmark",
+    "New Bookmark Folder",
 ]
 
 # -- Tree ---------------------------------------------------------------------

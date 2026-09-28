@@ -174,7 +174,7 @@ pub fn default_bookmarks() -> Vec<Bookmark> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|home| !home.as_os_str().is_empty())
-        .map(|home| vec![Bookmark { name: String::from("Home"), path: home }])
+        .map(|home| vec![Bookmark::leaf(String::from("Home"), home)])
         .unwrap_or_default()
 }
 
@@ -242,6 +242,9 @@ fn default_panel_layer() -> PanelLayer {
 fn default_panel_width() -> u32 {
     builtin().panel.width
 }
+fn default_panel_nav_toolbar() -> bool {
+    builtin().panel.nav_toolbar
+}
 fn default_dirs_first() -> bool {
     builtin().tree.dirs_first
 }
@@ -269,6 +272,9 @@ fn default_bookmarks_menu() -> Vec<ContextAction> {
 fn default_bookmarks_context() -> Vec<ContextAction> {
     builtin().bookmarks.context.clone()
 }
+fn default_bookmarks_blank() -> Vec<ContextAction> {
+    builtin().bookmarks.blank.clone()
+}
 
 /// Dock/panel configuration. Field-level serde defaults keep a partially
 /// written `[panel]` table valid without consulting `Self::default()` (which
@@ -285,6 +291,10 @@ pub struct PanelConfig {
     /// Pixel margin around the panel within the screen edge.
     #[serde(default)]
     pub margin: u32,
+    /// Show a navigation toolbar (up one level, back, forward) directly below
+    /// the path bar. Off by default; the same actions stay on `[pane_menu]`.
+    #[serde(default = "default_panel_nav_toolbar")]
+    pub nav_toolbar: bool,
 }
 
 impl Default for PanelConfig {
@@ -657,6 +667,10 @@ pub enum BuiltinAction {
     EditBookmark,
     /// Bookmark-only: delete the clicked bookmark.
     DeleteBookmark,
+    /// Bookmarks view: create a new leaf bookmark.
+    NewBookmark,
+    /// Bookmarks view: create a new (empty) bookmark folder.
+    NewBookmarkFolder,
     /// A menu divider; never does anything.
     Separator,
 }
@@ -704,6 +718,8 @@ impl BuiltinAction {
             BuiltinAction::ToggleBookmarks => "Bookmarks",
             BuiltinAction::EditBookmark => "Edit Bookmark",
             BuiltinAction::DeleteBookmark => "Delete Bookmark",
+            BuiltinAction::NewBookmark => "New Bookmark",
+            BuiltinAction::NewBookmarkFolder => "New Bookmark Folder",
             BuiltinAction::Separator => "---",
         }
     }
@@ -789,13 +805,21 @@ impl BuiltinAction {
                 | BuiltinAction::Collapse
                 | BuiltinAction::ClosePane
                 | BuiltinAction::ToggleBookmarks
+                | BuiltinAction::NewBookmark
+                | BuiltinAction::NewBookmarkFolder
         )
     }
 
     /// Whether this action only makes sense inside the bookmarks view's own
-    /// menu (it needs a bookmark entry as its target).
+    /// menu (it needs a bookmark entry as its target, or creates one).
     pub fn is_bookmark_only(&self) -> bool {
-        matches!(self, BuiltinAction::EditBookmark | BuiltinAction::DeleteBookmark)
+        matches!(
+            self,
+            BuiltinAction::EditBookmark
+                | BuiltinAction::DeleteBookmark
+                | BuiltinAction::NewBookmark
+                | BuiltinAction::NewBookmarkFolder
+        )
     }
 
     /// Parse a configuration string, case-insensitively. `"---"` and
@@ -851,6 +875,8 @@ impl BuiltinAction {
             Self::ToggleBookmarks,
             Self::EditBookmark,
             Self::DeleteBookmark,
+            Self::NewBookmark,
+            Self::NewBookmarkFolder,
             Self::Separator,
         ]
         .into_iter()
@@ -1224,6 +1250,10 @@ pub struct BookmarksConfig {
     /// `Delete Bookmark` are the bookmark-specific actions.
     #[serde(default = "default_bookmarks_context")]
     pub context: Vec<ContextAction>,
+    /// The context menu opened by right-clicking the empty area below the
+    /// bookmarks (usually the "new bookmark" items).
+    #[serde(default = "default_bookmarks_blank")]
+    pub blank: Vec<ContextAction>,
 }
 
 impl Default for BookmarksConfig {
@@ -1232,11 +1262,26 @@ impl Default for BookmarksConfig {
     }
 }
 
-/// One saved directory shortcut.
+/// One entry in the bookmarks list: either a directory shortcut (has a `path`),
+/// a folder grouping nested entries (non-empty `items`), or both.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Bookmark {
     pub name: String,
-    pub path: PathBuf,
+    /// The directory this entry opens. `None` for a pure folder.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+    /// Nested entries. A non-empty list makes this a folder, expanded or
+    /// collapsed with `expanded`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub items: Vec<Bookmark>,
+    /// Whether a folder starts expanded. Serialized only when true.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub expanded: bool,
+}
+
+/// `skip_serializing_if` helper: omit `false` booleans from the bookmarks file.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl Bookmark {
@@ -1248,9 +1293,92 @@ impl Bookmark {
             .filter(|name| !name.is_empty())
             .unwrap_or_else(|| path.display().to_string())
     }
+
+    /// A leaf bookmark pointing at `path`.
+    pub fn leaf(name: String, path: PathBuf) -> Self {
+        Bookmark { name, path: Some(path), items: Vec::new(), expanded: false }
+    }
+
+    /// Whether this entry is a folder. Anything without a path is a folder
+    /// (including an empty one just created); an entry with both a path and
+    /// children is both clickable and a container.
+    pub fn is_folder(&self) -> bool {
+        self.path.is_none() || !self.items.is_empty()
+    }
+
+    /// Whether any entry in the tree points at `path`.
+    pub fn contains_path(entries: &[Bookmark], path: &Path) -> bool {
+        entries.iter().any(|entry| {
+            entry.path.as_deref() == Some(path) || Bookmark::contains_path(&entry.items, path)
+        })
+    }
+
+    /// The entry at an index path (each element indexes into the next level).
+    pub fn get<'a>(entries: &'a [Bookmark], index_path: &[usize]) -> Option<&'a Bookmark> {
+        let (head, rest) = index_path.split_first()?;
+        let entry = entries.get(*head)?;
+        if rest.is_empty() {
+            Some(entry)
+        } else {
+            Bookmark::get(&entry.items, rest)
+        }
+    }
+
+    /// The entry at an index path (each element indexes into the next level),
+    /// mutably.
+    pub fn get_mut<'a>(entries: &'a mut [Bookmark], index_path: &[usize]) -> Option<&'a mut Bookmark> {
+        let (head, rest) = index_path.split_first()?;
+        let entry = entries.get_mut(*head)?;
+        if rest.is_empty() {
+            Some(entry)
+        } else {
+            Bookmark::get_mut(&mut entry.items, rest)
+        }
+    }
+
+    /// Remove the entry at `index_path`, returning whether it existed.
+    #[allow(clippy::ptr_arg)] // removal needs `Vec`, not a slice
+    pub fn remove(entries: &mut Vec<Bookmark>, index_path: &[usize]) -> bool {
+        Bookmark::take(entries, index_path).is_some()
+    }
+
+    /// Remove and return the entry at `index_path` (for moving it elsewhere).
+    #[allow(clippy::ptr_arg)] // removal needs `Vec`, not a slice
+    pub fn take(entries: &mut Vec<Bookmark>, index_path: &[usize]) -> Option<Bookmark> {
+        let (last, parents) = index_path.split_last()?;
+        if parents.is_empty() {
+            (*last < entries.len()).then(|| entries.remove(*last))
+        } else if let Some(parent) = Bookmark::get_mut(entries, parents) {
+            (*last < parent.items.len()).then(|| parent.items.remove(*last))
+        } else {
+            None
+        }
+    }
+
+    /// Insert `entry` into the list at `parent` (empty = top level), at `index`
+    /// clamped to the list length.
+    pub fn insert(
+        entries: &mut Vec<Bookmark>,
+        parent: &[usize],
+        index: usize,
+        entry: Bookmark,
+    ) -> bool {
+        if parent.is_empty() {
+            entries.insert(index.min(entries.len()), entry);
+            true
+        } else if let Some(folder) = Bookmark::get_mut(entries, parent) {
+            folder.items.insert(index.min(folder.items.len()), entry);
+            true
+        } else {
+            false
+        }
+    }
 }
 
-/// The on-disk shape of the bookmarks file: a top-level `[[bookmarks]]` array.
+/// The on-disk shape of the bookmarks file: a top-level `bookmarks` array. The
+/// reader accepts both the compact `bookmarks = [{ ... }]` form written by
+/// [`bookmarks_to_toml`] and the older `[[bookmarks]]` / `[[bookmarks.items]]`
+/// tables.
 #[derive(Debug, Default, Serialize, Deserialize)]
 struct BookmarksFile {
     #[serde(default)]
@@ -1522,11 +1650,75 @@ pub fn save_bookmarks_to_path(path: &Path, bookmarks: &[Bookmark]) -> Result<(),
     {
         return Err(LoadProblem::Io(parent.to_path_buf(), err.kind()));
     }
-    let body = toml::to_string_pretty(&BookmarksFile { bookmarks: bookmarks.to_vec() })
-        .map_err(|_| LoadProblem::Io(path.to_path_buf(), std::io::ErrorKind::InvalidData))?;
+    let body = bookmarks_to_toml(bookmarks);
     let tmp = path.with_extension("toml.tmp");
     std::fs::write(&tmp, body).map_err(|err| LoadProblem::Io(tmp.clone(), err.kind()))?;
     std::fs::rename(&tmp, path).map_err(|err| LoadProblem::Io(path.to_path_buf(), err.kind()))
+}
+
+/// Render the bookmarks list as compact TOML:
+///
+/// ```toml
+/// bookmarks = [
+///     { name = "Home", path = "/home/me" },
+///     { name = "Work", expanded = true, items = [
+///         { name = "Repo", path = "/srv/repo" },
+///     ] },
+/// ]
+/// ```
+///
+/// The reader accepts this and the older `[[bookmarks]]` / `[[bookmarks.items]]`
+/// form alike, so only the writer needs to know the shape.
+fn bookmarks_to_toml(bookmarks: &[Bookmark]) -> String {
+    let mut out = String::from("bookmarks = [\n");
+    for bookmark in bookmarks {
+        out.push_str(&bookmark_to_toml(bookmark, 4));
+        out.push_str(",\n");
+    }
+    out.push_str("]\n");
+    out
+}
+
+/// One bookmarks entry as an inline table, indented by `indent` spaces. Nested
+/// folders render as an `items = [ ... ]` array on the same line.
+fn bookmark_to_toml(bookmark: &Bookmark, indent: usize) -> String {
+    let pad = " ".repeat(indent);
+    let mut fields = vec![format!("name = {}", toml_string(&bookmark.name))];
+    if let Some(path) = &bookmark.path {
+        fields.push(format!("path = {}", toml_string(&path.to_string_lossy())));
+    }
+    if bookmark.expanded {
+        fields.push("expanded = true".to_owned());
+    }
+    if !bookmark.items.is_empty() {
+        let mut items = String::from("items = [\n");
+        for child in &bookmark.items {
+            items.push_str(&bookmark_to_toml(child, indent + 4));
+            items.push_str(",\n");
+        }
+        items.push_str(&format!("{pad}]"));
+        fields.push(items);
+    }
+    format!("{pad}{{ {} }}", fields.join(", "))
+}
+
+/// A double-quoted TOML basic string with the standard escapes.
+fn toml_string(value: &str) -> String {
+    let mut out = String::with_capacity(value.len() + 2);
+    out.push('"');
+    for ch in value.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if (ch as u32) < 0x20 => out.push_str(&format!("\\u{:04X}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out.push('"');
+    out
 }
 
 /// Create the bookmarks file for `config` (containing `list`) on first launch,
@@ -1802,6 +1994,15 @@ icon_size = 20
         assert_eq!(config.panel.side, PanelSide::Right);
         assert_eq!(config.panel.width, Config::default().panel.width);
         assert_eq!(config.tree, Config::default().tree);
+    }
+
+    #[test]
+    fn nav_toolbar_defaults_off_and_can_be_enabled() {
+        // Off unless the user asks for it, and a partial `[panel]` table that
+        // omits it keeps the shipped default (off).
+        assert!(!Config::default().panel.nav_toolbar);
+        assert!(!parse("[panel]\nside = \"right\"\n").panel.nav_toolbar);
+        assert!(parse("[panel]\nnav_toolbar = true\n").panel.nav_toolbar);
     }
 
     #[test]
@@ -2358,8 +2559,16 @@ items = [
         assert!(BuiltinAction::ToggleBookmarks.is_pane_action());
         assert_eq!(BuiltinAction::parse("Edit Bookmark"), Some(BuiltinAction::EditBookmark));
         assert_eq!(BuiltinAction::parse("Delete Bookmark"), Some(BuiltinAction::DeleteBookmark));
+        assert_eq!(BuiltinAction::parse("New Bookmark"), Some(BuiltinAction::NewBookmark));
+        assert_eq!(
+            BuiltinAction::parse("New Bookmark Folder"),
+            Some(BuiltinAction::NewBookmarkFolder)
+        );
         assert!(BuiltinAction::EditBookmark.is_bookmark_only());
         assert!(BuiltinAction::DeleteBookmark.is_bookmark_only());
+        assert!(BuiltinAction::NewBookmark.is_bookmark_only());
+        assert!(BuiltinAction::NewBookmarkFolder.is_bookmark_only());
+        assert!(BuiltinAction::NewBookmark.is_pane_action());
     }
 
     #[test]
@@ -2367,6 +2576,7 @@ items = [
         let shipped = Config::default().bookmarks;
         assert!(!shipped.menu.is_empty());
         assert!(!shipped.context.is_empty());
+        assert!(!shipped.blank.is_empty());
         // The shipped context extras are the bookmark-only actions.
         assert!(
             shipped
@@ -2375,19 +2585,28 @@ items = [
                 .any(|a| a.shortcut().is_none()
                     && matches!(a, ContextAction::Builtin(BuiltinAction::EditBookmark)))
         );
+        // The blank menu offers the "new" bookmark actions.
+        assert!(
+            shipped
+                .blank
+                .iter()
+                .any(|a| matches!(a, ContextAction::Builtin(BuiltinAction::NewBookmark)))
+        );
 
-        // A partial `[bookmarks]` keeps the shipped menu/context.
+        // A partial `[bookmarks]` keeps the shipped menu/context/blank.
         let partial = parse("[bookmarks]\nfile = \"bm.toml\"\n").bookmarks;
         assert_eq!(partial.menu, shipped.menu);
         assert_eq!(partial.context, shipped.context);
+        assert_eq!(partial.blank, shipped.blank);
 
         // And they can be overridden.
         let custom = parse(
-            "[bookmarks]\nmenu = [\"Open Folder...\"]\ncontext = [\"Delete Bookmark\"]\n",
+            "[bookmarks]\nmenu = [\"Open Folder...\"]\ncontext = [\"Delete Bookmark\"]\nblank = [\"New Bookmark\"]\n",
         )
         .bookmarks;
         assert_eq!(custom.menu.len(), 1);
         assert_eq!(custom.context.len(), 1);
+        assert_eq!(custom.blank.len(), 1);
     }
 
     #[test]
@@ -2395,13 +2614,71 @@ items = [
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bookmarks.toml");
         let list = vec![
-            Bookmark { name: "Home".to_owned(), path: PathBuf::from("/home/x") },
-            Bookmark { name: "Code".to_owned(), path: PathBuf::from("/srv/code") },
+            Bookmark::leaf("Home".to_owned(), PathBuf::from("/home/x")),
+            Bookmark::leaf("Code".to_owned(), PathBuf::from("/srv/code")),
         ];
         save_bookmarks_to_path(&path, &list).unwrap();
         let (loaded, problem) = load_bookmarks_from_path(&path);
         assert!(problem.is_none());
         assert_eq!(loaded, list);
+    }
+
+    #[test]
+    fn bookmark_folders_round_trip_and_are_searched() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bookmarks.toml");
+        let list = vec![Bookmark {
+            name: "Work".to_owned(),
+            path: None,
+            items: vec![
+                Bookmark::leaf("Repo".to_owned(), PathBuf::from("/srv/repo")),
+                Bookmark {
+                    name: "Nested".to_owned(),
+                    path: None,
+                    items: vec![Bookmark::leaf("Deep".to_owned(), PathBuf::from("/srv/deep"))],
+                    expanded: true,
+                },
+            ],
+            expanded: false,
+        }];
+        save_bookmarks_to_path(&path, &list).unwrap();
+        let (loaded, problem) = load_bookmarks_from_path(&path);
+        assert!(problem.is_none());
+        assert_eq!(loaded, list);
+
+        // Nested paths are found and removable by index path.
+        assert!(Bookmark::contains_path(&loaded, Path::new("/srv/deep")));
+        assert!(!Bookmark::contains_path(&loaded, Path::new("/nope")));
+        let mut mutable = loaded.clone();
+        assert!(Bookmark::remove(&mut mutable, &[0, 1, 0]));
+        assert!(!Bookmark::contains_path(&mutable, Path::new("/srv/deep")));
+        assert!(!Bookmark::remove(&mut mutable, &[0, 9]));
+    }
+
+    #[test]
+    fn remove_deletes_top_level_and_nested_entries() {
+        let mut list = vec![
+            Bookmark::leaf("A".to_owned(), PathBuf::from("/a")),
+            Bookmark {
+                name: "F".to_owned(),
+                path: None,
+                items: vec![Bookmark::leaf("B".to_owned(), PathBuf::from("/b"))],
+                expanded: false,
+            },
+            Bookmark::leaf("C".to_owned(), PathBuf::from("/c")),
+        ];
+        // A nested leaf.
+        assert!(Bookmark::remove(&mut list, &[1, 0]));
+        assert!(!Bookmark::contains_path(&list, Path::new("/b")));
+        // A top-level folder (this was the regression).
+        assert!(Bookmark::remove(&mut list, &[1]));
+        assert_eq!(list.len(), 2);
+        // A top-level leaf.
+        assert!(Bookmark::remove(&mut list, &[0]));
+        assert!(!Bookmark::contains_path(&list, Path::new("/a")));
+        // An empty or out-of-range path removes nothing.
+        assert!(!Bookmark::remove(&mut list, &[]));
+        assert!(!Bookmark::remove(&mut list, &[9]));
     }
 
     #[test]
@@ -2414,15 +2691,46 @@ items = [
     }
 
     #[test]
+    fn bookmarks_file_is_written_compactly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bookmarks.toml");
+        let list = vec![
+            Bookmark::leaf("Home".to_owned(), PathBuf::from("/home/me")),
+            Bookmark {
+                name: "Work".to_owned(),
+                path: None,
+                items: vec![Bookmark::leaf("Repo".to_owned(), PathBuf::from("/srv/repo"))],
+                expanded: true,
+            },
+        ];
+        save_bookmarks_to_path(&path, &list).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        // The compact array-of-inline-tables form, not `[[bookmarks]]` tables.
+        assert!(text.starts_with("bookmarks = [\n"), "{text}");
+        assert!(!text.contains("[[bookmarks]]"), "{text}");
+        assert!(!text.contains("[[bookmarks.items]]"), "{text}");
+        // And it reads back identically.
+        let (loaded, problem) = load_bookmarks_from_path(&path);
+        assert!(problem.is_none());
+        assert_eq!(loaded, list);
+    }
+
+    #[test]
+    fn bookmark_strings_are_quoted_and_escaped() {
+        assert_eq!(toml_string("plain"), "\"plain\"");
+        assert_eq!(toml_string("a\"b\\c\n\t"), "\"a\\\"b\\\\c\\n\\t\"");
+    }
+
+    #[test]
     fn ensure_bookmarks_creates_and_never_clobbers() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bookmarks.toml");
-        let list = vec![Bookmark { name: "Home".to_owned(), path: PathBuf::from("/home/x") }];
+        let list = vec![Bookmark::leaf("Home".to_owned(), PathBuf::from("/home/x"))];
         ensure_bookmarks_at(&path, &list).unwrap();
         let (loaded, _) = load_bookmarks_from_path(&path);
         assert_eq!(loaded, list);
         // A second call must leave the existing file untouched.
-        let other = vec![Bookmark { name: "Other".to_owned(), path: PathBuf::from("/tmp") }];
+        let other = vec![Bookmark::leaf("Other".to_owned(), PathBuf::from("/tmp"))];
         ensure_bookmarks_at(&path, &other).unwrap();
         let (loaded, _) = load_bookmarks_from_path(&path);
         assert_eq!(loaded, list);

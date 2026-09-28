@@ -1,22 +1,22 @@
 //! tree-space — a dockable, keyboard-first file manager panel for Wayland/Hyprland.
 //!
 //! Usage:
-//!   tree-space                            — start the panel, or toggle it if a
+//!   ts                            — start the panel, or toggle it if a
 //!                                           panel is already running
-//!   tree-space --side left|right          — dock to that screen edge
+//!   ts --side left|right          — dock to that screen edge
 //!                                           (default: the configured side)
-//!   tree-space /path/a [/path/b ...]        — open each directory as a pane
-//!   tree-space --side right /path         — open a pane in the right dock
-//!   tree-space /path/to/file              — reveal a file: open its folder and
+//!   ts /path/a [/path/b ...]        — open each directory as a pane
+//!   ts --side right /path         — open a pane in the right dock
+//!   ts /path/to/file              — reveal a file: open its folder and
 //!                                           select it
-//!   tree-space --select /path/to/anything — reveal an explicit file or folder
-//!   tree-space --hidden                   — launch (or keep) the panel hidden
-//!   tree-space --width 420                — set the panel width (absolute px)
-//!   tree-space --width +40                — widen the panel by 40px (`-40` narrows)
+//!   ts --select /path/to/anything — reveal an explicit file or folder
+//!   ts --hidden                   — launch (or keep) the panel hidden
+//!   ts --width 420                — set the panel width (absolute px)
+//!   ts --width +40                — widen the panel by 40px (`-40` narrows)
 //!
 //! Directories may also be passed via the TREE_SPACE_DIRS environment variable
 //! as a colon-separated list:
-//!   TREE_SPACE_DIRS=/a:/b tree-space
+//!   TREE_SPACE_DIRS=/a:/b ts
 //!
 //! Single instance
 //! ───────────────
@@ -38,10 +38,10 @@
 //! Desktop / XDG activation
 //! ────────────────────────
 //! The `GApplication` is created with `HANDLES_OPEN` and an `open` handler, so
-//! a `.desktop` entry using `Exec=tree-space %u` (or `xdg-open`, or a portal
+//! a `.desktop` entry using `Exec=ts %u` (or `xdg-open`, or a portal
 //! request) forwards the file/folder to the running panel instead of being
 //! discarded. The handler funnels every opened file back through the same
-//! instance socket, so it behaves exactly like `tree-space --select <path>`.
+//! instance socket, so it behaves exactly like `ts --select <path>`.
 
 use std::path::PathBuf;
 
@@ -82,7 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Build the GApplication by hand so it carries `HANDLES_OPEN` and an `open`
     // handler: that is what lets desktop/X!DG activation (a `.desktop` with
-    // `Exec=tree-space %u`, `xdg-open`, a portal request) hand us a file or
+    // `Exec=ts %u`, `xdg-open`, a portal request) hand us a file or
     // folder instead of silently discarding it. Every such request is turned
     // back into a [`Command`] and pushed through the same instance socket the
     // CLI uses, so it lands in the running panel as an ordinary reveal.
@@ -102,7 +102,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app = RelmApp::from_app(app)
         .visible_on_activate(!command.hidden)
-        .with_args(vec!["tree-space".to_owned()]);
+        .with_args(vec!["ts".to_owned()]);
     app.run::<App>(AppInit { command, listener });
 
     Ok(())
@@ -127,7 +127,7 @@ fn print_usage() {
 tree-space — a dockable, keyboard-first file manager panel.
 
 USAGE:
-    tree-space [OPTIONS] [PATH ...]
+    ts [OPTIONS] [PATH ...]
 
 ARGS:
     PATH...  Paths to open. A directory opens as a pane (an already-open
@@ -140,7 +140,7 @@ OPTIONS:
     --select <PATH>           Reveal PATH: open its containing folder and
                               select it. Works for a file or a folder, and is
                               the mechanism `.desktop`/`xdg-open` activation
-                              uses (`Exec=tree-space %u`).
+                              uses (`Exec=ts %u`).
     -H, --hidden              Launch hidden (or, for a running panel, hide it
                               and keep it hidden). Never shows the panel.
     -w, --width <W>           Resize the panel. `420` sets an absolute width;

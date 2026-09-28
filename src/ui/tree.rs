@@ -189,7 +189,7 @@ fn provider_for_paths(paths: &[PathBuf]) -> gdk::ContentProvider {
 /// `DragSource` would use. The threshold comes from the widget's settings
 /// (`gtk-dnd-drag-threshold`, 8px by default); a cast guards against a
 /// nonsensical negative value.
-fn past_drag_threshold(row: &gtk::Widget, start: (f64, f64), now: (f64, f64)) -> bool {
+pub(crate) fn past_drag_threshold(row: &gtk::Widget, start: (f64, f64), now: (f64, f64)) -> bool {
     let threshold = row
         .settings()
         .gtk_dnd_drag_threshold()
@@ -231,7 +231,7 @@ struct DragOrigin {
 /// `gtk_drag_source_drag_begin` performs instead of relying on its gesture.
 ///
 /// Returns `true` if the drag actually began.
-fn begin_row_drag(
+pub(crate) fn begin_row_drag(
     widget: &gtk::Widget,
     paths: &[PathBuf],
     start: (f64, f64),
@@ -582,6 +582,10 @@ pub struct Tree {
     /// Row index to bring into view on the next widget pass (set by
     /// [`TreeMsg::SelectPath`], which has no widget access of its own).
     scroll_to: Option<usize>,
+    /// A focus request arrived before any row existed (a freshly-opened
+    /// directory may still be loading); take the keyboard once the first row is
+    /// built.
+    focus_pending: bool,
 
     /// The paths a drag started from a row should carry. Updated on every row
     /// press (from the selection at that moment) and read by each row's
@@ -749,6 +753,7 @@ impl Component for Tree {
             selection_dirty: false,
             typeahead: TypeAhead::default(),
             scroll_to: None,
+            focus_pending: false,
             drag_payload: Rc::new(RefCell::new(Vec::new())),
             drag_active: Rc::new(Cell::new(false)),
             pending_click: None,
@@ -886,6 +891,12 @@ impl Component for Tree {
             // The rows are the focusable widgets (the list/scrolled are not),
             // so focus the row at the keyboard cursor — falling back to the
             // first row, then the list.
+            if widgets.list.row_at_index(0).is_none() {
+                // A freshly-opened directory has not loaded yet; take focus once
+                // the first row is built (see the tail of this method).
+                self.focus_pending = true;
+                return;
+            }
             let index = self.cursor.unwrap_or(0) as i32;
             if let Some(row) = widgets
                 .list
@@ -919,6 +930,19 @@ impl Component for Tree {
         }
         <Self as Component>::update_view(self, widgets, sender.clone());
         rebuild(self, widgets, sender);
+        // A focus request that arrived while the directory was still loading:
+        // the first row now exists, so take the keyboard.
+        if self.focus_pending && widgets.list.row_at_index(0).is_some() {
+            self.focus_pending = false;
+            let index = self.cursor.unwrap_or(0) as i32;
+            if let Some(row) = widgets
+                .list
+                .row_at_index(index)
+                .or_else(|| widgets.list.row_at_index(0))
+            {
+                row.grab_focus();
+            }
+        }
     }
 }
 
@@ -2153,7 +2177,9 @@ fn builtin_message(action: BuiltinAction, path: &Path) -> TreeMsg {
         | BuiltinAction::Forward
         | BuiltinAction::Collapse
         | BuiltinAction::ClosePane
-        | BuiltinAction::ToggleBookmarks => unreachable!("pane action in a row context menu"),
+        | BuiltinAction::ToggleBookmarks
+        | BuiltinAction::NewBookmark
+        | BuiltinAction::NewBookmarkFolder => unreachable!("pane action in a row context menu"),
         // Bookmark-only actions are handled by the bookmarks view, never a tree.
         BuiltinAction::EditBookmark | BuiltinAction::DeleteBookmark => TreeMsg::Noop,
         BuiltinAction::Separator => unreachable!("separators are rendered, not dispatched"),
