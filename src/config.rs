@@ -174,7 +174,7 @@ pub fn default_bookmarks() -> Vec<Bookmark> {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .filter(|home| !home.as_os_str().is_empty())
-        .map(|home| vec![Bookmark { name: Bookmark::default_name(&home), path: home }])
+        .map(|home| vec![Bookmark { name: String::from("Home"), path: home }])
         .unwrap_or_default()
 }
 
@@ -260,14 +260,14 @@ fn default_icon_size() -> u32 {
 fn default_confirm_drop_move() -> bool {
     builtin().tree.confirm_drop_move
 }
-fn default_bookmarks_show() -> bool {
-    builtin().bookmarks.show
-}
-fn default_bookmarks_position() -> BookmarkPosition {
-    builtin().bookmarks.position
-}
 fn default_bookmarks_file() -> PathBuf {
     builtin().bookmarks.file.clone()
+}
+fn default_bookmarks_menu() -> Vec<ContextAction> {
+    builtin().bookmarks.menu.clone()
+}
+fn default_bookmarks_context() -> Vec<ContextAction> {
+    builtin().bookmarks.context.clone()
 }
 
 /// Dock/panel configuration. Field-level serde defaults keep a partially
@@ -653,6 +653,10 @@ pub enum BuiltinAction {
     ClosePane,
     /// Pane-level: show or hide the bookmarks section in this dock.
     ToggleBookmarks,
+    /// Bookmark-only: edit the clicked bookmark (name/path).
+    EditBookmark,
+    /// Bookmark-only: delete the clicked bookmark.
+    DeleteBookmark,
     /// A menu divider; never does anything.
     Separator,
 }
@@ -698,6 +702,8 @@ impl BuiltinAction {
             BuiltinAction::Collapse => "Collapse",
             BuiltinAction::ClosePane => "Close Pane",
             BuiltinAction::ToggleBookmarks => "Bookmarks",
+            BuiltinAction::EditBookmark => "Edit Bookmark",
+            BuiltinAction::DeleteBookmark => "Delete Bookmark",
             BuiltinAction::Separator => "---",
         }
     }
@@ -786,6 +792,12 @@ impl BuiltinAction {
         )
     }
 
+    /// Whether this action only makes sense inside the bookmarks view's own
+    /// menu (it needs a bookmark entry as its target).
+    pub fn is_bookmark_only(&self) -> bool {
+        matches!(self, BuiltinAction::EditBookmark | BuiltinAction::DeleteBookmark)
+    }
+
     /// Parse a configuration string, case-insensitively. `"---"` and
     /// `"separator"` both spell a menu divider.
     ///
@@ -837,6 +849,8 @@ impl BuiltinAction {
             Self::Collapse,
             Self::ClosePane,
             Self::ToggleBookmarks,
+            Self::EditBookmark,
+            Self::DeleteBookmark,
             Self::Separator,
         ]
         .into_iter()
@@ -1193,32 +1207,23 @@ impl Default for PaneMenu {
     }
 }
 
-/// Where the bookmarks section sits relative to the pane stack in each dock.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum BookmarkPosition {
-    /// Above every pane.
-    #[default]
-    Top,
-    /// Below every pane.
-    Bottom,
-}
-
-/// The `[bookmarks]` options table: whether the section starts shown, where it
-/// sits, and which file holds the list.
+/// The `[bookmarks]` options table. Bookmarks are a pane view (a "new panel"
+/// showing directory shortcuts to jump from).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BookmarksConfig {
-    /// Show the bookmarks section on launch (the hamburger can toggle it either
-    /// way at runtime).
-    #[serde(default = "default_bookmarks_show")]
-    pub show: bool,
-    /// Whether the section is placed above or below the pane stack.
-    #[serde(default = "default_bookmarks_position")]
-    pub position: BookmarkPosition,
     /// The bookmarks list file, relative to the config directory (or absolute).
     /// Created with a single home bookmark when missing.
     #[serde(default = "default_bookmarks_file")]
     pub file: PathBuf,
+    /// The hamburger menu shown while the bookmarks view is active, in the same
+    /// item syntax as `[pane_menu]`.
+    #[serde(default = "default_bookmarks_menu")]
+    pub menu: Vec<ContextAction>,
+    /// Extra items appended to a bookmark's right-click menu, after the menu
+    /// inherited from the bookmarked directory. `Edit Bookmark` and
+    /// `Delete Bookmark` are the bookmark-specific actions.
+    #[serde(default = "default_bookmarks_context")]
+    pub context: Vec<ContextAction>,
 }
 
 impl Default for BookmarksConfig {
@@ -2351,6 +2356,38 @@ items = [
         assert!(BuiltinAction::AddBookmark.is_single_row_only());
         assert_eq!(BuiltinAction::parse("Bookmarks"), Some(BuiltinAction::ToggleBookmarks));
         assert!(BuiltinAction::ToggleBookmarks.is_pane_action());
+        assert_eq!(BuiltinAction::parse("Edit Bookmark"), Some(BuiltinAction::EditBookmark));
+        assert_eq!(BuiltinAction::parse("Delete Bookmark"), Some(BuiltinAction::DeleteBookmark));
+        assert!(BuiltinAction::EditBookmark.is_bookmark_only());
+        assert!(BuiltinAction::DeleteBookmark.is_bookmark_only());
+    }
+
+    #[test]
+    fn bookmarks_menu_and_context_parse_from_the_shipped_file() {
+        let shipped = Config::default().bookmarks;
+        assert!(!shipped.menu.is_empty());
+        assert!(!shipped.context.is_empty());
+        // The shipped context extras are the bookmark-only actions.
+        assert!(
+            shipped
+                .context
+                .iter()
+                .any(|a| a.shortcut().is_none()
+                    && matches!(a, ContextAction::Builtin(BuiltinAction::EditBookmark)))
+        );
+
+        // A partial `[bookmarks]` keeps the shipped menu/context.
+        let partial = parse("[bookmarks]\nfile = \"bm.toml\"\n").bookmarks;
+        assert_eq!(partial.menu, shipped.menu);
+        assert_eq!(partial.context, shipped.context);
+
+        // And they can be overridden.
+        let custom = parse(
+            "[bookmarks]\nmenu = [\"Open Folder...\"]\ncontext = [\"Delete Bookmark\"]\n",
+        )
+        .bookmarks;
+        assert_eq!(custom.menu.len(), 1);
+        assert_eq!(custom.context.len(), 1);
     }
 
     #[test]
@@ -2422,8 +2459,8 @@ items = [
             parse("startup = { path = \"/srv\" }\n").startup,
             StartupRoot::Path("/srv".to_owned())
         );
-        // Default is "home".
-        assert_eq!(Config::default().startup, StartupRoot::Home);
+        // The shipped default opens the bookmarks view.
+        assert_eq!(Config::default().startup, StartupRoot::Bookmarks);
         // An unknown keyword is rejected (whole config falls back to defaults).
         assert!(
             Config::parse("startup = \"bogus\"\n", Path::new("test.toml"))

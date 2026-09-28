@@ -45,9 +45,9 @@ use relm4::prelude::*;
 
 use crate::cmd::{Command, WidthArg};
 use crate::config::{
-    Bookmark, BookmarkPosition, BuiltinAction, Config, ContextAction, PANEL_MAX_WIDTH,
-    PANEL_MIN_WIDTH, PanelConfig, PanelLayer, PanelSide, PaneMenu, SessionState, ShortcutTarget,
-    StartupRoot, bookmark_file_path, load_stylesheet, save_bookmarks_to_path,
+    Bookmark, BuiltinAction, Config, ContextAction, PANEL_MAX_WIDTH, PANEL_MIN_WIDTH, PanelConfig,
+    PanelLayer, PanelSide, SessionState, ShortcutTarget, StartupRoot, bookmark_file_path,
+    load_stylesheet, save_bookmarks_to_path,
 };
 use crate::fs::SortKey;
 use crate::ipc;
@@ -55,40 +55,47 @@ use crate::ui::bookmarks::{self, BookmarkEvent};
 use crate::ui::toolbar::{PaneShortcuts, Toolbar, ToolbarInit, ToolbarMsg, ToolbarOutput};
 use crate::ui::tree::{Tree, TreeInit, TreeOutput, TreeMsg};
 
+/// One entry in a pane's history: a directory it showed, or the bookmarks view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ViewEntry {
+    Dir(PathBuf),
+    Bookmarks,
+}
+
 /// A pane's back/forward navigation history.
 ///
-/// Directories are recorded in visit order with a cursor into the list. Going
-/// back moves the cursor left, forward moves it right; visiting a *new* root
-/// (not via back/forward) truncates the forward tail and appends. This is a
-/// pure data structure so the rules can be unit-tested without a display.
+/// Views are recorded in visit order with a cursor into the list. Going back
+/// moves the cursor left, forward moves it right; visiting a *new* view (not via
+/// back/forward) truncates the forward tail and appends. This is a pure data
+/// structure so the rules can be unit-tested without a display.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 struct NavHistory {
-    entries: Vec<PathBuf>,
+    entries: Vec<ViewEntry>,
     /// Index of the current entry. Meaningless while `entries` is empty.
     cursor: usize,
     /// Set while a back/forward navigation is in flight, so the `RootChanged`
-    /// it produces is not itself recorded as a new visit.
+    /// (or view switch) it produces is not itself recorded as a new visit.
     navigating: bool,
 }
 
 impl NavHistory {
-    /// Record a newly opened root. A repeat of the current entry is ignored;
-    /// any forward history is dropped. While a back/forward is navigating this
-    /// is a no-op (the target is already in the list).
-    fn record(&mut self, path: &Path) {
+    /// Record a newly shown view. A repeat of the current entry is ignored; any
+    /// forward history is dropped. While a back/forward is navigating this is a
+    /// no-op (the target is already in the list).
+    fn record(&mut self, entry: ViewEntry) {
         if self.navigating {
             return;
         }
-        if self.entries.get(self.cursor).is_some_and(|cur| cur == path) {
+        if self.entries.get(self.cursor).is_some_and(|cur| cur == &entry) {
             return;
         }
         if self.entries.is_empty() {
-            self.entries.push(path.to_path_buf());
+            self.entries.push(entry);
             self.cursor = 0;
             return;
         }
         self.entries.truncate(self.cursor + 1);
-        self.entries.push(path.to_path_buf());
+        self.entries.push(entry);
         self.cursor = self.entries.len() - 1;
     }
 
@@ -100,8 +107,8 @@ impl NavHistory {
         !self.entries.is_empty() && self.cursor + 1 < self.entries.len()
     }
 
-    /// Step back one entry and return its path, arming `navigating`.
-    fn back(&mut self) -> Option<PathBuf> {
+    /// Step back one entry and return it, arming `navigating`.
+    fn back(&mut self) -> Option<ViewEntry> {
         if !self.can_back() {
             return None;
         }
@@ -110,8 +117,8 @@ impl NavHistory {
         Some(self.entries[self.cursor].clone())
     }
 
-    /// Step forward one entry and return its path, arming `navigating`.
-    fn forward(&mut self) -> Option<PathBuf> {
+    /// Step forward one entry and return it, arming `navigating`.
+    fn forward(&mut self) -> Option<ViewEntry> {
         if !self.can_forward() {
             return None;
         }
@@ -120,13 +127,13 @@ impl NavHistory {
         Some(self.entries[self.cursor].clone())
     }
 
-    /// Clear the in-flight flag once the resulting `RootChanged` has arrived.
+    /// Clear the in-flight flag once the resulting view has been shown.
     fn finish_navigation(&mut self) {
         self.navigating = false;
     }
 }
 
-/// One split view inside a dock: its own top bar above its own tree.
+/// One split view inside a dock: its own top bar above its own body.
 pub struct Pane {
     id: u64,
     toolbar: Controller<Toolbar>,
@@ -143,7 +150,17 @@ pub struct Pane {
     /// Only this pane's tree receives the filter.
     filter_bar: gtk::Box,
     filter_entry: gtk::SearchEntry,
-    /// The pane overlay: its main child is the `{ toolbar, filter_bar?, tree }`
+    /// Switches the pane body between the tree and the bookmarks view. A pane
+    /// created without a directory starts on the bookmarks page (a "new panel"
+    /// suggesting places to jump to).
+    body: gtk::Stack,
+    /// The bookmarks list container (the bookmarks page of `body`), refilled
+    /// whenever the list changes.
+    bookmarks_list: gtk::Box,
+    /// Case-insensitive filter applied to the bookmarks list. Kept per pane so
+    /// the filter bar works on the bookmarks view too.
+    bookmark_filter: String,
+    /// The pane overlay: its main child is the `{ toolbar, filter_bar?, body }`
     /// vertical box, and its overlay children hold panes' popovers (e.g. the
     /// path-entry completion dropdown). Built once and reused across split/close
     /// rebuilds, so the tree and toolbar widgets never need to be reparented
@@ -158,6 +175,23 @@ impl Pane {
         self.canonical_root = std::fs::canonicalize(&root).ok();
         self.root = Some(root);
     }
+
+    /// Show the bookmarks view in this pane's body (and switch its hamburger).
+    fn show_bookmarks(&self) {
+        self.body.set_visible_child_name("bookmarks");
+        self.toolbar.emit(ToolbarMsg::SetBookmarks(true));
+    }
+
+    /// Show the tree in this pane's body (and switch its hamburger).
+    fn show_tree(&self) {
+        self.body.set_visible_child_name("tree");
+        self.toolbar.emit(ToolbarMsg::SetBookmarks(false));
+    }
+
+    /// Whether this pane is currently on the bookmarks view.
+    fn on_bookmarks(&self) -> bool {
+        self.body.visible_child_name().as_deref() == Some("bookmarks")
+    }
 }
 
 /// One layer-shell dock window anchored to a screen edge, with its panes.
@@ -169,10 +203,6 @@ struct Dock {
     /// The vertical box holding the pane stack (for the primary dock this is
     /// `App::pane_container`, referenced by `view!`).
     container: gtk::Box,
-    /// The bookmarks section, when it is shown in this dock. Parented in the
-    /// dock's outer box (not `container`) so rebuilding the pane stack never
-    /// disturbs it.
-    bookmarks: Option<gtk::Widget>,
     panes: Vec<Pane>,
     /// Id of the pane most recently interacted with in this dock.
     active_pane: Option<u64>,
@@ -329,12 +359,10 @@ pub enum AppMsg {
     ResizeCommit,
     /// Move keyboard focus into pane `id`'s tree (after it is allocated).
     FocusPane { id: u64 },
-    /// The bookmarks section in `side`'s dock reported a user action.
-    BookmarkEvent { side: PanelSide, event: BookmarkEvent },
+    /// The bookmarks view in pane `id` reported a user action.
+    BookmarkEvent { id: u64, event: BookmarkEvent },
     /// The bookmark editor for index `index` was saved with the new values.
     BookmarkEditSaved { index: usize, name: String, path: PathBuf },
-    /// Show or hide the bookmarks section in every dock (hamburger item).
-    ToggleBookmarks,
 }
 
 /// The init payload: the parsed invocation plus the instance socket, if this
@@ -366,12 +394,8 @@ pub struct App {
     widths: HashMap<PanelSide, u32>,
     /// Most recently opened root, kept so a width save never drops it.
     last_root: Option<PathBuf>,
-    /// Whether the bookmarks section is currently shown in every dock. Starts
-    /// from `[bookmarks] show` (or a `startup = "bookmarks"` launch) and is
-    /// toggled at runtime from the hamburger menu.
-    show_bookmarks: bool,
-    /// The saved directory shortcuts, loaded from the bookmarks file and written
-    /// back whenever they change.
+    /// The bookmarks list, loaded from the bookmarks file and written back
+    /// whenever it changes.
     bookmarks: Vec<Bookmark>,
     /// Monotonic id for the debounced width save: a scheduled save only writes
     /// if it is still the latest (no `SourceId` juggling — removing a one-shot
@@ -444,16 +468,12 @@ impl SimpleComponent for App {
         // Keep `config.panel.width` meaningful for the primary dock.
         config.panel.width = widths[&primary_side];
         let primary_width = config.panel.width;
-        // A `startup = "bookmarks"` launch opens with the section showing and no
-        // directory pane; the hamburger or a bookmark click adds panes later.
-        let bookmarks_startup = config.startup.is_bookmarks();
-        let show_bookmarks = config.bookmarks.show || bookmarks_startup;
-        // Build the primary dock's initial panes from the invocation. When the
-        // invocation carries no roots, resolve the configured startup directory
-        // (last-used, home, or a fixed path), falling back to home.
+        // Build the primary dock's initial panes from the invocation. With no
+        // roots, resolve the configured startup directory; a `bookmarks` startup
+        // (the default) resolves to none, so the pane opens the bookmarks view.
         let roots = if !init.command.roots.is_empty() {
             init.command.roots.clone()
-        } else if bookmarks_startup {
+        } else if config.startup.is_bookmarks() {
             Vec::new()
         } else {
             let last = session.last_root.clone().filter(|p| p.is_dir());
@@ -475,17 +495,20 @@ impl SimpleComponent for App {
             panes.last_mut().unwrap().set_root(root.clone());
             next_id += 1;
         }
-        // Guarantee at least one pane, unless the bookmarks view is the whole
-        // initial content.
-        if panes.is_empty() && !bookmarks_startup {
-            panes.push(make_pane(
+        // Guarantee at least one pane. With no roots it opens the bookmarks view
+        // (a "new panel" suggesting places to jump to).
+        if panes.is_empty() {
+            let mut pane = make_pane(
                 &config,
                 parent.clone(),
                 next_id,
                 primary_side,
                 primary_width,
                 sender.clone(),
-            ));
+            );
+            pane.show_bookmarks();
+            pane.history.record(ViewEntry::Bookmarks);
+            panes.push(pane);
             next_id += 1;
         }
 
@@ -509,7 +532,6 @@ impl SimpleComponent for App {
                 side: primary_side,
                 window: root.clone(),
                 container: pane_container.clone(),
-                bookmarks: None,
                 panes,
                 active_pane: None,
             }],
@@ -519,14 +541,12 @@ impl SimpleComponent for App {
             visible: !init.command.hidden,
             widths,
             last_root: session.last_root.clone(),
-            show_bookmarks,
             bookmarks,
             save_generation: Rc::new(Cell::new(0)),
         };
 
         init_layer_window(&model.window, &model.config, primary_side, primary_width);
         install_css(&model.config);
-        attach_bookmarks_shortcut(&model.window, &model.config.pane_menu, &sender);
         // Interactive resize only makes sense for a docked layer surface; a
         // plain fallback window is resized like any other window.
         if layer_shell_available() {
@@ -547,8 +567,8 @@ impl SimpleComponent for App {
 
         let widgets = view_output!();
 
-        // The primary dock's outer box now exists; mount the bookmarks section.
-        model.refresh_bookmarks(0, &sender);
+        // Populate every pane's bookmarks list now that the order is settled.
+        model.refresh_all_bookmarks(&sender);
 
         // Quitting while a video thumbnail is playing is a shutdown race:
         // `GtkMediaFile` renders through GStreamer's GL sink, and exiting with
@@ -579,10 +599,7 @@ impl SimpleComponent for App {
                     self.show_open_folder(id, &sender);
                 }
                 ToolbarOutput::NavigateTo(path) => {
-                    self.set_active(id);
-                    if let Some((di, pi)) = self.dock_pane_of(id) {
-                        self.docks[di].panes[pi].tree.emit(TreeMsg::OpenRoot(path));
-                    }
+                    self.open_root_in_pane(id, path);
                 }
                 ToolbarOutput::FilterRequested => {
                     self.set_active(id);
@@ -645,8 +662,9 @@ impl SimpleComponent for App {
                         // Record the visit for back/forward, then clear the
                         // in-flight flag a back/forward navigation sets (so its
                         // own root change is not recorded as a fresh visit).
-                        pane.history.record(&root);
+                        pane.history.record(ViewEntry::Dir(root.clone()));
                         pane.history.finish_navigation();
+                        pane.show_tree();
                         pane.set_root(root.clone());
                         pane.toolbar.emit(ToolbarMsg::SetRoot(root.clone()));
                     }
@@ -662,9 +680,7 @@ impl SimpleComponent for App {
             }
 
             AppMsg::OpenFolderPicked { id, path: Some(path) } => {
-                if let Some((di, pi)) = self.dock_pane_of(id) {
-                    self.docks[di].panes[pi].tree.emit(TreeMsg::OpenRoot(path));
-                }
+                self.open_root_in_pane(id, path);
             }
             AppMsg::OpenFolderPicked { path: None, .. } => {}
 
@@ -673,9 +689,10 @@ impl SimpleComponent for App {
             }
 
             AppMsg::SplitFromPane { id } => {
-                let (di, pi) = self.dock_pane_of(id).unwrap_or((0, 0));
-                let seed = self.docks[di].panes.get(pi).and_then(|p| p.root.clone()).or_else(home_dir);
-                self.add_pane(di, seed, &sender);
+                // A new panel with no path opens the bookmarks view, so the
+                // split suggests places to jump to.
+                let di = self.dock_pane_of(id).map(|(di, _)| di).unwrap_or(0);
+                self.add_pane(di, None, &sender);
             }
 
             AppMsg::OpenSplitFrom { id, root } => {
@@ -703,20 +720,14 @@ impl SimpleComponent for App {
                 if self.docks[di].active_pane == Some(id) {
                     self.docks[di].active_pane = self.docks[di].panes.last().map(|p| p.id);
                 }
-                // The program only exits once the *last* pane anywhere closes,
-                // unless the bookmarks section is showing (which keeps the panel
-                // alive on its own).
+                // The program only exits once the *last* pane anywhere closes.
                 let panes_left: usize = self.docks.iter().map(|d| d.panes.len()).sum();
-                if panes_left == 0 && !self.show_bookmarks {
+                if panes_left == 0 {
                     self.window.close();
                     return;
                 }
                 if self.docks[di].panes.is_empty() {
-                    if self.show_bookmarks {
-                        // Keep the dock for its bookmarks section; just clear the
-                        // (now empty) pane stack.
-                        fill_pane_container(&self.docks[di].container.clone(), &[]);
-                    } else if di == 0 {
+                    if di == 0 {
                         // The primary dock is the relm4 root window; closing it
                         // tears the whole app down. Hide it instead, and show it
                         // again on the next launch/toggle.
@@ -733,7 +744,12 @@ impl SimpleComponent for App {
 
             AppMsg::FilterChanged { id, filter } => {
                 if let Some((di, pi)) = self.dock_pane_of(id) {
-                    self.docks[di].panes[pi].tree.emit(TreeMsg::SetFilter(filter));
+                    if self.docks[di].panes[pi].on_bookmarks() {
+                        self.docks[di].panes[pi].bookmark_filter = filter;
+                        self.refresh_all_bookmarks(&sender);
+                    } else {
+                        self.docks[di].panes[pi].tree.emit(TreeMsg::SetFilter(filter));
+                    }
                 }
             }
             AppMsg::FilterClosed { id } => {
@@ -741,8 +757,10 @@ impl SimpleComponent for App {
                     let pane = &mut self.docks[di].panes[pi];
                     pane.filter_entry.set_text("");
                     pane.tree.emit(TreeMsg::SetFilter(String::new()));
+                    pane.bookmark_filter.clear();
                     pane.filter_bar.set_visible(false);
                 }
+                self.refresh_all_bookmarks(&sender);
             }
 
             AppMsg::FocusPane { id } => {
@@ -776,9 +794,12 @@ impl SimpleComponent for App {
             AppMsg::ResizeBy { side, delta } => self.resize_by(side, delta),
             AppMsg::ResizeCommit => self.persist_session(),
 
-            AppMsg::BookmarkEvent { side, event } => match event {
-                BookmarkEvent::Open(path) => self.open_bookmark(side, path, &sender),
-                BookmarkEvent::Edit(index) => self.edit_bookmark(side, index, &sender),
+            AppMsg::BookmarkEvent { id, event } => match event {
+                BookmarkEvent::Open(path) => self.open_bookmark(id, path, &sender),
+                BookmarkEvent::Edit(index) => self.edit_bookmark(id, index, &sender),
+                BookmarkEvent::Action { path, target } => {
+                    self.run_bookmark_action(id, path, target);
+                }
                 BookmarkEvent::Delete(index) => {
                     if index < self.bookmarks.len() {
                         self.bookmarks.remove(index);
@@ -786,7 +807,6 @@ impl SimpleComponent for App {
                         self.refresh_all_bookmarks(&sender);
                     }
                 }
-                BookmarkEvent::Hide => self.set_bookmarks_visible(false, &sender),
             },
             AppMsg::BookmarkEditSaved { index, name, path } => {
                 if let Some(bookmark) = self.bookmarks.get_mut(index) {
@@ -796,7 +816,6 @@ impl SimpleComponent for App {
                     self.refresh_all_bookmarks(&sender);
                 }
             }
-            AppMsg::ToggleBookmarks => self.set_bookmarks_visible(!self.show_bookmarks, &sender),
         }
     }
 }
@@ -941,31 +960,73 @@ impl App {
         self.status = format!("Bookmarked {}", path.display());
     }
 
-    /// Open a new pane at a bookmark's directory in `side`'s dock.
-    fn open_bookmark(&mut self, side: PanelSide, path: PathBuf, sender: &ComponentSender<Self>) {
+    /// Show `path` in pane `id`: switch its body to the tree and load the
+    /// directory (leaving the bookmarks view, if it was showing).
+    fn open_root_in_pane(&mut self, id: u64, path: PathBuf) {
+        if let Some((di, pi)) = self.dock_pane_of(id) {
+            self.docks[di].panes[pi].show_tree();
+            self.docks[di].panes[pi].tree.emit(TreeMsg::OpenRoot(path));
+            self.set_active(id);
+        }
+    }
+
+    /// Jump pane `id` to a bookmark's directory, replacing its bookmarks view
+    /// (or its current directory) with that folder.
+    fn open_bookmark(&mut self, id: u64, path: PathBuf, _sender: &ComponentSender<Self>) {
         let path = crate::config::expand_bookmark_path(&path);
         if !path.is_dir() {
             self.status = format!("{} is not a directory", path.display());
             return;
         }
-        // Already open somewhere? Focus that pane instead of duplicating it.
-        if let Some((di, pi)) = self.find_pane_with_dir(&path) {
-            let id = self.docks[di].panes[pi].id;
-            self.set_active(id);
-            self.docks[di].panes[pi].tree.emit(TreeMsg::Focus);
-            self.set_docks_visible(true);
-            return;
-        }
-        let di = self.dock_of_side(side).unwrap_or(0);
-        self.add_pane(di, Some(path), sender);
+        self.open_root_in_pane(id, path);
     }
 
-    /// Open the bookmark editor for the bookmark at `index` in `side`'s dock.
-    fn edit_bookmark(&mut self, side: PanelSide, index: usize, sender: &ComponentSender<Self>) {
+    /// Run a bookmark's inherited context action against its directory without
+    /// opening it. `Open` navigates (a directory) or launches (a file); other
+    /// path-safe builtins are sent to the pane's tree, which acts on the
+    /// explicit path; custom commands run against the path.
+    fn run_bookmark_action(&mut self, id: u64, path: PathBuf, target: ShortcutTarget) {
+        let path = crate::config::expand_bookmark_path(&path);
+        let Some((di, pi)) = self.dock_pane_of(id) else {
+            return;
+        };
+        match target {
+            ShortcutTarget::Builtin(BuiltinAction::Open) => {
+                if path.is_dir() {
+                    self.open_root_in_pane(id, path);
+                } else {
+                    self.docks[di].panes[pi].tree.emit(TreeMsg::OpenWithDefault(path));
+                }
+            }
+            ShortcutTarget::Builtin(action) => {
+                if let Some(msg) = crate::ui::tree::path_action_message(action, &path) {
+                    self.docks[di].panes[pi].tree.emit(msg);
+                }
+            }
+            ShortcutTarget::Command(cmd) => {
+                self.docks[di].panes[pi]
+                    .tree
+                    .emit(TreeMsg::RunCommand { command: cmd.command, path });
+            }
+        }
+    }
+
+    /// Switch pane `id` to the bookmarks view (the hamburger "Bookmarks" item).
+    fn show_bookmarks_view(&mut self, id: u64) {
+        if let Some((di, pi)) = self.dock_pane_of(id) {
+            self.docks[di].panes[pi].show_bookmarks();
+            self.docks[di].panes[pi].history.record(ViewEntry::Bookmarks);
+            self.set_active(id);
+        }
+    }
+
+    /// Open the bookmark editor for the bookmark at `index`, parented to the
+    /// window of pane `id`.
+    fn edit_bookmark(&mut self, id: u64, index: usize, sender: &ComponentSender<Self>) {
         let Some(bookmark) = self.bookmarks.get(index).cloned() else {
             return;
         };
-        let Some(di) = self.dock_of_side(side) else { return };
+        let Some((di, _pi)) = self.dock_pane_of(id) else { return };
         let parent = self.docks[di].window.clone();
         let sender = sender.clone();
         let path = crate::config::expand_bookmark_path(&bookmark.path);
@@ -982,76 +1043,29 @@ impl App {
         }
     }
 
-    /// Rebuild the bookmarks section in every dock (after a list change or a
-    /// show/hide toggle).
+    /// Refill every pane's bookmarks list after the list changes. Panes showing
+    /// the view update in place; hidden ones are ready when next shown. Each
+    /// pane's own filter and menu config are applied.
     fn refresh_all_bookmarks(&mut self, sender: &ComponentSender<Self>) {
+        let context = self.config.context_menu.clone();
+        let extras = self.config.bookmarks.context.clone();
+        let bookmarks = self.bookmarks.clone();
         for di in 0..self.docks.len() {
-            self.refresh_bookmarks(di, sender);
-        }
-    }
-
-    /// Show or hide the bookmarks strip everywhere. Hiding it when nothing else
-    /// is open closes the panel, so it never leaves a blank surface behind.
-    fn set_bookmarks_visible(&mut self, show: bool, sender: &ComponentSender<Self>) {
-        self.show_bookmarks = show;
-        self.refresh_all_bookmarks(sender);
-        if !show {
-            self.prune_empty_docks();
-        }
-    }
-
-    /// Drop secondary docks that no longer show anything, and close the app if
-    /// no pane is left anywhere.
-    fn prune_empty_docks(&mut self) {
-        let mut di = self.docks.len();
-        while di > 1 {
-            di -= 1;
-            if self.docks[di].panes.is_empty() {
-                let dock = self.docks.remove(di);
-                dock.window.close();
+            for pi in 0..self.docks[di].panes.len() {
+                let pane = &self.docks[di].panes[pi];
+                let menu = bookmarks::BookmarkMenuConfig {
+                    context: &context,
+                    extras: &extras,
+                    side: self.docks[di].side,
+                };
+                let id = pane.id;
+                let filter = pane.bookmark_filter.clone();
+                let sender = sender.clone();
+                let on_event: Rc<dyn Fn(BookmarkEvent)> =
+                    Rc::new(move |event| sender.input(AppMsg::BookmarkEvent { id, event }));
+                bookmarks::fill_bookmarks(&pane.bookmarks_list, &bookmarks, &filter, &menu, on_event);
             }
         }
-        // The primary dock is the root window and cannot be removed; if nothing
-        // is left to show anywhere, quit.
-        if self.docks.iter().all(|dock| dock.panes.is_empty()) {
-            self.window.close();
-        }
-    }
-
-    /// Rebuild dock `di`'s bookmarks section. Mounts a freshly-built widget in
-    /// the dock's outer box (above or below the pane stack) or removes it when
-    /// the section is hidden.
-    fn refresh_bookmarks(&mut self, di: usize, sender: &ComponentSender<Self>) {
-        let widget = if self.show_bookmarks {
-            let list = self.bookmarks.clone();
-            let side = self.docks[di].side;
-            let sender = sender.clone();
-            let on_event: Rc<dyn Fn(BookmarkEvent)> =
-                Rc::new(move |event| sender.input(AppMsg::BookmarkEvent { side, event }));
-            Some(bookmarks::bookmarks_section(&list, on_event))
-        } else {
-            None
-        };
-        self.place_bookmark_widget(di, widget);
-    }
-
-    /// Install (or remove) dock `di`'s bookmarks widget at the configured
-    /// top/bottom position.
-    fn place_bookmark_widget(&mut self, di: usize, widget: Option<gtk::Widget>) {
-        if let Some(old) = self.docks[di].bookmarks.take() {
-            remove_from_parent(&old);
-        }
-        let Some(widget) = widget else { return };
-        let stack = self.docks[di].container.clone();
-        let outer = stack
-            .parent()
-            .and_downcast::<gtk::Box>()
-            .unwrap_or_else(|| stack.clone());
-        match self.config.bookmarks.position {
-            BookmarkPosition::Top => outer.prepend(&widget),
-            BookmarkPosition::Bottom => outer.insert_child_after(&widget, Some(&stack)),
-        }
-        self.docks[di].bookmarks = Some(widget);
     }
 
     /// Run a pane-level builtin (`Split View`, `Open Folder...`, `Filter...`,
@@ -1073,7 +1087,7 @@ impl App {
             BuiltinAction::Forward => self.go_forward(id),
             BuiltinAction::Collapse => self.collapse_dock(id),
             BuiltinAction::ClosePane => sender.input(AppMsg::ClosePane { id }),
-            BuiltinAction::ToggleBookmarks => sender.input(AppMsg::ToggleBookmarks),
+            BuiltinAction::ToggleBookmarks => self.show_bookmarks_view(id),
             _ => {}
         }
     }
@@ -1095,24 +1109,44 @@ impl App {
         self.docks[di].panes[pi].tree.emit(TreeMsg::OpenRoot(parent));
     }
 
-    /// Step pane `id` back one entry in its history and reopen that root.
+    /// Step pane `id` back one entry in its history and show it.
     fn go_back(&mut self, id: u64) {
         let Some((di, pi)) = self.dock_pane_of(id) else {
             return;
         };
         if let Some(target) = self.docks[di].panes[pi].history.back() {
-            self.docks[di].panes[pi].tree.emit(TreeMsg::OpenRoot(target));
+            self.show_view_entry(id, target);
         }
     }
 
-    /// Step pane `id` forward one entry in its history and reopen that root.
+    /// Step pane `id` forward one entry in its history and show it.
     fn go_forward(&mut self, id: u64) {
         let Some((di, pi)) = self.dock_pane_of(id) else {
             return;
         };
         if let Some(target) = self.docks[di].panes[pi].history.forward() {
-            self.docks[di].panes[pi].tree.emit(TreeMsg::OpenRoot(target));
+            self.show_view_entry(id, target);
         }
+    }
+
+    /// Show a history entry in pane `id`: a directory (load it in the tree) or
+    /// the bookmarks view. A back/forward to the bookmarks view produces no
+    /// `RootChanged`, so its navigation flag is cleared here.
+    fn show_view_entry(&mut self, id: u64, entry: ViewEntry) {
+        let Some((di, pi)) = self.dock_pane_of(id) else {
+            return;
+        };
+        match entry {
+            ViewEntry::Dir(path) => {
+                self.docks[di].panes[pi].show_tree();
+                self.docks[di].panes[pi].tree.emit(TreeMsg::OpenRoot(path));
+            }
+            ViewEntry::Bookmarks => {
+                self.docks[di].panes[pi].show_bookmarks();
+                self.docks[di].panes[pi].history.finish_navigation();
+            }
+        }
+        self.set_active(id);
     }
 
     /// Run a pane-menu shortcut resolved anywhere in pane `id`. Pane builtins go
@@ -1295,10 +1329,7 @@ impl App {
         if layer_shell_available() {
             attach_resize_controls(&window, side, sender);
         }
-        attach_bookmarks_shortcut(&window, &config.pane_menu, sender);
-        // The window's child is an outer box holding the pane stack; the
-        // bookmarks section (when shown) is parented here too, so resetting the
-        // stack never disturbs it.
+        // The window's child is the box holding the pane stack.
         let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
         outer.set_vexpand(true);
         let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
@@ -1311,7 +1342,6 @@ impl App {
             side,
             window,
             container,
-            bookmarks: None,
             panes: Vec::new(),
             active_pane: None,
         });
@@ -1319,13 +1349,16 @@ impl App {
             let startup = self.config.startup.clone();
             if let Some(root) = default_root(&startup) {
                 self.add_pane(di, Some(root), sender);
+            } else {
+                // No directory: seed the dock with a bookmarks pane.
+                self.add_pane(di, None, sender);
             }
         }
-        self.refresh_bookmarks(di, sender);
         di
     }
 
-    /// Append a pane showing `root` (if any) to dock `di`, returning its id.
+    /// Append a pane showing `root` to dock `di`, returning its id. A `None`
+    /// root opens the bookmarks view instead of a directory.
     fn add_pane(&mut self, di: usize, root: Option<PathBuf>, sender: &ComponentSender<Self>) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
@@ -1334,8 +1367,14 @@ impl App {
         let width = self.width_for(side);
         let pane = make_pane(&self.config, parent, id, side, width, sender.clone());
         let mut pane = pane;
+        match &root {
+            Some(root) => pane.tree.emit(TreeMsg::OpenRoot(root.clone())),
+            None => {
+                pane.show_bookmarks();
+                pane.history.record(ViewEntry::Bookmarks);
+            }
+        }
         if let Some(root) = &root {
-            pane.tree.emit(TreeMsg::OpenRoot(root.clone()));
             pane.set_root(root.clone());
         }
         let dock = &mut self.docks[di];
@@ -1347,6 +1386,8 @@ impl App {
         // app (and each new split) is usable without a click.
         let focus_sender = sender.clone();
         glib::idle_add_local_once(move || focus_sender.input(AppMsg::FocusPane { id }));
+        // Populate the new pane's bookmarks list.
+        self.refresh_all_bookmarks(sender);
         id
     }
 
@@ -1402,6 +1443,7 @@ fn make_pane(
         .launch(ToolbarInit {
             overlay: overlay.clone(),
             pane_menu: config.pane_menu.clone(),
+            bookmarks_menu: config.bookmarks.menu.clone(),
         })
         .forward(sender.input_sender(), move |out| AppMsg::PaneToolbar { id, out });
     let tree = Tree::builder()
@@ -1452,9 +1494,24 @@ fn make_pane(
 
     widget.append(&filter_bar);
 
+    // ── pane body: tree or bookmarks, switched by `body` ────────────────────
     let tree_widget = tree.widget();
     tree_widget.set_vexpand(true);
-    widget.append(tree_widget);
+
+    let bookmarks_list = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    bookmarks_list.add_css_class("bookmarks-list");
+    let bookmarks_scroll = gtk::ScrolledWindow::new();
+    bookmarks_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    bookmarks_scroll.set_vexpand(true);
+    bookmarks_scroll.add_css_class("bookmarks-view");
+    bookmarks_scroll.set_child(Some(&bookmarks_list));
+
+    let body = gtk::Stack::new();
+    body.set_vexpand(true);
+    body.add_named(tree_widget, Some("tree"));
+    body.add_named(&bookmarks_scroll, Some("bookmarks"));
+    body.set_visible_child_name("tree");
+    widget.append(&body);
     widget.set_vexpand(true);
 
     overlay.set_child(Some(&widget));
@@ -1463,7 +1520,11 @@ fn make_pane(
     // they work whether focus is on the tree, the path entry, the filter bar, or
     // nothing at all. Row shortcuts stay on the tree.
     {
-        let shortcuts = Rc::new(PaneShortcuts::compile(&config.pane_menu));
+        // Both menus' shortcuts are live regardless of which body is showing,
+        // so a binding in either works from the tree or the bookmarks view.
+        let mut items = config.pane_menu.items.clone();
+        items.extend(config.bookmarks.menu.iter().cloned());
+        let shortcuts = Rc::new(PaneShortcuts::compile(&items));
         let s = sender.clone();
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
@@ -1487,6 +1548,9 @@ fn make_pane(
         history: NavHistory::default(),
         filter_bar,
         filter_entry,
+        body,
+        bookmarks_list,
+        bookmark_filter: String::new(),
         widget: overlay,
     }
 }
@@ -1633,28 +1697,6 @@ fn apply_window_width(window: &gtk::Window, width: u32) {
     }
     window.set_size_request(width as i32, -1);
     window.set_default_size(width as i32, if height > 0 { height } else { -1 });
-}
-
-/// Wire a dock window's configurable bookmarks shortcut. It lives on the window
-/// (capture phase) so it fires from anywhere in the dock — including when the
-/// bookmarks strip is the only thing shown and no pane is focused.
-fn attach_bookmarks_shortcut(window: &gtk::Window, menu: &PaneMenu, sender: &ComponentSender<App>) {
-    let shortcuts = Rc::new(PaneShortcuts::compile(menu));
-    let s = sender.clone();
-    let keys = gtk::EventControllerKey::new();
-    keys.set_propagation_phase(gtk::PropagationPhase::Capture);
-    keys.connect_key_pressed(move |_, key, _, state| {
-        if matches!(
-            shortcuts.action_for(key, state),
-            Some(ContextAction::Builtin(BuiltinAction::ToggleBookmarks))
-        ) {
-            s.input(AppMsg::ToggleBookmarks);
-            glib::Propagation::Stop
-        } else {
-            glib::Propagation::Proceed
-        }
-    });
-    window.add_controller(keys);
 }
 
 /// Wire the interactive width controls into a dock window: Super+right-drag to
@@ -1968,32 +2010,32 @@ mod visibility_tests {
 
 #[cfg(test)]
 mod nav_history_tests {
-    use super::NavHistory;
-    use std::path::{Path, PathBuf};
+    use super::{NavHistory, ViewEntry};
+    use std::path::PathBuf;
 
-    fn p(s: &str) -> PathBuf {
-        PathBuf::from(s)
+    fn dir(s: &str) -> ViewEntry {
+        ViewEntry::Dir(PathBuf::from(s))
     }
 
     #[test]
     fn records_visits_in_order_and_navigates_both_ways() {
         let mut h = NavHistory::default();
-        h.record(Path::new("/a"));
-        h.record(Path::new("/b"));
-        h.record(Path::new("/c"));
+        h.record(dir("/a"));
+        h.record(dir("/b"));
+        h.record(dir("/c"));
         assert!(h.can_back());
         assert!(!h.can_forward());
 
-        assert_eq!(h.back(), Some(p("/b")));
+        assert_eq!(h.back(), Some(dir("/b")));
         h.finish_navigation();
-        assert_eq!(h.back(), Some(p("/a")));
+        assert_eq!(h.back(), Some(dir("/a")));
         h.finish_navigation();
         assert!(!h.can_back());
         assert!(h.can_forward());
 
-        assert_eq!(h.forward(), Some(p("/b")));
+        assert_eq!(h.forward(), Some(dir("/b")));
         h.finish_navigation();
-        assert_eq!(h.forward(), Some(p("/c")));
+        assert_eq!(h.forward(), Some(dir("/c")));
         h.finish_navigation();
         assert!(h.can_back());
         assert!(!h.can_forward());
@@ -2002,36 +2044,52 @@ mod nav_history_tests {
     #[test]
     fn a_new_visit_after_going_back_truncates_the_forward_tail() {
         let mut h = NavHistory::default();
-        h.record(Path::new("/a"));
-        h.record(Path::new("/b"));
-        h.record(Path::new("/c"));
-        assert_eq!(h.back(), Some(p("/b")));
+        h.record(dir("/a"));
+        h.record(dir("/b"));
+        h.record(dir("/c"));
+        assert_eq!(h.back(), Some(dir("/b")));
         h.finish_navigation();
         // Visiting /d from /b drops /c from the forward history.
-        h.record(Path::new("/d"));
+        h.record(dir("/d"));
         assert!(!h.can_forward());
-        assert_eq!(h.back(), Some(p("/b")));
+        assert_eq!(h.back(), Some(dir("/b")));
     }
 
     #[test]
     fn navigating_does_not_record_and_repeats_are_ignored() {
         let mut h = NavHistory::default();
-        h.record(Path::new("/a"));
-        h.record(Path::new("/b"));
+        h.record(dir("/a"));
+        h.record(dir("/b"));
         // Back, then the resulting RootChanged; recording must be suppressed.
         let target = h.back().unwrap();
-        assert_eq!(target, p("/a"));
-        h.record(&target);
+        assert_eq!(target, dir("/a"));
+        h.record(target.clone());
         h.finish_navigation();
         // Still at /a with /b ahead, and no duplicate /a entry was appended.
         assert!(h.can_forward());
-        assert_eq!(h.forward(), Some(p("/b")));
+        assert_eq!(h.forward(), Some(dir("/b")));
         h.finish_navigation();
 
         // Re-recording the current entry is a no-op.
-        h.record(Path::new("/b"));
+        h.record(dir("/b"));
         assert_eq!(h.cursor, 1);
         assert_eq!(h.entries.len(), 2);
+    }
+
+    #[test]
+    fn bookmarks_view_is_a_history_entry() {
+        let mut h = NavHistory::default();
+        h.record(ViewEntry::Bookmarks);
+        h.record(dir("/a"));
+        // From /a, back goes to the bookmarks view.
+        assert_eq!(h.back(), Some(ViewEntry::Bookmarks));
+        h.finish_navigation();
+        // Re-recording the view we are already on is a no-op.
+        h.record(ViewEntry::Bookmarks);
+        assert_eq!(h.entries.len(), 2);
+        // And forward returns to the directory.
+        assert_eq!(h.forward(), Some(dir("/a")));
+        h.finish_navigation();
     }
 
     #[test]

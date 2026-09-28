@@ -4,33 +4,59 @@
 # the next start. Every section and key is optional; anything omitted falls back
 # to a default value.
 
-# ── Startup ──────────────────────────────────────────────────────────────────
+# -- Startup ------------------------------------------------------------------
 # Where the panel opens when launched without a path argument. One of:
-#   "home"  - always open the home directory (the default)
+#   "home"  - always open the home directory
 #   "last"  - reopen the last-used directory
-#   "bookmarks" - open with the bookmarks section showing and no directory pane
+#   "bookmarks" - open a panel showing the bookmarks view (the default)
 #   { path = "/some/dir" }  - always open that directory (a leading ~ = $HOME)
-startup = "home"
+startup = "bookmarks"
 
-# ── Panel ────────────────────────────────────────────────────────────────────
+# -- Panel --------------------------------------------------------------------
 [panel]
 side = "left"        # screen edge to dock to: "left" | "right"
 layer = "bottom"     # stacking layer: "background" | "bottom" | "top" | "overlay"
 width = 300          # panel width in px (clamped to 160–2000)
 margin = 0           # gap from the screen edge in px (clamped to 0–200)
 
-# ── Bookmarks ────────────────────────────────────────────────────────────────
-# A bookmarks strip docked above or below every pane. Click an entry to open a
-# pane at that directory; right-click it to edit (name/path) or delete it. The
-# list itself lives in `file` below (created with a single home bookmark on
-# first launch). `startup = "bookmarks"` opens with the section as the initial
-# view; the hamburger menu's "Bookmarks" item toggles it at any time.
+# -- Bookmarks ----------------------------------------------------------------
+# Bookmarks are a pane view: a panel opened without a directory shows them as
+# suggested places to jump to, and clicking one replaces the view with that
+# directory. The list lives in `file` below (created with a single home bookmark
+# on first launch); each entry can be renamed or removed from its right-click
+# menu, and "Add Bookmark" in a directory's menu adds one.
 [bookmarks]
-show = false          # show the section on launch
-position = "top"      # "top" | "bottom" - above or below the pane stack
 file = "bookmarks.toml" # list file, relative to this config (or absolute)
 
-# ── Tree ─────────────────────────────────────────────────────────────────────
+# The hamburger menu shown while the bookmarks view is active. Same item syntax
+# as [pane_menu]; pane-level actions (Open Folder, Filter, Split, Back/Forward,
+# Collapse, Close Pane) apply. "Up One Level" would be a no-op here, so it is
+# left out.
+menu = [
+    "Open Folder...",
+    "Filter...",
+    "Split View",
+
+    "---",
+    { action = "Back", shortcut = "Alt+Left" },
+    { action = "Forward", shortcut = "Alt+Right" },
+
+    "---",
+    "Collapse",
+    { action = "Close Pane", shortcut = "Ctrl+w" },
+]
+
+# Extra items appended to a bookmark's right-click menu. The rest of that menu is
+# inherited from the context menu the bookmarked directory would get in the tree
+# (actions run against that directory without opening it), so only the
+# bookmark-specific actions live here.
+context = [
+    "---",
+    "Edit Bookmark",
+    "Delete Bookmark",
+]
+
+# -- Tree ---------------------------------------------------------------------
 [tree]
 dirs_first = true     # list directories above files
 sort_key = "name"     # primary sort: "name" | "size" | "modified" | "type"
@@ -40,7 +66,7 @@ font_size = 13        # row label size in pt (clamped to 6–40)
 icon_size = 18        # row icon size in px (clamped to 12–128)
 confirm_drop_move = false # ask before a drag-and-drop move (Ctrl+drag copies freely)
 
-# ── Context menus ────────────────────────────────────────────────────────────
+# -- Context menus ------------------------------------------------------------
 #
 # Right-click menus are an ordered list of rules. The first rule whose
 # `matches` claims a row provides that row's entire menu; rows no rule claims

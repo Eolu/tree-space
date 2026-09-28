@@ -468,6 +468,9 @@ pub enum TreeMsg {
     DropIntoConfirmed { target: PathBuf, sources: Vec<PathBuf> },
     /// Drop every thumbnail and stop all media playback ahead of app exit.
     Shutdown,
+    /// Do nothing. Produced for actions that are dispatched elsewhere (the
+    /// bookmark-only builtins never run against a tree row).
+    Noop,
 }
 
 /// Notable events the tree reports upwards.
@@ -934,6 +937,7 @@ impl Tree {
             }
             TreeMsg::SetPanel(panel) => self.content_width = thumbnail_content_width(panel),
             TreeMsg::Shutdown => self.shutdown(),
+            TreeMsg::Noop => {}
 
             TreeMsg::MoveUp => self.cursor_delta(-1),
             TreeMsg::MoveDown => self.cursor_delta(1),
@@ -1845,7 +1849,7 @@ fn action_builtin(action: &ContextAction) -> Option<BuiltinAction> {
 /// label from the row's path and the side of the screen the tree lives on:
 ///   * "Open With {default app}" — the default application's display name;
 ///   * "In {right|left} panel" — the opposite side of the dock.
-fn menu_label(action: &ContextAction, path: &Path, side: PanelSide) -> String {
+pub(crate) fn menu_label(action: &ContextAction, path: &Path, side: PanelSide) -> String {
     let dynamic = match action_builtin(action) {
         Some(BuiltinAction::OpenWithDefault) => default_app_label(path),
         Some(BuiltinAction::InOppositePanel) => Some(format!("In {} panel", side.opposite().name())),
@@ -2150,8 +2154,45 @@ fn builtin_message(action: BuiltinAction, path: &Path) -> TreeMsg {
         | BuiltinAction::Collapse
         | BuiltinAction::ClosePane
         | BuiltinAction::ToggleBookmarks => unreachable!("pane action in a row context menu"),
+        // Bookmark-only actions are handled by the bookmarks view, never a tree.
+        BuiltinAction::EditBookmark | BuiltinAction::DeleteBookmark => TreeMsg::Noop,
         BuiltinAction::Separator => unreachable!("separators are rendered, not dispatched"),
     }
+}
+
+/// Whether `action` can be run against a bare path with no tree row behind it
+/// (used by the bookmarks view, whose entries point at directories that may not
+/// be visible in any tree). Actions that need the tree's model or selection —
+/// new file/folder, cut/copy/paste, thumbnails — are excluded.
+pub(crate) fn is_path_safe(action: BuiltinAction) -> bool {
+    matches!(
+        action,
+        BuiltinAction::Open
+            | BuiltinAction::OpenSplit
+            | BuiltinAction::InNewPanel
+            | BuiltinAction::InOppositePanel
+            | BuiltinAction::OpenWith
+            | BuiltinAction::OpenWithDefault
+            | BuiltinAction::Duplicate
+            | BuiltinAction::CreateLink
+            | BuiltinAction::CopyPath
+            | BuiltinAction::CopyRelativePath
+            | BuiltinAction::Properties
+            | BuiltinAction::Trash
+            | BuiltinAction::DeletePermanently
+            | BuiltinAction::AddBookmark
+    )
+}
+
+/// The [`TreeMsg`] that runs path-safe `action` against `path` for a caller
+/// with no tree row (the bookmarks view). `None` for actions without a
+/// path-based form; `Open` is handled by the app directly and never reaches
+/// here.
+pub(crate) fn path_action_message(action: BuiltinAction, path: &Path) -> Option<TreeMsg> {
+    if !is_path_safe(action) || action == BuiltinAction::Open {
+        return None;
+    }
+    Some(builtin_message(action, path))
 }
 
 /// Extensions that map to a package/archive icon in the row list.

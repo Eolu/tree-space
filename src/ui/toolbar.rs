@@ -63,14 +63,19 @@ pub enum ToolbarOutput {
 pub enum ToolbarMsg {
     /// Update the path entry to reflect the current root.
     SetRoot(PathBuf),
+    /// Switch the hamburger to the bookmarks-view menu (or back to the pane
+    /// menu) as the pane's body changes.
+    SetBookmarks(bool),
 }
 
 /// The toolbar's init payload: the pane overlay its completion dropdown is
 /// parented to (so the dropdown can draw over the tree without stealing focus),
-/// plus the configurable hamburger-menu definition.
+/// plus the two configurable hamburger menus.
 pub struct ToolbarInit {
     pub overlay: gtk::Overlay,
     pub pane_menu: PaneMenu,
+    /// The hamburger shown while the bookmarks view is active.
+    pub bookmarks_menu: Vec<ContextAction>,
 }
 
 /// The toolbar component. Holds the current root path for the editable entry.
@@ -78,6 +83,10 @@ pub struct Toolbar {
     root: PathBuf,
     path_entry: gtk::Entry,
     menu_button: gtk::MenuButton,
+    /// Items of the normal pane menu and of the bookmarks-view menu; the
+    /// popover is rebuilt from one or the other as the body switches.
+    pane_items: Vec<ContextAction>,
+    bookmarks_items: Vec<ContextAction>,
     completion: Completion,
 }
 
@@ -166,17 +175,19 @@ impl SimpleComponent for Toolbar {
             root: PathBuf::new(),
             path_entry: entry,
             menu_button: widgets.menu_button.clone(),
+            pane_items: init.pane_menu.items.clone(),
+            bookmarks_items: init.bookmarks_menu.clone(),
             completion,
         };
 
         // Build the hamburger popover from the configured pane menu.
-        let popover = build_pane_popover(&init.pane_menu, &sender);
+        let popover = build_pane_popover(&model.pane_items, &sender);
         model.menu_button.set_popover(Some(&popover));
 
         ComponentParts { model, widgets }
     }
 
-    fn update(&mut self, msg: Self::Input, _sender: ComponentSender<Self>) {
+    fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>) {
         match msg {
             ToolbarMsg::SetRoot(path) => {
                 self.root = path;
@@ -185,6 +196,12 @@ impl SimpleComponent for Toolbar {
                 self.path_entry.set_text(&self.root.display().to_string());
                 self.path_entry.set_position(-1);
                 self.completion.suppress.set(false);
+            }
+            ToolbarMsg::SetBookmarks(on) => {
+                let items =
+                    if on { &self.bookmarks_items } else { &self.pane_items };
+                let popover = build_pane_popover(items, &sender);
+                self.menu_button.set_popover(Some(&popover));
             }
         }
     }
@@ -400,17 +417,17 @@ fn suggestions(text: &str) -> Vec<PathBuf> {
     names.into_iter().map(|name| PathBuf::from(format!("{parent}{name}"))).collect()
 }
 
-/// Build the hamburger popover from the configured pane menu. Separators become
-/// dividers; every other item becomes a button that pops the menu down and
-/// dispatches its action. Plain buttons never auto-close a `GtkPopover`, hence
-/// the explicit `popdown`.
-fn build_pane_popover(menu: &PaneMenu, sender: &ComponentSender<Toolbar>) -> gtk::Popover {
+/// Build the hamburger popover from a configured menu (the pane menu or the
+/// bookmarks-view menu). Separators become dividers; every other item becomes a
+/// button that pops the menu down and dispatches its action. Plain buttons never
+/// auto-close a `GtkPopover`, hence the explicit `popdown`.
+fn build_pane_popover(items: &[ContextAction], sender: &ComponentSender<Toolbar>) -> gtk::Popover {
     let popover = gtk::Popover::new();
     popover.add_css_class("hamburger-popover");
 
     let box_ = gtk::Box::new(gtk::Orientation::Vertical, 0);
     box_.add_css_class("hamburger-menu");
-    append_pane_items(&box_, &menu.items, &popover, sender);
+    append_pane_items(&box_, items, &popover, sender);
 
     popover.set_child(Some(&box_));
     popover
@@ -543,11 +560,11 @@ pub struct PaneShortcuts {
 }
 
 impl PaneShortcuts {
-    /// Compile every shortcut-carrying item in `menu`. Unparseable accelerators
-    /// are skipped (the menu item still works).
-    pub fn compile(menu: &PaneMenu) -> Self {
+    /// Compile every shortcut-carrying item in `items`. Unparseable
+    /// accelerators are skipped (the menu item still works).
+    pub fn compile(items: &[ContextAction]) -> Self {
         let mut bindings = Vec::new();
-        collect_pane_bindings(&menu.items, &mut bindings);
+        collect_pane_bindings(items, &mut bindings);
         Self { bindings }
     }
 
