@@ -1,6 +1,6 @@
 [package]
 name = "tree-space"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 description = "A dockable, keyboard-first file manager panel for Wayland/Hyprland"
 license = "MIT"
@@ -27,6 +27,15 @@ regex = "1"
 # binding dependency entirely (GTK still links libgstreamer itself), at the cost
 # of no inline audio player. See the `audio` feature below.
 gstreamer = { version = "0.25.4", optional = true }
+# Inline document previews (see `preview.rs`): parse data formats and read
+# archive tables. All pure-Rust, no system libraries at runtime.
+serde_json = "1"
+serde_norway = "0.9"
+tar = "0.4"
+flate2 = "1"
+# Only the zip reader is used (listing), but entries are commonly Deflate-
+# compressed, so enable that one backend and skip crypto/7z/zstd/etc.
+zip = { version = "8", default-features = false, features = ["deflate"] }
 
 [features]
 # `audio` is on by default; build with `--no-default-features` to drop the

@@ -18,7 +18,7 @@
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::rc::Rc;
+use std::rc::{Rc, Weak};
 use std::time::{Duration, SystemTime};
 
 use crate::audio::AudioPlayer;
@@ -26,9 +26,13 @@ use crate::config::{
     BuiltinAction, ContextAction, ContextMenu, PanelConfig, PanelSide, ShortcutTarget,
     TreeConfig, action_command,
 };
+use crate::fs::meta::format_size;
 use crate::fs::model::{Change, SortKey, StdDirSource, TreeModel, VisibleRow};
 use crate::fs::ops::FileOps;
 use crate::fs::watcher::{RecursiveMode, RecommendedWatcher, Watcher, spawn as spawn_watcher};
+use crate::preview::{
+    self, ArchiveData, DocumentData, DocumentLines, ParseStatus, PreviewKind, TableData,
+};
 use gtk4_layer_shell::{KeyboardMode, Layer, LayerShell};
 use relm4::gtk::{gdk, gio, glib, pango, prelude::*};
 use relm4::prelude::*;
@@ -504,15 +508,28 @@ pub struct Tree {
     side: PanelSide,
 
     /// Paths the user turned "View Thumbnail" on: a file previews only itself,
-    /// a directory previews every image beneath it. Non-persistent — cleared
-    /// when a directory collapses or the root changes.
+    /// a directory previews every previewable file beneath it. Non-persistent —
+    /// cleared when a directory collapses or the root changes.
     thumbnails: HashSet<PathBuf>,
+    /// Detected preview kind per path, so the content sniffing that classifies
+    /// each file runs once rather than on every rebuild. `None` caches a file
+    /// that has no preview.
+    preview_kinds: HashMap<PathBuf, Option<PreviewKind>>,
+    /// Parsed inline documents (text, tables, structured data, archives) keyed
+    /// by path, so a rebuild never re-reads or re-parses. `None` caches a file
+    /// that failed to load.
+    documents: HashMap<PathBuf, Option<DocumentData>>,
     /// Decoded textures for the active thumbnails, so rebuilds (which run on
     /// every selection change) don't re-decode images.
     thumb_cache: HashMap<PathBuf, gdk::Texture>,
     /// Decoded media streams for video thumbnails (kept across rebuilds so a
     /// playing clip isn't restarted by a redraw).
     media: HashMap<PathBuf, gtk::MediaFile>,
+    /// The live `GtkVideo` for each video thumbnail. Held so teardown can
+    /// detach the stream from the widget: a removed row can stay alive until GTK
+    /// re-focuses, and a widget still holding a stream would keep playing.
+    /// Repopulated on each render.
+    video_widgets: HashMap<PathBuf, gtk::Video>,
     /// Audio players (GStreamer `playbin`, not GtkMediaFile — see `crate::audio`),
     /// kept across rebuilds so playback continues through a redraw.
     audio: HashMap<PathBuf, Rc<AudioPlayer>>,
@@ -724,8 +741,11 @@ impl Component for Tree {
             menu: init.menu,
             side: init.side,
             thumbnails: HashSet::new(),
+            preview_kinds: HashMap::new(),
+            documents: HashMap::new(),
             thumb_cache: HashMap::new(),
             media: HashMap::new(),
+            video_widgets: HashMap::new(),
             audio: HashMap::new(),
             playing: HashSet::new(),
             gif_anims: Rc::new(RefCell::new(HashMap::new())),
@@ -1666,6 +1686,9 @@ fn rebuild(tree: &mut Tree, widgets: &mut <Tree as Component>::Widgets, sender: 
     // Likewise the previous render's audio players: `audio_tick` must never
     // touch controls that this rebuild is about to free.
     tree.audio_widgets.borrow_mut().clear();
+    // Stop media for rows that are no longer rendered, whatever the reason.
+    let visible: HashSet<PathBuf> = rows.iter().map(|row| row.path.clone()).collect();
+    tree.retain_visible_media(&visible);
 
     for (index, row) in rows.iter().enumerate() {
         let list_row = gtk::ListBoxRow::new();
@@ -1736,10 +1759,10 @@ fn rebuild(tree: &mut Tree, widgets: &mut <Tree as Component>::Widgets, sender: 
             menu_row = Some(list_row.clone());
         }
 
-        // Inline thumbnail preview (a previewable file, or every one under a
-        // directory the user turned on). Sized to the column, never enlarged.
-        if tree.wants_thumbnail(row) {
-            tree.append_thumbnail(&row.path, row_indent, &container, &sender);
+        // Inline preview (a previewable file, or every one under a directory
+        // the user turned on). Sized to the column, never enlarged.
+        if tree.wants_preview(row) {
+            tree.append_preview(&row.path, row_indent, &container, &sender);
         }
 
         let path = row.path.clone();
@@ -1877,10 +1900,11 @@ pub(crate) fn menu_label(action: &ContextAction, path: &Path, side: PanelSide) -
     let dynamic = match action_builtin(action) {
         Some(BuiltinAction::OpenWithDefault) => default_app_label(path),
         Some(BuiltinAction::InOppositePanel) => Some(format!("In {} panel", side.opposite().name())),
-        // Audio has no picture to show, so the same toggle reads as "Show Player".
-        Some(BuiltinAction::ViewThumbnail) if media_kind(path) == Some(MediaKind::Audio) => {
-            Some("Show Player".to_owned())
-        }
+        // Not every preview is a picture: audio has a player, text a snippet, an
+        // archive its contents. Let those say what they show.
+        Some(BuiltinAction::ViewThumbnail) => preview::detect(path)
+            .and_then(PreviewKind::menu_label)
+            .map(str::to_owned),
         _ => None,
     };
     dynamic.unwrap_or_else(|| action.label())
@@ -1951,10 +1975,11 @@ fn append_menu_items(
             if matches!(builtin, BuiltinAction::OpenWithDefault) && path.is_dir() {
                 continue;
             }
-            // Thumbnails only make sense for directories and image files.
+            // A preview is only offered for a directory (its children) or a
+            // file we know how to preview.
             if builtin == BuiltinAction::ViewThumbnail
                 && !path.is_dir()
-                && !is_thumbnailable(path)
+                && preview::detect(path).is_none()
             {
                 continue;
             }
@@ -2224,6 +2249,12 @@ pub(crate) fn path_action_message(action: BuiltinAction, path: &Path) -> Option<
 /// Extensions that map to a package/archive icon in the row list.
 const ARCHIVE_EXTENSIONS: [&str; 8] = ["zip", "tar", "gz", "xz", "bz2", "zst", "7z", "rar"];
 
+fn has_extension(path: &Path, extensions: &[&str]) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| extensions.iter().any(|candidate| ext.eq_ignore_ascii_case(candidate)))
+}
+
 fn icon_name(row: &VisibleRow) -> &'static str {
     if row.is_dir {
         return if row.expanded { "folder-open-symbolic" } else { "folder-symbolic" };
@@ -2251,65 +2282,6 @@ fn icon_name(row: &VisibleRow) -> &'static str {
 // model operations
 // ---------------------------------------------------------------------------
 
-/// What kind of inline preview a file supports.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MediaKind {
-    /// A still image, decoded to a `GdkTexture`.
-    Image,
-    /// An animated GIF: first frame still, animates on click.
-    Gif,
-    /// A video: first frame (paused) still, plays on click.
-    Video,
-    /// An audio file: no picture, just an inline transport.
-    Audio,
-}
-
-/// Extensions GdkTexture can decode as a still image (GIF is handled
-/// separately so it can animate). SVG is deliberately excluded: neither
-/// GdkTexture nor the media backend can rasterise it.
-const IMAGE_EXTENSIONS: [&str; 10] =
-    ["jpg", "jpeg", "png", "webp", "bmp", "tif", "tiff", "avif", "heic", "heif"];
-
-/// Video extensions offered a thumbnail. Whether a given file actually plays
-/// depends on the installed GStreamer plugins.
-const VIDEO_EXTENSIONS: [&str; 15] = [
-    "mp4", "m4v", "mkv", "webm", "mov", "avi", "wmv", "flv", "ogv", "ogg", "ts", "mpg",
-    "mpeg", "3gp", "m2ts",
-];
-
-/// Audio extensions offered an inline player. Like video, actual playback
-/// depends on the installed GStreamer plugins (`gst-plugins-good` covers the
-/// common ones; `gst-libav`/`gst-plugins-ugly` add more).
-const AUDIO_EXTENSIONS: [&str; 12] = [
-    "mp3", "m4a", "m4b", "aac", "flac", "wav", "opus", "oga", "wma", "aif", "aiff", "alac",
-];
-
-fn has_extension(path: &Path, extensions: &[&str]) -> bool {
-    path.extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| extensions.iter().any(|candidate| ext.eq_ignore_ascii_case(candidate)))
-}
-
-/// The preview kind for `path`, if it is previewable media.
-fn media_kind(path: &Path) -> Option<MediaKind> {
-    if has_extension(path, &["gif"]) {
-        Some(MediaKind::Gif)
-    } else if has_extension(path, &IMAGE_EXTENSIONS) {
-        Some(MediaKind::Image)
-    } else if has_extension(path, &VIDEO_EXTENSIONS) {
-        Some(MediaKind::Video)
-    } else if cfg!(feature = "audio") && has_extension(path, &AUDIO_EXTENSIONS) {
-        Some(MediaKind::Audio)
-    } else {
-        None
-    }
-}
-
-/// Whether `path` can have an inline preview (a thumbnail, or an audio player).
-fn is_thumbnailable(path: &Path) -> bool {
-    media_kind(path).is_some()
-}
-
 /// A GIF animation being played inline. The iterator keeps its animation
 /// alive and yields the frame for a given wall-clock time.
 struct GifAnim {
@@ -2320,7 +2292,9 @@ struct GifAnim {
 /// and writes the other widgets, so the bar/clock/icon stay correct even as
 /// the row is rebuilt.
 struct AudioWidgets {
-    player: Rc<AudioPlayer>,
+    /// Weak so the widgets never outlive (and keep playing) a discarded preview;
+    /// [`Tree::audio`] is the sole strong owner.
+    player: Weak<AudioPlayer>,
     play: gtk::Button,
     seek: gtk::Scale,
     time: gtk::Label,
@@ -2440,8 +2414,15 @@ fn build_audio_player(player: &Rc<AudioPlayer>, margin_start: i32) -> (gtk::Box,
     play.set_tooltip_text(Some("Play"));
     play.set_valign(gtk::Align::Center);
     {
-        let player = player.clone();
+        // Hold the player weakly: the row widgets outlive the `Tree`'s own
+        // caches long enough to matter (a removed row can stay alive until GTK
+        // re-focuses), and a strong handle here would keep the sink playing
+        // after the preview was discarded.
+        let player = Rc::downgrade(player);
         play.connect_clicked(move |button| {
+            let Some(player) = player.upgrade() else {
+                return;
+            };
             let playing = player.is_playing();
             player.set_playing(!playing);
             button.set_icon_name(if playing {
@@ -2462,14 +2443,16 @@ fn build_audio_player(player: &Rc<AudioPlayer>, margin_start: i32) -> (gtk::Box,
     seek.set_size_request(60, -1);
     let seeking = Rc::new(Cell::new(false));
     {
-        let player = player.clone();
+        let player = Rc::downgrade(player);
         let seeking = seeking.clone();
         seek.connect_change_value(move |_, _, value| {
             // Pause the ticker's clock while the user drags the handle.
             seeking.set(true);
             let flag = seeking.clone();
             glib::timeout_add_local_once(Duration::from_millis(200), move || flag.set(false));
-            player.seek(value.round() as i64);
+            if let Some(player) = player.upgrade() {
+                player.seek(value.round() as i64);
+            }
             glib::Propagation::Proceed
         });
     }
@@ -2489,19 +2472,140 @@ fn build_audio_player(player: &Rc<AudioPlayer>, margin_start: i32) -> (gtk::Box,
     volume.set_size_request(56, -1);
     volume.set_tooltip_text(Some("Volume"));
     {
-        let player = player.clone();
-        volume.connect_value_changed(move |scale| player.set_volume(scale.value()));
+        let player = Rc::downgrade(player);
+        volume.connect_value_changed(move |scale| {
+            if let Some(player) = player.upgrade() {
+                player.set_volume(scale.value());
+            }
+        });
     }
     controls.append(&volume);
 
     let widgets = AudioWidgets {
-        player: player.clone(),
+        player: Rc::downgrade(player),
         play,
         seek,
         time,
         seeking,
     };
     (controls, widgets)
+}
+
+/// Widest a table cell is allowed to grow before it ellipsizes.
+const PREVIEW_CELL_CHARS: i32 = 12;
+
+/// Append a monospaced text excerpt (a document, or a structured file's source).
+fn append_text_lines(container: &gtk::Box, margin_start: i32, lines: &DocumentLines) {
+    if lines.lines.is_empty() {
+        return;
+    }
+    let mut text = lines.lines.join("\n");
+    if lines.more {
+        text.push_str("\n…");
+    }
+    let label = gtk::Label::new(Some(&text));
+    label.add_css_class("tree-preview-text");
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    label.set_wrap(true);
+    label.set_wrap_mode(pango::WrapMode::Char);
+    label.set_margin_start(margin_start);
+    label.set_margin_bottom(6);
+    container.append(&label);
+}
+
+/// Append the validity line under a structured preview.
+fn append_status(container: &gtk::Box, margin_start: i32, status: &ParseStatus) {
+    if status.detail.is_empty() {
+        return;
+    }
+    let label = gtk::Label::new(Some(&status.detail));
+    label.add_css_class("tree-preview-status");
+    label.add_css_class(if status.ok { "ok" } else { "error" });
+    label.set_xalign(0.0);
+    label.set_hexpand(true);
+    label.set_wrap(true);
+    label.set_wrap_mode(pango::WrapMode::WordChar);
+    label.set_margin_start(margin_start);
+    label.set_margin_bottom(6);
+    container.append(&label);
+}
+
+/// Append a CSV/TSV preview as a grid. The first row is styled as a header; the
+/// grid shrinks column by column (cells ellipsize) to fit the panel.
+fn append_table(container: &gtk::Box, margin_start: i32, table: &TableData) {
+    if table.rows.is_empty() {
+        return;
+    }
+    let grid = gtk::Grid::new();
+    grid.add_css_class("tree-preview-table");
+    grid.set_margin_start(margin_start);
+    grid.set_margin_bottom(6);
+    grid.set_column_spacing(10);
+    grid.set_row_spacing(1);
+    for (r, row) in table.rows.iter().enumerate() {
+        for (c, cell) in row.iter().enumerate() {
+            let label = gtk::Label::new(Some(cell));
+            label.set_xalign(0.0);
+            label.set_ellipsize(pango::EllipsizeMode::End);
+            label.set_max_width_chars(PREVIEW_CELL_CHARS);
+            if r == 0 {
+                label.add_css_class("tree-preview-header");
+            }
+            grid.attach(&label, c as i32, r as i32, 1, 1);
+        }
+    }
+    container.append(&grid);
+    if table.more {
+        let more = gtk::Label::new(Some("…"));
+        more.add_css_class("tree-preview-status");
+        more.set_xalign(0.0);
+        more.set_margin_start(margin_start);
+        container.append(&more);
+    }
+}
+
+/// Append an archive's table of contents (or a one-line summary when its format
+/// can't be listed).
+fn append_archive(container: &gtk::Box, margin_start: i32, archive: &ArchiveData) {
+    let list = gtk::Box::new(gtk::Orientation::Vertical, 1);
+    list.add_css_class("tree-preview-archive");
+    list.set_margin_start(margin_start);
+    list.set_margin_bottom(6);
+    match archive {
+        ArchiveData::Unsupported(reason) => {
+            let label = gtk::Label::new(Some(reason));
+            label.add_css_class("tree-preview-status");
+            label.set_xalign(0.0);
+            label.set_wrap(true);
+            list.append(&label);
+        }
+        ArchiveData::Listed(listing) => {
+            for entry in &listing.entries {
+                let row = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+                let name = gtk::Label::new(Some(&entry.name));
+                name.add_css_class("tree-preview-archive-name");
+                name.set_xalign(0.0);
+                name.set_hexpand(true);
+                name.set_ellipsize(pango::EllipsizeMode::Middle);
+                row.append(&name);
+                if !entry.is_dir {
+                    let size = gtk::Label::new(Some(&format_size(entry.size)));
+                    size.add_css_class("tree-preview-archive-size");
+                    size.set_xalign(1.0);
+                    row.append(&size);
+                }
+                list.append(&row);
+            }
+            if listing.more {
+                let more = gtk::Label::new(Some("…"));
+                more.add_css_class("tree-preview-status");
+                more.set_xalign(0.0);
+                list.append(&more);
+            }
+        }
+    }
+    container.append(&list);
 }
 
 impl Tree {
@@ -2529,11 +2633,11 @@ impl Tree {
         self.rename_entry = None;
         self.menu_target = None;
         self.thumbnails.clear();
+        self.preview_kinds.clear();
+        self.documents.clear();
         self.thumb_cache.clear();
         self.playing.clear();
-        for media in self.media.values() {
-            media.set_playing(false);
-        }
+        self.stop_all_videos();
         self.media.clear();
         self.audio.clear();
         self.gif_anims.borrow_mut().clear();
@@ -2777,27 +2881,24 @@ impl Tree {
         self.audio_widgets.borrow_mut().clear();
         self.playing.clear();
         self.thumbnails.clear();
-        for media in self.media.values() {
-            media.set_playing(false);
-        }
+        self.stop_all_videos();
         self.media.clear();
         // Dropping each player returns its pipeline to NULL.
         self.audio.clear();
     }
 
-    /// Forget all thumbnail state for `prefix` and everything under it.
+    /// Forget all preview state for `prefix` and everything under it. Every
+    /// resource a preview owns is torn down explicitly here rather than left to
+    /// widget destruction: a removed row can stay referenced long enough to keep
+    /// a video or audio stream playing.
     fn clear_thumbnails_under(&mut self, prefix: &Path) {
         self.thumbnails.retain(|path| !path.starts_with(prefix));
+        self.preview_kinds.retain(|path, _| !path.starts_with(prefix));
+        self.documents.retain(|path, _| !path.starts_with(prefix));
         self.thumb_cache.retain(|path, _| !path.starts_with(prefix));
         self.playing.retain(|path| !path.starts_with(prefix));
-        self.media.retain(|path, media| {
-            if path.starts_with(prefix) {
-                media.set_playing(false);
-                false
-            } else {
-                true
-            }
-        });
+        self.stop_videos_under(prefix);
+        self.media.retain(|path, _| !path.starts_with(prefix));
         self.gif_anims.borrow_mut().retain(|path, _| !path.starts_with(prefix));
         self.gif_widgets.borrow_mut().retain(|path, _| !path.starts_with(prefix));
         self.audio_widgets.borrow_mut().retain(|path, _| !path.starts_with(prefix));
@@ -2805,10 +2906,54 @@ impl Tree {
         self.audio.retain(|path, _| !path.starts_with(prefix));
     }
 
-    /// Whether `row` should render an inline preview: a previewable file that
-    /// was turned on directly, or that sits under a directory that was.
-    fn wants_thumbnail(&self, row: &VisibleRow) -> bool {
-        if row.is_dir || !is_thumbnailable(&row.path) {
+    /// Detach every video stream under `prefix` from its `GtkVideo` and drop the
+    /// widget handle. A `GtkMediaFile` is shared, so dropping the cache is not
+    /// enough while the widget still references it.
+    fn stop_videos_under(&mut self, prefix: &Path) {
+        self.video_widgets.retain(|path, video| {
+            if path.starts_with(prefix) {
+                video.set_media_stream(None::<&gtk::MediaStream>);
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    /// Detach every video stream from its widget and drop all handles.
+    fn stop_all_videos(&mut self) {
+        for video in self.video_widgets.values() {
+            video.set_media_stream(None::<&gtk::MediaStream>);
+        }
+        self.video_widgets.clear();
+    }
+
+    /// Stop and drop every media resource whose file is not in `visible` (the
+    /// model's rows about to be rendered). Previews are ephemeral: a file that
+    /// is no longer on screen — collapsed, filtered out, replaced by another
+    /// view — must not keep decoding or playing. This single choke point makes
+    /// teardown independent of *why* a row disappeared.
+    fn retain_visible_media(&mut self, visible: &HashSet<PathBuf>) {
+        self.video_widgets.retain(|path, video| {
+            if visible.contains(path) {
+                true
+            } else {
+                video.set_media_stream(None::<&gtk::MediaStream>);
+                false
+            }
+        });
+        self.media.retain(|path, _| visible.contains(path));
+        self.playing.retain(|path| visible.contains(path));
+        self.gif_anims.borrow_mut().retain(|path, _| visible.contains(path));
+        // Dropping a player returns its pipeline to NULL.
+        self.audio.retain(|path, _| visible.contains(path));
+    }
+
+    /// Whether `row` should render an inline preview: a file that was turned on
+    /// directly, or that sits under a directory that was. Whether the file is
+    /// previewable at all is resolved later, from the detection cache.
+    fn wants_preview(&self, row: &VisibleRow) -> bool {
+        if row.is_dir {
             return false;
         }
         self.thumbnails.contains(&row.path)
@@ -2819,21 +2964,32 @@ impl Tree {
                 .any(|ancestor| self.thumbnails.contains(ancestor))
     }
 
+    /// The preview kind for `path`, detected once and cached. `None` (cached)
+    /// means the file has no inline preview.
+    fn preview_kind(&mut self, path: &Path) -> Option<PreviewKind> {
+        if let Some(kind) = self.preview_kinds.get(path) {
+            return *kind;
+        }
+        let kind = preview::detect(path);
+        self.preview_kinds.insert(path.to_path_buf(), kind);
+        kind
+    }
+
     /// The still texture for `path` — an image, or a GIF's first frame —
     /// decoded and cached on first use.
-    fn static_texture(&mut self, path: &Path) -> Option<gdk::Texture> {
+    fn static_texture(&mut self, path: &Path, kind: PreviewKind) -> Option<gdk::Texture> {
         if let Some(texture) = self.thumb_cache.get(path) {
             return Some(texture.clone());
         }
-        let texture = match media_kind(path)? {
-            MediaKind::Image => gdk::Texture::from_filename(path).ok()?,
-            MediaKind::Gif => {
+        let texture = match kind {
+            PreviewKind::Image => gdk::Texture::from_filename(path).ok()?,
+            PreviewKind::Gif => {
                 let animation = gdk::gdk_pixbuf::PixbufAnimation::from_file(path).ok()?;
                 let pixbuf = animation.static_image()?;
                 gdk::Texture::for_pixbuf(&pixbuf)
             }
-            // Videos and audio are rendered by their own widgets, not a texture.
-            MediaKind::Video | MediaKind::Audio => return None,
+            // Everything else renders through its own widget, not a texture.
+            _ => return None,
         };
         self.thumb_cache.insert(path.to_path_buf(), texture.clone());
         Some(texture)
@@ -2873,7 +3029,7 @@ impl Tree {
     /// Play/pause an animated GIF thumbnail. (Videos are handled entirely by
     /// `GtkVideo`'s own transport controls, so they never reach here.)
     fn toggle_thumbnail_play(&mut self, path: &Path) {
-        if media_kind(path) != Some(MediaKind::Gif) {
+        if self.preview_kind(path) != Some(PreviewKind::Gif) {
             return;
         }
         if self.playing.remove(path) {
@@ -2934,8 +3090,13 @@ impl Tree {
                 return glib::ControlFlow::Break;
             }
             for widgets in players.values() {
-                let position = widgets.player.position();
-                let duration = widgets.player.duration();
+                // The player is owned by `Tree::audio`; a dead weak handle means
+                // it was discarded, so stop driving these controls.
+                let Some(player) = widgets.player.upgrade() else {
+                    continue;
+                };
+                let position = player.position();
+                let duration = player.duration();
                 if duration > 0
                     && (widgets.seek.adjustment().upper() - duration as f64).abs() > 0.5
                 {
@@ -2949,7 +3110,7 @@ impl Tree {
                     format_time(position),
                     format_time(duration)
                 ));
-                widgets.play.set_icon_name(if widgets.player.is_playing() {
+                widgets.play.set_icon_name(if player.is_playing() {
                     "media-playback-pause-symbolic"
                 } else {
                     "media-playback-start-symbolic"
@@ -2960,29 +3121,46 @@ impl Tree {
         *self.audio_tick.borrow_mut() = Some(id);
     }
 
-    /// Append the inline preview for `path` below its row (a still image, an
-    /// animated GIF, a video, or an audio player).
-    fn append_thumbnail(
+    /// Append the inline preview for `path` below its row. The kind is detected
+    /// (and cached) here; media is decoded/played by [`Self::append_media`],
+    /// everything else by [`Self::append_document`].
+    fn append_preview(
         &mut self,
         path: &Path,
         row_indent: i32,
         container: &gtk::Box,
         sender: &ComponentSender<Self>,
     ) {
-        let Some(kind) = media_kind(path) else {
+        let Some(kind) = self.preview_kind(path) else {
             return;
         };
         let label_start = row_indent + self.config.icon_size as i32 + 6;
-        let available = self.content_width - label_start - 6;
+        if kind.is_media() {
+            let available = self.content_width - label_start - 6;
+            self.append_media(path, kind, label_start, available, container, sender);
+        } else {
+            self.append_document(path, kind, label_start, container);
+        }
+    }
 
+    /// Append a still image, animated GIF, video or audio player for `path`.
+    fn append_media(
+        &mut self,
+        path: &Path,
+        kind: PreviewKind,
+        label_start: i32,
+        available: i32,
+        container: &gtk::Box,
+        sender: &ComponentSender<Self>,
+    ) {
         match kind {
-            MediaKind::Image => {
-                if let Some(texture) = self.static_texture(path) {
+            PreviewKind::Image => {
+                if let Some(texture) = self.static_texture(path, kind) {
                     let (width, height) = thumbnail_size(&texture, available);
                     container.append(&thumbnail_picture(&texture, label_start, width, height));
                 }
             }
-            MediaKind::Gif => {
+            PreviewKind::Gif => {
                 // While playing, show the current frame; otherwise the first.
                 let playing = self.playing.contains(path);
                 let texture = if playing {
@@ -2991,7 +3169,7 @@ impl Tree {
                         .get(path)
                         .map(|anim| gdk::Texture::for_pixbuf(&anim.iter.pixbuf()))
                 } else {
-                    self.static_texture(path)
+                    self.static_texture(path, kind)
                 };
                 if let Some(texture) = texture {
                     let (width, height) = thumbnail_size(&texture, available);
@@ -3011,7 +3189,7 @@ impl Tree {
                     container.append(&picture);
                 }
             }
-            MediaKind::Video => {
+            PreviewKind::Video => {
                 if let Some(media) = self.media_file(path) {
                     // `GtkVideo` brings its own transport controls (play/pause,
                     // seek, mute). Adding our own click gesture here would fire
@@ -3028,10 +3206,11 @@ impl Tree {
                     video.set_size_request(width, (width * 9 / 16).max(36));
                     video.set_margin_start(label_start);
                     video.set_margin_bottom(6);
+                    self.video_widgets.insert(path.to_path_buf(), video.clone());
                     container.append(&video);
                 }
             }
-            MediaKind::Audio => {
+            PreviewKind::Audio => {
                 if let Some(player) = self.audio_player(path) {
                     // Unlike a video, audio has no picture to show, so we build
                     // a compact transport (play/pause, seek, clock, volume) that
@@ -3042,6 +3221,40 @@ impl Tree {
                     self.ensure_audio_ticker();
                 }
             }
+            // Documents are handled by `append_document`.
+            PreviewKind::Text
+            | PreviewKind::Csv
+            | PreviewKind::Json
+            | PreviewKind::Toml
+            | PreviewKind::Yaml
+            | PreviewKind::Archive => {}
+        }
+    }
+
+    /// Append a text, table, structured-data or archive preview for `path`. The
+    /// parsed data is cached, so a rebuild only rebuilds the widgets.
+    fn append_document(
+        &mut self,
+        path: &Path,
+        kind: PreviewKind,
+        label_start: i32,
+        container: &gtk::Box,
+    ) {
+        if !self.documents.contains_key(path) {
+            let data = preview::load_document(path, kind);
+            self.documents.insert(path.to_path_buf(), data);
+        }
+        let Some(Some(data)) = self.documents.get(path) else {
+            return;
+        };
+        match data {
+            DocumentData::Lines(lines) => append_text_lines(container, label_start, lines),
+            DocumentData::Structured { lines, status } => {
+                append_text_lines(container, label_start, lines);
+                append_status(container, label_start, status);
+            }
+            DocumentData::Table(table) => append_table(container, label_start, table),
+            DocumentData::Archive(archive) => append_archive(container, label_start, archive),
         }
     }
 
@@ -3491,7 +3704,10 @@ impl Tree {
         if matches!(builtin, BuiltinAction::OpenWithDefault) && path.is_dir() {
             return;
         }
-        if builtin == BuiltinAction::ViewThumbnail && !path.is_dir() && !is_thumbnailable(&path) {
+        if builtin == BuiltinAction::ViewThumbnail
+            && !path.is_dir()
+            && preview::detect(&path).is_none()
+        {
             return;
         }
         // Row-specific actions are meaningless with nothing selected.
@@ -3707,29 +3923,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn media_detection_is_extension_based_and_case_insensitive() {
-        for name in ["a.JPG", "b.jpeg", "c.png", "d.webp", "e.HEIC", "f.tiff"] {
-            assert_eq!(media_kind(Path::new(name)), Some(MediaKind::Image), "{name}");
-        }
-        for name in ["loop.GIF", "x.gif"] {
-            assert_eq!(media_kind(Path::new(name)), Some(MediaKind::Gif), "{name}");
-        }
-        for name in ["clip.mp4", "b.MKV", "c.webm", "d.mov", "e.OGV"] {
-            assert_eq!(media_kind(Path::new(name)), Some(MediaKind::Video), "{name}");
-        }
-        for name in ["song.MP3", "b.flac", "c.wav", "d.m4a", "e.opus", "f.oga"] {
-            if cfg!(feature = "audio") {
-                assert_eq!(media_kind(Path::new(name)), Some(MediaKind::Audio), "{name}");
-                assert!(is_thumbnailable(Path::new(name)), "{name}");
-            } else {
-                // Without the `audio` feature, audio files are not previewable.
-                assert_eq!(media_kind(Path::new(name)), None, "{name}");
-            }
-        }
-        for name in ["a.svg", "b.txt", "c.rs", "noext", "d.png.bak"] {
-            assert_eq!(media_kind(Path::new(name)), None, "{name}");
-            assert!(!is_thumbnailable(Path::new(name)), "{name}");
-        }
+    fn preview_menu_label_reflects_the_file_kind() {
+        use tempfile::tempdir;
+        let dir = tempdir().unwrap();
+        let write = |name: &str, bytes: &[u8]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        let label = |path: &Path| {
+            menu_label(
+                &ContextAction::Builtin(BuiltinAction::ViewThumbnail),
+                path,
+                PanelSide::Left,
+            )
+        };
+        // A picture keeps the configured label; the rest say what they show.
+        let png = write("a.png", &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]);
+        assert_eq!(label(&png), "View Thumbnail");
+        let text = write("a.txt", b"hello\n");
+        assert_eq!(label(&text), "Show Preview");
+        let json = write("a.json", br#"{"a":1}"#);
+        assert_eq!(label(&json), "Show Preview");
+        // A zip magic signature is enough to classify it as an archive.
+        let zip = write("a.zip", b"PK\x03\x04rest");
+        assert_eq!(label(&zip), "Show Contents");
+        // Directories keep the default label too.
+        assert_eq!(label(dir.path()), "View Thumbnail");
     }
 
     #[test]

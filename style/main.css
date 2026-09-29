@@ -433,6 +433,52 @@ popover.hamburger-popover > arrow {
     opacity: 0.8;
     font-feature-settings: "tnum";
 }
+
+/* ── inline document previews (text, tables, structured data, archives) ──── */
+.tree-preview-text {
+    font-family: monospace;
+    font-size: 0.82em;
+    color: @tn_fg;
+    background-color: alpha(@tn_fg, 0.04);
+    border-radius: 4px;
+    padding: 3px 6px;
+}
+
+.tree-preview-status {
+    font-size: 0.8em;
+    color: @tn_fg_dim;
+}
+
+/* Tokyo Night green/red for a parse result. */
+.tree-preview-status.ok {
+    color: #9ece6a;
+}
+
+.tree-preview-status.error {
+    color: #f7768e;
+}
+
+.tree-preview-table {
+    font-size: 0.82em;
+}
+
+.tree-preview-header {
+    color: @tn_fg_bright;
+    font-weight: bold;
+}
+
+.tree-preview-archive {
+    font-size: 0.85em;
+}
+
+.tree-preview-archive-name {
+    color: @tn_fg;
+}
+
+.tree-preview-archive-size {
+    color: @tn_fg_dim;
+    font-size: 0.85em;
+}
 /* ── properties dialog ───────────────────────────────────────────────────── */
 .props {
     background-color: @tn_bg;

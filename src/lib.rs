@@ -25,4 +25,5 @@ pub mod fs;
 pub mod cmd;
 pub mod ipc;
 pub mod audio;
+pub mod preview;
 pub mod ui;
