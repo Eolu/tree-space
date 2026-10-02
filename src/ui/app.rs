@@ -2099,6 +2099,7 @@ fn init_layer_window(window: &gtk::Window, config: &Config, side: PanelSide, wid
         return;
     }
     window.init_layer_shell();
+    window.set_namespace(Some(crate::ui::LAYER_NAMESPACE));
     window.set_layer(layer_of(config.panel.layer));
     let edge = match side {
         PanelSide::Left => Edge::Left,

@@ -17,3 +17,8 @@ pub mod bookmarks;
 pub mod props;
 pub mod toolbar;
 pub mod tree;
+
+/// The `wlr-layer-shell` namespace every tree-space surface advertises, so
+/// compositor rules can target the panel and its dialogs by name instead of the
+/// built-in `gtk4-layer-shell` default.
+pub(crate) const LAYER_NAMESPACE: &str = "tree-space";

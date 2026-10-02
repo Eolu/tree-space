@@ -3813,6 +3813,7 @@ fn open_with_dialog(parent: &gtk::Window, path: &Path, sender: &ComponentSender<
     // (transient for the panel) so it still behaves modally.
     if gtk4_layer_shell::is_supported() && !dialog.is_layer_window() {
         dialog.init_layer_shell();
+        dialog.set_namespace(Some(crate::ui::LAYER_NAMESPACE));
         dialog.set_layer(Layer::Overlay);
         dialog.set_keyboard_mode(KeyboardMode::Exclusive);
         dialog.set_default_size(540, 620);

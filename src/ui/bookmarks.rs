@@ -899,6 +899,7 @@ pub fn show_bookmark_dialog(
     window.set_transient_for(Some(parent));
     if gtk4_layer_shell::is_supported() && !window.is_layer_window() {
         window.init_layer_shell();
+        window.set_namespace(Some(crate::ui::LAYER_NAMESPACE));
         window.set_layer(Layer::Overlay);
         window.set_keyboard_mode(KeyboardMode::Exclusive);
     }
