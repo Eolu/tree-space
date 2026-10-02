@@ -243,6 +243,18 @@ impl BookmarkNav {
         }
     }
 
+    /// The event to fire for the row under the cursor when it is activated
+    /// (Enter/Space): expand/collapse a folder, or open a leaf's directory.
+    /// Mirrors what a click on the row does. Used by the IPC `--key` command.
+    pub fn activate(&self) -> Option<BookmarkEvent> {
+        let node = self.current()?;
+        if node.folder {
+            Some(BookmarkEvent::Toggle(node.index_path))
+        } else {
+            node.path.map(BookmarkEvent::Open)
+        }
+    }
+
     /// Ask the next rebuild to restore keyboard focus to the cursor row.
     fn focus_on_next_fill(&self) {
         self.focus_after_fill.set(true);

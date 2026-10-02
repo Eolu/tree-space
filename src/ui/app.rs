@@ -1441,18 +1441,24 @@ impl App {
             self.run_pane_shortcut(id, action, sender);
             return;
         }
-        // A bookmark row navigation key belongs to the bookmarks view, not the
-        // (hidden) tree, which would have no rows to move over.
-        if self.docks[di].panes[pi].on_bookmarks()
-            && bookmarks::BookmarkNav::is_nav_key(key)
-        {
-            if let Some(node) = self.docks[di].panes[pi].bookmark_nav.navigate(key) {
-                sender.input(AppMsg::BookmarkEvent {
-                    id,
-                    event: BookmarkEvent::Toggle(node.index_path),
-                });
+        // Navigation and activation belong to the bookmarks view, not the
+        // (hidden) tree, which would have no rows to move over or open.
+        if self.docks[di].panes[pi].on_bookmarks() {
+            if bookmarks::BookmarkNav::is_nav_key(key) {
+                if let Some(node) = self.docks[di].panes[pi].bookmark_nav.navigate(key) {
+                    sender.input(AppMsg::BookmarkEvent {
+                        id,
+                        event: BookmarkEvent::Toggle(node.index_path),
+                    });
+                }
+                return;
             }
-            return;
+            if matches!(key, gdk::Key::Return | gdk::Key::KP_Enter | gdk::Key::space) {
+                if let Some(event) = self.docks[di].panes[pi].bookmark_nav.activate() {
+                    sender.input(AppMsg::BookmarkEvent { id, event });
+                }
+                return;
+            }
         }
         self.docks[di].panes[pi]
             .tree

@@ -622,7 +622,7 @@ pub fn parse_accelerator(accel: &str) -> Option<(gdk::Key, gdk::ModifierType)> {
 
 fn normalize_accelerator(accel: &str) -> String {
     if !accel.contains('+') {
-        return accel.to_owned();
+        return normalize_key_name(accel);
     }
     let mut mods = String::new();
     let mut key = String::new();
@@ -638,10 +638,20 @@ fn normalize_accelerator(accel: &str) -> String {
             "super" | "win" | "mod4" => mods.push_str("<Super>"),
             "meta" => mods.push_str("<Meta>"),
             "hyper" => mods.push_str("<Hyper>"),
-            _ => key = token.to_owned(),
+            _ => key = normalize_key_name(token),
         }
     }
     format!("{mods}{key}")
+}
+
+/// Map friendly key names GTK does not know onto its canonical ones, so the
+/// IPC `--key` command accepts the names people actually write.
+fn normalize_key_name(name: &str) -> String {
+    if name.eq_ignore_ascii_case("enter") {
+        "Return".to_owned()
+    } else {
+        name.to_owned()
+    }
 }
 
 #[cfg(test)]
