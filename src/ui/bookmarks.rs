@@ -194,6 +194,55 @@ impl BookmarkNav {
         self.focus_index(index);
     }
 
+    /// Whether `key` is a navigation key the bookmarks list consumes. Mirrors
+    /// the widget's own key controller, for the IPC `--key` path.
+    pub fn is_nav_key(key: gdk::Key) -> bool {
+        matches!(
+            key,
+            gdk::Key::Up
+                | gdk::Key::Down
+                | gdk::Key::Home
+                | gdk::Key::End
+                | gdk::Key::Left
+                | gdk::Key::Right
+        )
+    }
+
+    /// Handle a bookmarks navigation key from outside the widget (the IPC
+    /// `--key` command). Up/Down/Home/End move the cursor; Left/Right on a
+    /// folder returns the entry to expand/collapse, which the caller must
+    /// rebuild via a `BookmarkEvent::Toggle`. Returns `None` otherwise.
+    pub fn navigate(&self, key: gdk::Key) -> Option<BookmarkNode> {
+        match key {
+            gdk::Key::Up => {
+                self.move_by(-1);
+                None
+            }
+            gdk::Key::Down => {
+                self.move_by(1);
+                None
+            }
+            gdk::Key::Home => {
+                self.move_bound(false);
+                None
+            }
+            gdk::Key::End => {
+                self.move_bound(true);
+                None
+            }
+            gdk::Key::Left | gdk::Key::Right => {
+                let node = self.current()?;
+                let want_open = key == gdk::Key::Right;
+                if !node.folder || node.open == want_open {
+                    return None;
+                }
+                self.focus_on_next_fill();
+                Some(node)
+            }
+            _ => None,
+        }
+    }
+
     /// Ask the next rebuild to restore keyboard focus to the cursor row.
     fn focus_on_next_fill(&self) {
         self.focus_after_fill.set(true);

@@ -1428,8 +1428,8 @@ impl App {
 
     /// Run an accelerator string (e.g. `Ctrl+c`, `Down`) against pane `id`, as
     /// if the key were pressed: pane-menu shortcuts first (they are resolved at
-    /// the pane level in a real press), then the tree's structural and
-    /// context-menu shortcuts. Used by the IPC `--key` command.
+    /// the pane level in a real press), then the bookmarks or tree view's
+    /// structural/context-menu shortcuts. Used by the IPC `--key` command.
     fn run_accelerator(&mut self, id: u64, accel: &str, sender: &ComponentSender<Self>) {
         let Some((key, mods)) = parse_accelerator(accel) else {
             return;
@@ -1439,6 +1439,19 @@ impl App {
         };
         if let Some(action) = self.docks[di].panes[pi].shortcuts.action_for(key, mods) {
             self.run_pane_shortcut(id, action, sender);
+            return;
+        }
+        // A bookmark row navigation key belongs to the bookmarks view, not the
+        // (hidden) tree, which would have no rows to move over.
+        if self.docks[di].panes[pi].on_bookmarks()
+            && bookmarks::BookmarkNav::is_nav_key(key)
+        {
+            if let Some(node) = self.docks[di].panes[pi].bookmark_nav.navigate(key) {
+                sender.input(AppMsg::BookmarkEvent {
+                    id,
+                    event: BookmarkEvent::Toggle(node.index_path),
+                });
+            }
             return;
         }
         self.docks[di].panes[pi]
