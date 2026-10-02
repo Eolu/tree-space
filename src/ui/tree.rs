@@ -424,6 +424,10 @@ pub enum TreeMsg {
     ToggleThumbnailPlay(PathBuf),
     /// A configured shortcut fired against the row under the keyboard cursor.
     RunShortcut { target: ShortcutTarget },
+    /// Run a configured shortcut by accelerator string (e.g. `Ctrl+c`, `Down`),
+    /// as if the key were pressed. Used by the IPC `--key` command so external
+    /// button decks can drive the tree without it holding keyboard focus.
+    RunAccelerator(String),
     Duplicate(PathBuf),
     /// Ctrl+D: duplicate whatever is at the keyboard cursor.
     RequestDuplicateCursor,
@@ -1309,6 +1313,14 @@ impl Tree {
             }
             TreeMsg::ToggleThumbnailPlay(path) => self.toggle_thumbnail_play(&path),
             TreeMsg::RunShortcut { target } => self.run_shortcut(target, &sender),
+            TreeMsg::RunAccelerator(accel) => {
+                if let Some((key, mods)) = parse_accelerator(&accel) {
+                    let keys = compile_shortcuts(&self.menu);
+                    if let Some(msg) = resolve_key(key, mods, &keys) {
+                        sender.input(msg);
+                    }
+                }
+            }
 
             TreeMsg::SelectAllRows => {
                 if !self.rows.is_empty() {
@@ -1503,19 +1515,12 @@ fn normalize_accelerator(accel: &str) -> String {
     format!("{mods}{key}")
 }
 
-fn handle_key(
-    key: gdk::Key,
-    state: gdk::ModifierType,
-    renaming: bool,
-    keys: &[KeyBinding],
-    sender: &ComponentSender<Tree>,
-) -> glib::Propagation {
+/// Resolve a key press to the tree message it should run: structural
+/// navigation first (not configurable), then the configured context-menu
+/// accelerators. `None` means nothing matched. Shared by real key presses and
+/// the IPC `--key` command.
+fn resolve_key(key: gdk::Key, state: gdk::ModifierType, keys: &[KeyBinding]) -> Option<TreeMsg> {
     use gdk::Key;
-
-    // While a rename entry is focused, let it win all keys.
-    if renaming {
-        return glib::Propagation::Proceed;
-    }
 
     let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
     let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
@@ -1537,47 +1542,54 @@ fn handle_key(
         Key::a | Key::A if ctrl && !shift => Some(TreeMsg::SelectAllRows),
         _ => None,
     };
+    if let Some(msg) = structural {
+        return Some(msg);
+    }
 
-    let msg = match structural {
-        Some(msg) => msg,
-        None => {
-            // Everything else comes from the configured accelerators
-            // (cut/copy/paste/rename/delete/new tab/...), fired against the row
-            // under the keyboard cursor.
-            let mut hit = None;
-            for binding in keys.iter() {
-                if key.to_lower() == binding.key.to_lower()
-                    && accel_mods(state) == accel_mods(binding.mods)
-                {
-                    hit = Some(TreeMsg::RunShortcut {
-                        target: binding.target.clone(),
-                    });
-                    break;
-                }
-            }
-            match hit {
-                Some(msg) => msg,
-                // No binding matched. A bare printable key (no ctrl/alt/super)
-                // starts or extends a type-ahead search.
-                None if !ctrl
-                    && !state.contains(gdk::ModifierType::ALT_MASK)
-                    && !state.contains(gdk::ModifierType::SUPER_MASK) =>
-                {
-                    if let Some(ch) = key.to_unicode()
-                        && ch.is_ascii_graphic()
-                    {
-                        TreeMsg::TypeAhead(ch)
-                    } else {
-                        return glib::Propagation::Proceed;
-                    }
-                }
-                None => return glib::Propagation::Proceed,
-            }
-        }
-    };
+    // Everything else comes from the configured accelerators
+    // (cut/copy/paste/rename/delete/new tab/...), fired against the row under
+    // the keyboard cursor.
+    keys.iter()
+        .find(|binding| {
+            key.to_lower() == binding.key.to_lower()
+                && accel_mods(state) == accel_mods(binding.mods)
+        })
+        .map(|binding| TreeMsg::RunShortcut {
+            target: binding.target.clone(),
+        })
+}
 
-    sender.input(msg);
-    glib::Propagation::Stop
+fn handle_key(
+    key: gdk::Key,
+    state: gdk::ModifierType,
+    renaming: bool,
+    keys: &[KeyBinding],
+    sender: &ComponentSender<Tree>,
+) -> glib::Propagation {
+    // While a rename entry is focused, let it win all keys.
+    if renaming {
+        return glib::Propagation::Proceed;
+    }
+
+    if let Some(msg) = resolve_key(key, state, keys) {
+        sender.input(msg);
+        return glib::Propagation::Stop;
+    }
+
+    let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+    // No binding matched. A bare printable key (no ctrl/alt/super) starts or
+    // extends a type-ahead search.
+    if !ctrl
+        && !state.contains(gdk::ModifierType::ALT_MASK)
+        && !state.contains(gdk::ModifierType::SUPER_MASK)
+        && let Some(ch) = key.to_unicode()
+        && ch.is_ascii_graphic()
+    {
+        sender.input(TreeMsg::TypeAhead(ch));
+        return glib::Propagation::Stop;
+    }
+
+    glib::Propagation::Proceed
 }
 
 // ---------------------------------------------------------------------------

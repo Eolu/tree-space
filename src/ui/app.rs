@@ -52,7 +52,9 @@ use crate::config::{
 use crate::fs::SortKey;
 use crate::ipc;
 use crate::ui::bookmarks::{self, BookmarkEvent, MoveTarget};
-use crate::ui::toolbar::{PaneShortcuts, Toolbar, ToolbarInit, ToolbarMsg, ToolbarOutput};
+use crate::ui::toolbar::{
+    PaneShortcuts, Toolbar, ToolbarInit, ToolbarMsg, ToolbarOutput, parse_accelerator,
+};
 use crate::ui::tree::{Tree, TreeInit, TreeOutput, TreeMsg};
 
 /// One entry in a pane's history: a directory it showed, or the bookmarks view.
@@ -173,6 +175,9 @@ pub struct Pane {
     /// The navigation-toolbar buttons when `[panel] nav_toolbar` is enabled;
     /// their enabled state tracks the pane's root and history.
     nav_buttons: Option<NavButtons>,
+    /// The pane-menu accelerators, kept so the IPC `--key` command can resolve
+    /// a shortcut against this pane without a real key event.
+    shortcuts: Rc<PaneShortcuts>,
 }
 
 /// The optional navigation toolbar's buttons.
@@ -919,6 +924,20 @@ impl SimpleComponent for App {
 impl App {
     /// Apply a forwarded launch request.
     fn handle_launch(&mut self, command: Command, sender: &ComponentSender<Self>) {
+        // `--key`: run a configured shortcut against the active pane as if it
+        // were pressed. It never changes visibility; a cold start (no panes at
+        // all) falls through to the normal show.
+        if let Some(accel) = command.key.clone() {
+            match self.active_pane_id(command.side) {
+                Some(id) => {
+                    self.run_accelerator(id, &accel, sender);
+                    return;
+                }
+                None if !self.docks.is_empty() => return,
+                None => {}
+            }
+        }
+
         let hidden = command.hidden;
 
         // A width change is a side effect that never touches visibility. It
@@ -1390,6 +1409,43 @@ impl App {
         }
     }
 
+    /// The pane an action should target: the active pane of the asked-for side
+    /// (or the primary side / first visible dock), falling back to its last
+    /// pane.
+    fn active_pane_id(&self, side: Option<PanelSide>) -> Option<u64> {
+        let di = match side {
+            Some(side) => self.dock_of_side(side)?,
+            None => self
+                .dock_of_side(self.primary_side)
+                .or_else(|| self.docks.iter().position(|dock| dock.window.is_visible()))
+                .or_else(|| (!self.docks.is_empty()).then_some(0))?,
+        };
+        let dock = &self.docks[di];
+        dock.active_pane
+            .filter(|id| dock.panes.iter().any(|pane| pane.id == *id))
+            .or_else(|| dock.panes.last().map(|pane| pane.id))
+    }
+
+    /// Run an accelerator string (e.g. `Ctrl+c`, `Down`) against pane `id`, as
+    /// if the key were pressed: pane-menu shortcuts first (they are resolved at
+    /// the pane level in a real press), then the tree's structural and
+    /// context-menu shortcuts. Used by the IPC `--key` command.
+    fn run_accelerator(&mut self, id: u64, accel: &str, sender: &ComponentSender<Self>) {
+        let Some((key, mods)) = parse_accelerator(accel) else {
+            return;
+        };
+        let Some((di, pi)) = self.dock_pane_of(id) else {
+            return;
+        };
+        if let Some(action) = self.docks[di].panes[pi].shortcuts.action_for(key, mods) {
+            self.run_pane_shortcut(id, action, sender);
+            return;
+        }
+        self.docks[di].panes[pi]
+            .tree
+            .emit(TreeMsg::RunAccelerator(accel.to_owned()));
+    }
+
     /// Locate `(dock_index, pane_index)` for a pane id.
     fn dock_pane_of(&self, id: u64) -> Option<(usize, usize)> {
         self.docks.iter().enumerate().find_map(|(di, dock)| {
@@ -1813,18 +1869,20 @@ fn make_pane(
 
     // Pane-menu shortcuts are resolved at the pane level (capture phase), so
     // they work whether focus is on the tree, the path entry, the filter bar, or
-    // nothing at all. Row shortcuts stay on the tree.
-    {
+    // nothing at all. Row shortcuts stay on the tree. The compiled table is kept
+    // on the pane so the IPC `--key` command can reuse it.
+    let shortcuts = {
         // Both menus' shortcuts are live regardless of which body is showing,
         // so a binding in either works from the tree or the bookmarks view.
         let mut items = config.pane_menu.items.clone();
         items.extend(config.bookmarks.menu.iter().cloned());
         let shortcuts = Rc::new(PaneShortcuts::compile(&items));
         let s = sender.clone();
+        let bound = shortcuts.clone();
         let keys = gtk::EventControllerKey::new();
         keys.set_propagation_phase(gtk::PropagationPhase::Capture);
         keys.connect_key_pressed(move |_, key, _, state| {
-            if let Some(action) = shortcuts.action_for(key, state) {
+            if let Some(action) = bound.action_for(key, state) {
                 s.input(AppMsg::PaneShortcut { id, action });
                 glib::Propagation::Stop
             } else {
@@ -1832,7 +1890,8 @@ fn make_pane(
             }
         });
         widget.add_controller(keys);
-    }
+        shortcuts
+    };
 
     Pane {
         id,
@@ -1850,6 +1909,7 @@ fn make_pane(
         bookmark_nav,
         nav_buttons,
         widget: overlay,
+        shortcuts,
     }
 }
 

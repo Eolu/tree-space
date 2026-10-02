@@ -11,12 +11,14 @@
 //! * `tree-space --hidden`            → launch/keep hidden (never shows)
 //! * `tree-space --width 420`         → set the panel width (absolute pixels)
 //! * `tree-space --width +40`         → widen the running panel by 40px (`-40` narrows)
+//! * `tree-space --key Ctrl+c`         → run a configured shortcut against the
+//!   active pane without needing keyboard focus (used by external button decks)
 //!
 //! If a tree-space server is already running, the new invocation serializes
 //! its [`Command`] to the instance socket and exits; the server feeds it back
 //! to the app via [`crate::ui::app::AppMsg::LaunchRequest`]. The wire format is
-//! deliberately simple: `side=`/`root=`/`hidden=`/`width=` tokens joined with
-//! NULs (impossible in Unix path components) and terminated by a newline.
+//! deliberately simple: `side=`/`root=`/`hidden=`/`width=`/`key=` tokens joined
+//! with NULs (impossible in Unix path components) and terminated by a newline.
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -83,6 +85,10 @@ pub struct Command {
     /// `--width`: resize the panel (absolute or relative) without touching its
     /// visibility.
     pub width: Option<WidthArg>,
+    /// `--key`: a configured shortcut (GTK accelerator syntax, e.g. `Ctrl+c`,
+    /// `F2`, `Alt+Left`) to run against the active pane as if it were pressed.
+    /// Never changes visibility.
+    pub key: Option<String>,
 }
 
 impl Command {
@@ -100,6 +106,7 @@ impl Command {
         let mut reveal: Vec<PathBuf> = Vec::new();
         let mut hidden = false;
         let mut width = None;
+        let mut key = None;
         let mut args = args.into_iter().map(Into::into);
         while let Some(arg) = args.next() {
             let text = arg.to_string_lossy();
@@ -125,6 +132,19 @@ impl Command {
                     };
                     if let Some(parsed) = value.as_deref().and_then(WidthArg::parse) {
                         width = Some(parsed);
+                    }
+                }
+                "--key" | "-k" => {
+                    // Accept `--key ACCEL` and `--key=ACCEL`; a lone `--key`
+                    // (with no value) is ignored.
+                    let value = match inline_value {
+                        Some(v) => Some(v.to_string()),
+                        None => args.next().map(|v| v.to_string_lossy().into_owned()),
+                    };
+                    if let Some(value) = value
+                        && !value.trim().is_empty()
+                    {
+                        key = Some(value.trim().to_owned());
                     }
                 }
                 "--select" => {
@@ -155,7 +175,7 @@ impl Command {
                 }
             }
         }
-        Command { side, roots, reveal, hidden, width }
+        Command { side, roots, reveal, hidden, width, key }
     }
 
     /// Encode into the IPC wire format (a single line, NUL-separated tokens).
@@ -178,6 +198,9 @@ impl Command {
         if let Some(width) = self.width {
             parts.push(format!("width={}", width.encode()));
         }
+        if let Some(key) = &self.key {
+            parts.push(format!("key={key}"));
+        }
         parts.join("\0")
     }
 
@@ -189,6 +212,7 @@ impl Command {
         let mut reveal: Vec<PathBuf> = Vec::new();
         let mut hidden = false;
         let mut width = None;
+        let mut key = None;
         for token in line.split('\0') {
             if token.is_empty() {
                 continue;
@@ -204,20 +228,22 @@ impl Command {
                 "select" => reveal.push(PathBuf::from(value)),
                 "hidden" => hidden = value == "1" || value.eq_ignore_ascii_case("true"),
                 "width" => width = Some(WidthArg::parse(value)?),
+                "key" => key = Some(value.to_owned()),
                 _ => return None,
             }
         }
-        Some(Command { side, roots, reveal, hidden, width })
+        Some(Command { side, roots, reveal, hidden, width, key })
     }
 
     /// Does this command carry no directories and ask for the normal toggle
-    /// (neither a side override, `--hidden`, nor `--width`)?
+    /// (neither a side override, `--hidden`, `--width`, nor `--key`)?
     pub fn is_toggle(&self) -> bool {
         self.roots.is_empty()
             && self.reveal.is_empty()
             && self.side.is_none()
             && !self.hidden
             && self.width.is_none()
+            && self.key.is_none()
     }
 
     /// Resolve each reveal path into a pane root plus an optional child to
@@ -374,7 +400,26 @@ mod tests {
             reveal: vec![PathBuf::from("/home/eolu/some file.txt")],
             hidden: false,
             width: None,
+            key: None,
         };
+        assert_eq!(Command::decode(&cmd.encode()), Some(cmd));
+    }
+
+    #[test]
+    fn key_flag_parses_and_is_never_a_toggle() {
+        assert_eq!(parse_str(&["--key", "Ctrl+c"]).key, Some("Ctrl+c".to_owned()));
+        assert_eq!(parse_str(&["--key=F2"]).key, Some("F2".to_owned()));
+        assert_eq!(parse_str(&["-k", "Alt+Left"]).key, Some("Alt+Left".to_owned()));
+        assert_eq!(parse_str(&["--key", "  Ctrl+t  "]).key, Some("Ctrl+t".to_owned()));
+        // A lone `--key` with no value is ignored.
+        assert!(parse_str(&["--key"]).key.is_none());
+        assert!(!parse_str(&["--key", "Ctrl+c"]).is_toggle());
+    }
+
+    #[test]
+    fn encode_decode_key() {
+        let cmd = Command { key: Some("Ctrl+Shift+m".to_owned()), ..Command::default() };
+        assert_eq!(cmd.encode(), "key=Ctrl+Shift+m");
         assert_eq!(Command::decode(&cmd.encode()), Some(cmd));
     }
 

@@ -146,6 +146,10 @@ OPTIONS:
     -w, --width <W>           Resize the panel. `420` sets an absolute width;
                               `+40` grows it by 40px and `-40` shrinks it.
                               Does not change whether the panel is shown.
+    -k, --key <ACCEL>         Run a configured shortcut against the active pane
+                              as if it were pressed (e.g. `Ctrl+c`, `F2`,
+                              `Alt+Left`). Needs no keyboard focus; used by
+                              external button decks. Does not change visibility.
     -h, --help                Print this help.
 
 The panel is single-instance: an invocation while one is already running is
