@@ -51,6 +51,7 @@ use relm4::gtk;
 use relm4::prelude::*;
 
 use tree_space::cmd::Command;
+use tree_space::freedesktop;
 use tree_space::ipc;
 use tree_space::ui::app::{App, AppInit};
 
@@ -79,6 +80,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             None
         }
     };
+
+    // The primary instance also serves the freedesktop `FileManager1` D-Bus
+    // interface. Integrations that bypass the MIME default — the portal's
+    // "Show in folder" and Electron's `showItemInFolder`, used by VS Code's
+    // "Open Containing Folder" — call it directly, so without this they land in
+    // whichever file manager ships that service (usually Nautilus).
+    if listener.is_some() {
+        freedesktop::serve_file_manager();
+    }
 
     // Build the GApplication by hand so it carries `HANDLES_OPEN` and an `open`
     // handler: that is what lets desktop/X!DG activation (a `.desktop` with

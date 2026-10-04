@@ -45,6 +45,23 @@ const DEFAULT_CONFIG: &str = include_str!("../default-config.toml");
 /// launch and used as a fallback when the user's own is missing or unreadable.
 pub const DEFAULT_STYLESHEET: &str = include_str!("../style/main.css");
 
+/// Marks the point in the default stylesheet where the theme-independent
+/// structure begins. Everything above it is a palette of `@define-color`
+/// definitions a system theme replaces; everything below is shared CSS.
+const STYLE_STRUCTURE_MARKER: &str =
+    "/* --- structure (theme-independent; system themes replace the colors above) --- */";
+
+/// The theme-independent part of the default stylesheet: every rule, with the
+/// `@define-color` palette stripped off. A system theme prepends its own
+/// palette (and font rules) and reuses this structure, so it never needs the
+/// user's `main.css`.
+pub fn default_structure() -> &'static str {
+    DEFAULT_STYLESHEET
+        .split_once(STYLE_STRUCTURE_MARKER)
+        .map(|(_, structure)| structure)
+        .unwrap_or(DEFAULT_STYLESHEET)
+}
+
 /// The parsed `default-config.toml`, built once. Every `Default` impl delegates
 /// here so the file, not this module, decides the defaults.
 ///
@@ -61,6 +78,7 @@ fn builtin() -> &'static Config {
             .expect("default-config.toml must be valid TOML");
         Config {
             panel: raw.panel.unwrap_or_default(),
+            theme: raw.theme.unwrap_or_default(),
             tree: raw.tree.unwrap_or_default(),
             startup: raw.startup.unwrap_or_default(),
             context_menu: raw.context_menu.unwrap_or_default(),
@@ -77,6 +95,8 @@ fn builtin() -> &'static Config {
 struct ShippedRaw {
     #[serde(default)]
     panel: Option<PanelConfig>,
+    #[serde(default)]
+    theme: Option<ThemeConfig>,
     #[serde(default)]
     tree: Option<TreeConfig>,
     #[serde(default)]
@@ -222,6 +242,41 @@ pub enum PanelLayer {
     Bottom,
     Top,
     Overlay,
+}
+
+/// How the panel is styled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeMode {
+    /// Load `main.css` from the config directory (the default).
+    #[default]
+    Custom,
+    /// Ignore `main.css` and derive the stylesheet from the desktop theme.
+    System,
+}
+
+/// Which desktop theme [`ThemeMode::System`] follows. Only Omarchy is supported
+/// today; more providers may be added later.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SystemTheme {
+    /// Omarchy's active theme (`~/.local/state/omarchy/current/theme`).
+    #[default]
+    Omarchy,
+}
+
+/// The `[theme]` section: how the panel gets its colors and fonts.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ThemeConfig {
+    pub mode: ThemeMode,
+    pub system: SystemTheme,
+}
+
+impl Default for ThemeConfig {
+    fn default() -> Self {
+        Self { mode: ThemeMode::Custom, system: SystemTheme::Omarchy }
+    }
 }
 
 /// Smallest allowed panel width, in pixels.
@@ -663,6 +718,13 @@ pub enum BuiltinAction {
     ClosePane,
     /// Pane-level: show or hide the bookmarks section in this dock.
     ToggleBookmarks,
+    /// Pane-level: move the whole panel to the previous workspace.
+    MoveToPreviousWorkspace,
+    /// Pane-level: move the whole panel to the next workspace.
+    MoveToNextWorkspace,
+    /// Pane-level: move the whole panel to a named workspace (the target comes
+    /// from [`BuiltinEntry::workspace`]).
+    MoveToWorkspace,
     /// Bookmark-only: edit the clicked bookmark (name/path).
     EditBookmark,
     /// Bookmark-only: delete the clicked bookmark.
@@ -716,6 +778,9 @@ impl BuiltinAction {
             BuiltinAction::Collapse => "Collapse",
             BuiltinAction::ClosePane => "Close Pane",
             BuiltinAction::ToggleBookmarks => "Bookmarks",
+            BuiltinAction::MoveToPreviousWorkspace => "Move to Previous Workspace",
+            BuiltinAction::MoveToNextWorkspace => "Move to Next Workspace",
+            BuiltinAction::MoveToWorkspace => "Move to Workspace",
             BuiltinAction::EditBookmark => "Edit Bookmark",
             BuiltinAction::DeleteBookmark => "Delete Bookmark",
             BuiltinAction::NewBookmark => "New Bookmark",
@@ -805,6 +870,9 @@ impl BuiltinAction {
                 | BuiltinAction::Collapse
                 | BuiltinAction::ClosePane
                 | BuiltinAction::ToggleBookmarks
+                | BuiltinAction::MoveToPreviousWorkspace
+                | BuiltinAction::MoveToNextWorkspace
+                | BuiltinAction::MoveToWorkspace
                 | BuiltinAction::NewBookmark
                 | BuiltinAction::NewBookmarkFolder
         )
@@ -873,6 +941,9 @@ impl BuiltinAction {
             Self::Collapse,
             Self::ClosePane,
             Self::ToggleBookmarks,
+            Self::MoveToPreviousWorkspace,
+            Self::MoveToNextWorkspace,
+            Self::MoveToWorkspace,
             Self::EditBookmark,
             Self::DeleteBookmark,
             Self::NewBookmark,
@@ -935,6 +1006,10 @@ pub struct BuiltinEntry {
     /// shortcut (see [`BuiltinAction::default_shortcut`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shortcut: Option<String>,
+    /// Target workspace for [`BuiltinAction::MoveToWorkspace`], by Hyprland
+    /// workspace name (e.g. `"2"`, `"special:scratch"`). Ignored otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace: Option<String>,
     /// Hide this item from the rendered menu while keeping its shortcut live.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub hidden: bool,
@@ -975,6 +1050,17 @@ pub enum ContextAction {
     Entry(BuiltinEntry),
     Command(CommandAction),
     Submenu(Submenu),
+}
+
+/// Where a "move the panel" action should send the panel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkspaceMove {
+    /// The workspace before the panel's current one (wrapping around).
+    Previous,
+    /// The workspace after the panel's current one (wrapping around).
+    Next,
+    /// A specific workspace, by Hyprland workspace name.
+    Named(String),
 }
 
 /// The action bound by a shortcut: a builtin, or a custom command that is run
@@ -1051,6 +1137,23 @@ impl ContextAction {
                 .or_else(|| entry.action.default_shortcut().map(str::to_owned)),
             ContextAction::Command(cmd) => cmd.shortcut.clone(),
             ContextAction::Submenu(_) => None,
+        }
+    }
+
+    /// If this item moves the panel to another workspace, the target. `None`
+    /// for every other item. A `Move to Workspace` entry without a `workspace`
+    /// target yields `None` (the app reports the mistake).
+    pub fn workspace_move(&self) -> Option<WorkspaceMove> {
+        let (action, workspace) = match self {
+            ContextAction::Builtin(action) => (*action, None),
+            ContextAction::Entry(entry) => (entry.action, entry.workspace.clone()),
+            _ => return None,
+        };
+        match action {
+            BuiltinAction::MoveToPreviousWorkspace => Some(WorkspaceMove::Previous),
+            BuiltinAction::MoveToNextWorkspace => Some(WorkspaceMove::Next),
+            BuiltinAction::MoveToWorkspace => workspace.map(WorkspaceMove::Named),
+            _ => None,
         }
     }
 }
@@ -1390,6 +1493,7 @@ struct BookmarksFile {
 #[serde(default)]
 pub struct Config {
     pub panel: PanelConfig,
+    pub theme: ThemeConfig,
     pub tree: TreeConfig,
     pub startup: StartupRoot,
     pub context_menu: ContextMenu,
@@ -1499,6 +1603,9 @@ impl Config {
 pub enum LoadProblem {
     Io(PathBuf, std::io::ErrorKind),
     Parse(PathBuf, toml::de::Error),
+    /// A `[theme] mode = "system"` provider could not be read (e.g. no active
+    /// Omarchy theme); the built-in default is used instead.
+    SystemTheme(String),
 }
 
 /// The outcome of loading a config: always a usable config plus an optional
@@ -1529,19 +1636,30 @@ pub enum StyleSource {
     User,
     /// The compiled-in default (no user file, or it could not be read).
     Builtin,
+    /// Generated from the desktop theme (`[theme] mode = "system"`).
+    System,
 }
 
-/// Load the user stylesheet for the current environment.
+/// Load the stylesheet selected by `[theme]`.
 ///
-/// Prefers `$XDG_CONFIG_HOME/tree-space/main.css`; when that is missing the
-/// shipped default is used. On first launch the default is written out first
-/// (see [`ensure_default_stylesheet`]) so a file always exists to edit.
-pub fn load_stylesheet() -> Stylesheet {
-    let path = style_file();
-    // Materialize the default on first launch, mirroring the config file, so
-    // there is always something to edit.
-    let _ = ensure_default_stylesheet(&path);
-    load_stylesheet_from_path(&path)
+/// In the default `custom` mode this prefers
+/// `$XDG_CONFIG_HOME/tree-space/main.css`, writing the shipped default out on
+/// first launch (see [`ensure_default_stylesheet`]) so there is always a file to
+/// edit. In `system` mode the file is ignored entirely — neither read nor
+/// created — and the theme comes from the configured desktop provider.
+pub fn load_stylesheet(theme: &ThemeConfig) -> Stylesheet {
+    match theme.mode {
+        ThemeMode::Custom => {
+            let path = style_file();
+            // Materialize the default on first launch, mirroring the config
+            // file, so there is always something to edit.
+            let _ = ensure_default_stylesheet(&path);
+            load_stylesheet_from_path(&path)
+        }
+        ThemeMode::System => match theme.system {
+            SystemTheme::Omarchy => crate::theme::omarchy_stylesheet(),
+        },
+    }
 }
 
 /// Read the stylesheet at `path`, falling back to the built-in default when it
@@ -2239,6 +2357,7 @@ icon_size = 20
                             action: BuiltinAction::Rename,
                             label: None,
                             shortcut: Some("F2".into()),
+                            workspace: None,
                             hidden: false,
                         }),
                         ContextAction::Command(CommandAction {
@@ -2759,6 +2878,18 @@ items = [
     }
 
     #[test]
+    fn theme_parses_from_toml() {
+        // The default is the custom `main.css`.
+        assert_eq!(Config::default().theme.mode, ThemeMode::Custom);
+        assert_eq!(Config::default().theme.system, SystemTheme::Omarchy);
+        // A partial table fills the rest from the defaults.
+        let system = parse("[theme]\nmode = \"system\"\n");
+        assert_eq!(system.theme.mode, ThemeMode::System);
+        assert_eq!(system.theme.system, SystemTheme::Omarchy);
+        assert_eq!(parse("[theme]\nsystem = \"omarchy\"\n").theme.mode, ThemeMode::Custom);
+    }
+
+    #[test]
     fn startup_parses_from_toml() {
         assert_eq!(parse("startup = \"home\"\n").startup, StartupRoot::Home);
         assert_eq!(parse("startup = \"last\"\n").startup, StartupRoot::Last);
@@ -2829,6 +2960,16 @@ items = [
     fn invalid_regex_is_a_parse_error() {
         let err = ContextMatch::parse("regex:(").unwrap_err();
         assert!(err.contains("invalid regex"), "got: {err}");
+    }
+
+    #[test]
+    fn default_structure_strips_the_palette() {
+        // System mode reuses the structure with its own palette, so the marker
+        // must stay in `style/main.css` and nothing above it may survive.
+        let structure = default_structure();
+        assert_ne!(structure, DEFAULT_STYLESHEET);
+        assert!(!structure.contains("@define-color"));
+        assert!(structure.contains(".tree-row {"));
     }
 
     #[test]
@@ -3170,5 +3311,53 @@ items = ["Open", { command = "rm {path}", label = "Discard lock" }]
             action_command("sh", Path::new("/tmp/s.sh")),
             vec!["sh".to_owned(), "/tmp/s.sh".to_owned()]
         );
+    }
+
+    #[test]
+    fn workspace_move_actions_resolve() {
+        assert_eq!(
+            ContextAction::Builtin(BuiltinAction::MoveToPreviousWorkspace).workspace_move(),
+            Some(WorkspaceMove::Previous)
+        );
+        assert_eq!(
+            ContextAction::Builtin(BuiltinAction::MoveToNextWorkspace).workspace_move(),
+            Some(WorkspaceMove::Next)
+        );
+        let named = ContextAction::Entry(BuiltinEntry {
+            action: BuiltinAction::MoveToWorkspace,
+            label: None,
+            shortcut: Some("Super+2".into()),
+            workspace: Some("2".into()),
+            hidden: false,
+        });
+        assert_eq!(named.workspace_move(), Some(WorkspaceMove::Named("2".into())));
+        // Without a target there is nothing to move to.
+        let missing = ContextAction::Entry(BuiltinEntry {
+            action: BuiltinAction::MoveToWorkspace,
+            label: None,
+            shortcut: None,
+            workspace: None,
+            hidden: false,
+        });
+        assert_eq!(missing.workspace_move(), None);
+        // Ordinary actions are never workspace moves.
+        assert_eq!(ContextAction::Builtin(BuiltinAction::Copy).workspace_move(), None);
+    }
+
+    #[test]
+    fn move_to_workspace_parses_with_a_target() {
+        #[derive(serde::Deserialize)]
+        struct Wrap {
+            item: ContextAction,
+        }
+        let wrap: Wrap = toml::from_str(
+            r#"item = { action = "Move to Workspace", workspace = "special:scratch", shortcut = "Super+s" }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            wrap.item.workspace_move(),
+            Some(WorkspaceMove::Named("special:scratch".into()))
+        );
+        assert!(wrap.item.shortcut().as_deref() == Some("Super+s"));
     }
 }

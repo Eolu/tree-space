@@ -37,7 +37,12 @@
 //!   * with path(s)       → add a pane for each path (never a duplicate of an
 //!     already-open directory), then show the panel
 
-use std::{cell::{Cell, RefCell}, collections::HashMap, path::{Path, PathBuf}, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::{HashMap, HashSet},
+    path::{Path, PathBuf},
+    rc::Rc,
+};
 
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use relm4::gtk::{gdk, gio, glib, prelude::*};
@@ -46,9 +51,10 @@ use relm4::prelude::*;
 use crate::cmd::{Command, WidthArg};
 use crate::config::{
     Bookmark, BuiltinAction, Config, ContextAction, PANEL_MAX_WIDTH, PANEL_MIN_WIDTH, PanelConfig,
-    PanelLayer, PanelSide, SessionState, ShortcutTarget, StartupRoot, bookmark_file_path,
-    load_stylesheet, save_bookmarks_to_path,
+    PanelLayer, PanelSide, SessionState, ShortcutTarget, StartupRoot, WorkspaceMove,
+    bookmark_file_path, load_stylesheet, save_bookmarks_to_path,
 };
+use crate::workspace::Hyprland;
 use crate::fs::SortKey;
 use crate::ipc;
 use crate::ui::bookmarks::{self, BookmarkEvent, MoveTarget};
@@ -140,6 +146,9 @@ pub struct Pane {
     id: u64,
     toolbar: Controller<Toolbar>,
     tree: Controller<Tree>,
+    /// The workspace this pane belongs to (a Hyprland workspace name). A pane
+    /// is rendered only while its workspace is the active one.
+    workspace: String,
     /// The directory this pane currently shows, if any. Owned here (rather than
     /// in a parallel `Vec` on the dock) so a pane and its root can never drift.
     root: Option<PathBuf>,
@@ -172,6 +181,10 @@ pub struct Pane {
     /// rebuilds, so the tree and toolbar widgets never need to be reparented
     /// (which would trip `gtk_box_append: child has a parent`).
     widget: gtk::Overlay,
+    /// The toolbar's drag grip. Kept so a pane-move drag can compute the grip's
+    /// position within whatever window the pane currently lives in (which
+    /// changes when the pane is moved to another dock).
+    grip: gtk::Image,
     /// The navigation-toolbar buttons when `[panel] nav_toolbar` is enabled;
     /// their enabled state tracks the pane's root and history.
     nav_buttons: Option<NavButtons>,
@@ -198,6 +211,9 @@ impl Pane {
 
     /// Show the bookmarks view in this pane's body (and switch its hamburger).
     fn show_bookmarks(&self) {
+        // The tree stays alive but hidden; stop its previews so a playing
+        // video or audio file doesn't keep making noise behind the bookmarks.
+        self.tree.emit(TreeMsg::Suspend);
         self.body.set_visible_child_name("bookmarks");
         self.toolbar.emit(ToolbarMsg::SetBookmarks(true));
         self.refresh_nav();
@@ -232,8 +248,14 @@ impl Pane {
 }
 
 /// One layer-shell dock window anchored to a screen edge, with its panes.
+///
+/// A dock is identified by its `(side, monitor)` pair, so a second dock can
+/// share a side on another monitor when a pane is dragged there.
 struct Dock {
     side: PanelSide,
+    /// The monitor the surface landed on, resolved once it is mapped. `None`
+    /// until then (and when the compositor exposes no monitor information).
+    monitor: Option<gdk::Monitor>,
     /// The dock's window. For the primary dock this is the relm4 root window;
     /// for additional docks an imperatively-built `gtk::Window`.
     window: gtk::Window,
@@ -243,6 +265,17 @@ struct Dock {
     panes: Vec<Pane>,
     /// Id of the pane most recently interacted with in this dock.
     active_pane: Option<u64>,
+}
+
+/// Live state of a pane-move drag started from a toolbar grip.
+struct PaneDrag {
+    /// The pane being dragged.
+    id: u64,
+    /// The pointer's global position when the drag began; every update is this
+    /// plus the gesture's offset.
+    base: (f64, f64),
+    /// Index of the dock currently highlighted as the drop target, if any.
+    highlighted: Option<usize>,
 }
 
 /// What an invocation (or the hamburger "Collapse") wants to do to dock
@@ -373,6 +406,8 @@ pub enum AppMsg {
     OpenFolderPicked { id: u64, path: Option<PathBuf> },
     /// A new `tree-space` invocation was forwarded by the instance socket.
     LaunchRequest { command: Command },
+    /// Hyprland reported a new active workspace (from the IPC event stream).
+    ActiveWorkspace(String),
     /// Split pane `id`'s dock, seeding the new pane from `id`'s root.
     SplitFromPane { id: u64 },
     /// Split pane `id`'s dock with a specific root (context-menu "Open in Split
@@ -394,6 +429,16 @@ pub enum AppMsg {
     ResizeBy { side: PanelSide, delta: i32 },
     /// Persist the width after an interactive resize finishes.
     ResizeCommit,
+    /// A pane-move grip drag began: `start` is the press point relative to the
+    /// grip.
+    PaneDragBegin { id: u64, start: (f64, f64) },
+    /// The pointer moved `offset` (relative to the drag start) during a drag.
+    PaneDragUpdate { id: u64, offset: (f64, f64) },
+    /// A pane drag ended at `offset`: move the pane to the target under the
+    /// pointer.
+    PaneDragEnd { id: u64, offset: (f64, f64) },
+    /// Resolve a dock's monitor once its layer surface is mapped.
+    ResolveDockMonitor { di: usize },
     /// Move keyboard focus into pane `id`'s tree (after it is allocated).
     FocusPane { id: u64 },
     /// Focus the active pane of every visible dock (a window was just mapped,
@@ -428,10 +473,18 @@ pub struct App {
     pane_container: gtk::Box,
     /// The panel's side for launches that do not specify one.
     primary_side: PanelSide,
+    /// Hyprland IPC, when running under Hyprland. `None` means no workspace
+    /// scoping: every pane shares the empty workspace name and is always shown.
+    hypr: Option<Hyprland>,
+    /// The active workspace (a Hyprland name), as last reported. Panes are
+    /// shown only while their own workspace matches this.
+    active_workspace: String,
     /// Next pane id; bumped on every pane creation so ids never repeat.
     next_id: u64,
-    /// Whether any dock window is currently shown (drives no-arg toggling).
-    visible: bool,
+    /// Workspaces where the user explicitly hid the panel (via `ts --hidden`
+    /// or collapsing). A workspace absent from the set is shown. Hiding on one
+    /// workspace never affects the others.
+    hidden_workspaces: HashSet<String>,
     /// Per-side dock width in pixels. Starts from session state (falling back to
     /// `[panel] width`) and changes on interactive resize — one entry per side,
     /// so the two docks are sized independently without parallel scalar fields.
@@ -441,6 +494,8 @@ pub struct App {
     /// The bookmarks list, loaded from the bookmarks file and written back
     /// whenever it changes.
     bookmarks: Vec<Bookmark>,
+    /// The pane-move drag in flight, if any.
+    pane_drag: Option<PaneDrag>,
     /// Monotonic id for the debounced width save: a scheduled save only writes
     /// if it is still the latest (no `SourceId` juggling — removing a one-shot
     /// source that has already fired panics).
@@ -516,6 +571,12 @@ impl SimpleComponent for App {
         // Keep `config.panel.width` meaningful for the primary dock.
         config.panel.width = widths[&primary_side];
         let primary_width = config.panel.width;
+        // Panes are scoped to the workspace they are opened on. Under Hyprland
+        // we follow the active workspace over IPC; without it every pane shares
+        // the empty workspace (i.e. all panes are visible, as before).
+        let hypr = Hyprland::connect();
+        let active_workspace =
+            hypr.as_ref().and_then(Hyprland::active_workspace).unwrap_or_default();
         // Build the primary dock's initial panes from the invocation. With no
         // roots, resolve the configured startup directory; a `bookmarks` startup
         // (the default) resolves to none, so the pane opens the bookmarks view.
@@ -536,8 +597,15 @@ impl SimpleComponent for App {
         let mut panes: Vec<Pane> = Vec::new();
         let mut next_id = 0u64;
         for root in roots.iter() {
-            let pane =
-                make_pane(&config, parent.clone(), next_id, primary_side, primary_width, sender.clone());
+            let pane = make_pane(
+                &config,
+                parent.clone(),
+                next_id,
+                primary_side,
+                primary_width,
+                active_workspace.clone(),
+                sender.clone(),
+            );
             pane.tree.emit(TreeMsg::OpenRoot(root.clone()));
             panes.push(pane);
             panes.last_mut().unwrap().set_root(root.clone());
@@ -552,6 +620,7 @@ impl SimpleComponent for App {
                 next_id,
                 primary_side,
                 primary_width,
+                active_workspace.clone(),
                 sender.clone(),
             );
             pane.show_bookmarks();
@@ -563,7 +632,7 @@ impl SimpleComponent for App {
 
         let pane_container = gtk::Box::new(gtk::Orientation::Vertical, 0);
         pane_container.set_vexpand(true);
-        fill_pane_container(&pane_container, &panes);
+        fill_pane_container(&pane_container, &panes, &active_workspace);
 
         let mut status = String::new();
         if let Some(problem) = loaded.problem {
@@ -572,6 +641,13 @@ impl SimpleComponent for App {
             status = format!("bookmarks: {problem:?}");
         }
 
+        // A hidden launch hides the panel only on the workspace it starts on.
+        let hidden_workspaces = if init.command.hidden {
+            HashSet::from([active_workspace.clone()])
+        } else {
+            HashSet::new()
+        };
+
         let mut model = App {
             config,
             status,
@@ -579,6 +655,7 @@ impl SimpleComponent for App {
             file_dialog: gtk::FileDialog::new(),
             docks: vec![Dock {
                 side: primary_side,
+                monitor: None,
                 window: root.clone(),
                 container: pane_container.clone(),
                 panes,
@@ -586,16 +663,31 @@ impl SimpleComponent for App {
             }],
             pane_container,
             primary_side,
+            hypr: hypr.clone(),
+            active_workspace,
             next_id,
-            visible: !init.command.hidden,
+            hidden_workspaces,
             widths,
             last_root: session.last_root.clone(),
             bookmarks,
+            pane_drag: None,
             save_generation: Rc::new(Cell::new(0)),
             sender: sender.clone(),
         };
 
-        init_layer_window(&model.window, &model.config, primary_side, primary_width);
+        // Follow workspace changes so the panel hides when its workspace is not
+        // the active one and returns when it is.
+        if let Some(hypr) = &hypr {
+            let workspace_sender = sender.clone();
+            hypr.spawn_watcher(move |name| {
+                let sender = workspace_sender.clone();
+                glib::MainContext::default().invoke(move || {
+                    sender.input(AppMsg::ActiveWorkspace(name));
+                });
+            });
+        }
+
+        init_layer_window(&model.window, &model.config, primary_side, primary_width, None);
         install_css(&model.config);
         // Interactive resize only makes sense for a docked layer surface; a
         // plain fallback window is resized like any other window.
@@ -624,6 +716,8 @@ impl SimpleComponent for App {
             let sender = sender.clone();
             model.window.connect_map(move |_| {
                 let sender = sender.clone();
+                // The surface now exists, so its monitor can be resolved.
+                sender.input(AppMsg::ResolveDockMonitor { di: 0 });
                 glib::idle_add_local_once(move || sender.input(AppMsg::FocusVisible));
             });
         }
@@ -675,20 +769,7 @@ impl SimpleComponent for App {
                 ToolbarOutput::ClosePane => {
                     sender.input(AppMsg::ClosePane { id });
                 }
-                ToolbarOutput::PaneItem(target) => {
-                    self.set_active(id);
-                    // A pane-level builtin (Up/Back/Forward, ...) is performed by
-                    // the app; everything else is a tree action.
-                    if let ShortcutTarget::Builtin(action) = &target
-                        && action.is_pane_action()
-                    {
-                        self.dispatch_pane_builtin(id, *action, &sender);
-                    } else if let Some((di, pi)) = self.dock_pane_of(id)
-                        && let Some(msg) = pane_item_message(&target)
-                    {
-                        self.docks[di].panes[pi].tree.emit(msg);
-                    }
-                }
+                ToolbarOutput::PaneItem(action) => self.run_pane_shortcut(id, action, &sender),
             },
 
             AppMsg::PaneTree { id, out } => match out {
@@ -749,6 +830,8 @@ impl SimpleComponent for App {
                 self.handle_launch(command, &sender);
             }
 
+            AppMsg::ActiveWorkspace(name) => self.on_active_workspace(name),
+
             AppMsg::SplitFromPane { id } => {
                 // A new panel with no path opens the bookmarks view, so the
                 // split suggests places to jump to.
@@ -765,11 +848,13 @@ impl SimpleComponent for App {
             AppMsg::OpenOppositeFrom { id, root } => {
                 if let Some((di, _pi)) = self.dock_pane_of(id) {
                     let side = self.docks[di].side.opposite();
-                    let target = self.ensure_dock(side, false, &sender);
+                    let monitor = self.docks[di].monitor.clone();
+                    let target = self.ensure_dock(side, monitor, false, &sender);
                     self.add_pane(target, Some(root), &sender);
                     // A freshly created dock starts hidden; reveal it (unless
-                    // the panel is currently toggled off).
-                    self.set_docks_visible(self.visible);
+                    // the panel is currently toggled off on this workspace).
+                    let visible = self.visible();
+                    self.set_docks_visible(visible);
                 }
             }
 
@@ -777,9 +862,13 @@ impl SimpleComponent for App {
                 let Some((di, pi)) = self.dock_pane_of(id) else {
                     return;
                 };
+                // The pane's tree is about to be dropped; pause its previews
+                // first so a playing video can't be kept alive by a widget the
+                // removal leaves parented.
+                self.docks[di].panes[pi].tree.emit(TreeMsg::Suspend);
                 self.docks[di].panes.remove(pi);
                 if self.docks[di].active_pane == Some(id) {
-                    self.docks[di].active_pane = self.docks[di].panes.last().map(|p| p.id);
+                    self.docks[di].active_pane = self.last_active_pane_id(di);
                 }
                 // The program only exits once the *last* pane anywhere closes.
                 let panes_left: usize = self.docks.iter().map(|d| d.panes.len()).sum();
@@ -787,19 +876,22 @@ impl SimpleComponent for App {
                     self.window.close();
                     return;
                 }
-                if self.docks[di].panes.is_empty() {
-                    if di == 0 {
-                        // The primary dock is the relm4 root window; closing it
-                        // tears the whole app down. Hide it instead, and show it
-                        // again on the next launch/toggle.
-                        self.visible = false;
-                        self.docks[di].window.set_visible(false);
-                    } else {
-                        let dock = self.docks.remove(di);
-                        dock.window.close();
-                    }
+                if self.docks[di].panes.is_empty() && di != 0 {
+                    // Nothing left in this non-primary dock on any workspace.
+                    let dock = self.docks.remove(di);
+                    dock.window.close();
                 } else {
-                    fill_pane_container(&self.docks[di].container.clone(), &self.docks[di].panes);
+                    fill_pane_container(
+                        &self.docks[di].container.clone(),
+                        &self.docks[di].panes,
+                        &self.active_workspace,
+                    );
+                    // The dock may still hold panes, but none on the active
+                    // workspace; it must not linger as a blank strip. Closing a
+                    // pane is not a request to hide the panel, so the user's
+                    // show/hide intent is left alone.
+                    let shown = self.visible() && self.dock_has_active_pane(di);
+                    self.docks[di].window.set_visible(shown);
                 }
             }
 
@@ -829,11 +921,9 @@ impl SimpleComponent for App {
             }
 
             AppMsg::FocusVisible => {
-                let ids: Vec<u64> = self
-                    .docks
-                    .iter()
-                    .filter(|dock| dock.window.is_visible())
-                    .filter_map(|dock| dock.panes.last().map(|pane| pane.id))
+                let ids: Vec<u64> = (0..self.docks.len())
+                    .filter(|&di| self.docks[di].window.is_visible())
+                    .filter_map(|di| self.last_active_pane_id(di))
                     .collect();
                 for id in ids {
                     self.focus_pane(id);
@@ -864,6 +954,25 @@ impl SimpleComponent for App {
 
             AppMsg::ResizeBy { side, delta } => self.resize_by(side, delta),
             AppMsg::ResizeCommit => self.persist_session(),
+
+            AppMsg::ResolveDockMonitor { di } => {
+                let Some(dock) = self.docks.get(di) else { return };
+                if dock.monitor.is_some() {
+                    return;
+                }
+                let (Some(surface), Some(display)) =
+                    (dock.window.surface(), gdk::Display::default())
+                else {
+                    return;
+                };
+                if let Some(monitor) = display.monitor_at_surface(&surface) {
+                    self.docks[di].monitor = Some(monitor);
+                }
+            }
+
+            AppMsg::PaneDragBegin { id, start } => self.begin_pane_drag(id, start),
+            AppMsg::PaneDragUpdate { id, offset } => self.update_pane_drag(id, offset),
+            AppMsg::PaneDragEnd { id, offset } => self.end_pane_drag(id, offset, &sender),
 
             AppMsg::BookmarkEvent { id, event } => match event {
                 BookmarkEvent::Open(path) => self.open_bookmark(id, path, &sender),
@@ -974,7 +1083,8 @@ impl App {
                 continue;
             }
             let side = command.side.unwrap_or(self.primary_side);
-            let di = self.ensure_dock(side, false, sender);
+            let monitor = self.default_monitor();
+            let di = self.ensure_dock(side, monitor, false, sender);
             self.add_pane(di, Some(root.clone()), sender);
         }
 
@@ -987,7 +1097,8 @@ impl App {
                 continue;
             }
             let side = command.side.unwrap_or(self.primary_side);
-            let di = self.ensure_dock(side, false, sender);
+            let monitor = self.default_monitor();
+            let di = self.ensure_dock(side, monitor, false, sender);
             let id = self.add_pane(di, Some(root), sender);
             if let Some(select) = select
                 && let Some((di, pi)) = self.dock_pane_of(id)
@@ -1003,27 +1114,77 @@ impl App {
     /// plan. Creates a dock when the intent calls for it and seeds an empty one
     /// so "show" never reveals an empty shell.
     fn apply_visibility(&mut self, intent: VisibilityIntent, sender: &ComponentSender<Self>) {
-        let existing: Vec<PanelSide> = self.docks.iter().map(|d| d.side).collect();
-        let shown: Vec<PanelSide> = self
-            .docks
-            .iter()
-            .filter(|d| d.window.is_visible())
-            .map(|d| d.side)
-            .collect();
+        // Sides may host more than one dock (one per monitor); the visibility
+        // rules only care which sides exist and which are shown.
+        let mut existing: Vec<PanelSide> = Vec::new();
+        let mut shown: Vec<PanelSide> = Vec::new();
+        for dock in &self.docks {
+            if !existing.contains(&dock.side) {
+                existing.push(dock.side);
+            }
+            if dock.window.is_visible() && !shown.contains(&dock.side) {
+                shown.push(dock.side);
+            }
+        }
         let plan = resolve_visibility(intent, &existing, &shown);
 
+        // A whole-panel show just reveals what is already open: an emptied dock
+        // (e.g. the default side after its pane was moved to the other side)
+        // must not be re-seeded with a fresh pane when a pane is still open
+        // elsewhere. Only a side-specific show/creation seeds an empty dock.
+        let whole_panel =
+            matches!(intent, VisibilityIntent::ShowAll | VisibilityIntent::ToggleAll);
+        // Only panes on the active workspace count as "open" for seeding: a
+        // whole-panel show should reveal them rather than spawn a new pane.
+        let panes_exist = self
+            .docks
+            .iter()
+            .flat_map(|dock| &dock.panes)
+            .any(|pane| pane.workspace == self.active_workspace);
+        let seed_empty = should_seed_empty(panes_exist, plan.seed, whole_panel);
+
         if let Some(side) = plan.create {
-            self.ensure_dock(side, plan.seed, sender);
+            let monitor = self.default_monitor();
+            self.ensure_dock(side, monitor, plan.seed, sender);
         }
         for side in &plan.show {
-            // A newly created dock starts hidden; reveal it. An emptied primary
-            // dock is re-seeded so showing it is not an empty shell.
-            let di = self.ensure_dock(*side, plan.seed, sender);
-            self.docks[di].window.set_visible(true);
+            // Show every dock on this side (there may be more than one, one per
+            // monitor), creating one on the default monitor if none exists.
+            if self.dock_of_side(*side).is_none() {
+                let monitor = self.default_monitor();
+                self.ensure_dock(*side, monitor, seed_empty || !whole_panel, sender);
+            }
+            let indices: Vec<usize> = self
+                .docks
+                .iter()
+                .enumerate()
+                .filter(|(_, dock)| dock.side == *side)
+                .map(|(di, _)| di)
+                .collect();
+            for di in indices {
+                if seed_empty && !self.dock_has_active_pane(di) {
+                    let startup = self.config.startup.clone();
+                    match default_root(&startup) {
+                        Some(root) => self.add_pane(di, Some(root), sender),
+                        None => self.add_pane(di, None, sender),
+                    };
+                }
+                // Never reveal a dock with no active-workspace pane.
+                let show = self.dock_has_active_pane(di);
+                self.docks[di].window.set_visible(show);
+            }
         }
         for side in &plan.hide {
-            if let Some(di) = self.dock_of_side(*side) {
+            let indices: Vec<usize> = self
+                .docks
+                .iter()
+                .enumerate()
+                .filter(|(_, dock)| dock.side == *side)
+                .map(|(di, _)| di)
+                .collect();
+            for di in indices {
                 self.docks[di].window.set_visible(false);
+                self.suspend_dock_panes(di);
             }
         }
         // Any side not named by the plan keeps its current visibility.
@@ -1033,9 +1194,13 @@ impl App {
         let focus: Vec<u64> = plan
             .show
             .iter()
-            .filter_map(|side| self.dock_of_side(*side))
-            .filter_map(|di| self.docks[di].panes.last())
-            .map(|pane| pane.id)
+            .flat_map(|side| {
+                self.docks
+                    .iter()
+                    .filter(move |dock| dock.side == *side)
+                    .filter_map(|dock| dock.panes.last())
+                    .map(|pane| pane.id)
+            })
             .collect();
         for id in focus {
             self.focus_pane(id);
@@ -1393,6 +1558,19 @@ impl App {
         sender: &ComponentSender<Self>,
     ) {
         self.set_active(id);
+        // "Move to Workspace" carries a target that `ShortcutTarget` cannot
+        // represent, so it is handled here from the full menu item.
+        if let ContextAction::Entry(entry) = &action
+            && entry.action == BuiltinAction::MoveToWorkspace
+            && entry.workspace.is_none()
+        {
+            self.status = "Move to Workspace needs a workspace = \"...\" target".to_owned();
+            return;
+        }
+        if let Some(target) = action.workspace_move() {
+            self.move_active_pane_to_workspace(target);
+            return;
+        }
         let Some(target) = ShortcutTarget::from_action(&action) else {
             return;
         };
@@ -1421,9 +1599,18 @@ impl App {
                 .or_else(|| (!self.docks.is_empty()).then_some(0))?,
         };
         let dock = &self.docks[di];
+        let active = &self.active_workspace;
         dock.active_pane
-            .filter(|id| dock.panes.iter().any(|pane| pane.id == *id))
-            .or_else(|| dock.panes.last().map(|pane| pane.id))
+            .filter(|id| {
+                dock.panes.iter().any(|pane| pane.id == *id && &pane.workspace == active)
+            })
+            .or_else(|| {
+                dock.panes
+                    .iter()
+                    .rev()
+                    .find(|pane| &pane.workspace == active)
+                    .map(|pane| pane.id)
+            })
     }
 
     /// Run an accelerator string (e.g. `Ctrl+c`, `Down`) against pane `id`, as
@@ -1492,9 +1679,36 @@ impl App {
         })
     }
 
-    /// Index of the dock on `side`, if one exists.
+    /// Index of the first dock on `side`, if one exists.
     fn dock_of_side(&self, side: PanelSide) -> Option<usize> {
         self.docks.iter().position(|dock| dock.side == side)
+    }
+
+    /// Index of the dock on `(side, monitor)`. A dock whose monitor has not
+    /// been resolved yet matches only an unresolved (`None`) query.
+    fn dock_index_of(&self, side: PanelSide, monitor: Option<&gdk::Monitor>) -> Option<usize> {
+        self.docks.iter().position(|dock| {
+            dock.side == side
+                && match (&dock.monitor, monitor) {
+                    (Some(a), Some(b)) => monitor_key(a) == monitor_key(b),
+                    (None, None) => true,
+                    _ => false,
+                }
+        })
+    }
+
+    /// The monitor a newly-created (CLI/reveal) dock should use: the primary
+    /// dock's, falling back to the first monitor the display reports.
+    fn default_monitor(&self) -> Option<gdk::Monitor> {
+        self.docks
+            .first()
+            .and_then(|dock| dock.monitor.clone())
+            .or_else(|| {
+                gdk::Display::default()?
+                    .monitors()
+                    .item(0)
+                    .and_downcast::<gdk::Monitor>()
+            })
     }
 
     /// Hide the entire dock that holds pane `id` (the toolbar "Collapse"
@@ -1505,37 +1719,169 @@ impl App {
         }
     }
 
-    /// Show/hide one dock.
+    /// Show/hide one dock. A dock only maps when it holds a pane on the active
+    /// workspace.
     fn set_dock_visible(&mut self, di: usize, visible: bool) {
-        self.docks[di].window.set_visible(visible);
+        let shown = visible && self.dock_has_active_pane(di);
+        self.docks[di].window.set_visible(shown);
+        if !shown {
+            self.suspend_dock_panes(di);
+        }
         self.refresh_visible();
     }
 
-    /// Show/hide every dock window.
-    fn set_docks_visible(&mut self, visible: bool) {
-        let focus: Vec<u64> = self
-            .docks
-            .iter()
-            .filter_map(|dock| dock.panes.last().map(|pane| pane.id))
-            .collect();
-        for dock in &self.docks {
-            dock.window.set_visible(visible);
+    /// Pause media in every pane of dock `di`. Hiding a dock does not destroy
+    /// its trees, so without this a preview would keep playing while invisible.
+    fn suspend_dock_panes(&self, di: usize) {
+        for pane in &self.docks[di].panes {
+            pane.tree.emit(TreeMsg::Suspend);
         }
-        self.visible = visible;
-        // Hand keyboard focus to each dock's active pane. The window-map handler
-        // also does this once the surface is realized, so a just-shown panel
-        // gets focus even though the grab here may precede allocation.
+    }
+
+    /// Whether dock `di` holds at least one pane on the active workspace.
+    fn dock_has_active_pane(&self, di: usize) -> bool {
+        let active = &self.active_workspace;
+        self.docks[di].panes.iter().any(|pane| &pane.workspace == active)
+    }
+
+    /// The most recently added pane on the active workspace in dock `di`, if any.
+    fn last_active_pane_id(&self, di: usize) -> Option<u64> {
+        let active = &self.active_workspace;
+        self.docks[di]
+            .panes
+            .iter()
+            .rev()
+            .find(|pane| &pane.workspace == active)
+            .map(|pane| pane.id)
+    }
+
+    /// Handle a workspace change: re-render every dock for the new workspace and
+    /// update which docks are mapped.
+    fn on_active_workspace(&mut self, name: String) {
+        if self.active_workspace == name {
+            return;
+        }
+        self.active_workspace = name;
+        self.refill_docks();
+        self.sync_dock_visibility();
+        let active = (0..self.docks.len())
+            .find(|&di| self.docks[di].window.is_visible())
+            .and_then(|di| self.last_active_pane_id(di));
+        if let Some(id) = active {
+            self.focus_pane(id);
+        }
+    }
+
+    /// Rebuild every dock's pane stack for the active workspace.
+    fn refill_docks(&mut self) {
+        for dock in &self.docks {
+            fill_pane_container(&dock.container, &dock.panes, &self.active_workspace);
+        }
+    }
+
+    /// Whether the panel is intended to be shown on the active workspace:
+    /// shown unless the user explicitly hid it there. Each workspace keeps its
+    /// own intent, so hiding on one never affects the others.
+    fn visible(&self) -> bool {
+        !self.hidden_workspaces.contains(&self.active_workspace)
+    }
+
+    /// Record the show/hide intent for the active workspace.
+    fn set_visible(&mut self, visible: bool) {
         if visible {
+            self.hidden_workspaces.remove(&self.active_workspace);
+        } else {
+            self.hidden_workspaces.insert(self.active_workspace.clone());
+        }
+    }
+
+    /// Apply the active workspace's show/hide intent to every dock, showing only
+    /// docks that hold a pane on the active workspace.
+    fn sync_dock_visibility(&mut self) {
+        let show = self.visible();
+        for di in 0..self.docks.len() {
+            let shown = show && self.dock_has_active_pane(di);
+            self.docks[di].window.set_visible(shown);
+            if !shown {
+                self.suspend_dock_panes(di);
+            }
+        }
+    }
+
+    /// Show/hide every dock window. Docks with no pane on the active workspace
+    /// stay hidden.
+    fn set_docks_visible(&mut self, visible: bool) {
+        self.set_visible(visible);
+        self.sync_dock_visibility();
+        if visible {
+            // Hand keyboard focus to each shown dock's active pane. The
+            // window-map handler also does this once the surface is realized, so
+            // a just-shown panel gets focus even though the grab here may
+            // precede allocation.
+            let focus: Vec<u64> = (0..self.docks.len())
+                .filter(|&di| self.docks[di].window.is_visible())
+                .filter_map(|di| self.last_active_pane_id(di))
+                .collect();
             for id in focus {
                 self.focus_pane(id);
             }
         }
     }
 
-    /// Recomputed flag: true while at least one dock is shown. Drives the
-    /// no-argument toggle.
+    /// Move the active pane to another workspace (a configured action). It
+    /// disappears from the current workspace and appears on the target. The
+    /// panel itself never moves.
+    fn move_active_pane_to_workspace(&mut self, target: WorkspaceMove) {
+        if self.hypr.is_none() {
+            self.status = "Workspace moves need a Hyprland session".to_owned();
+            return;
+        }
+        let Some(id) = self.active_pane_id(None) else { return };
+        let Some((di, pi)) = self.dock_pane_of(id) else { return };
+        let from = self.docks[di].panes[pi].workspace.clone();
+        let name = match target {
+            WorkspaceMove::Named(name) => name,
+            WorkspaceMove::Previous => self.neighbor_workspace(&from, -1),
+            WorkspaceMove::Next => self.neighbor_workspace(&from, 1),
+        };
+        if name.is_empty() || name == from {
+            return;
+        }
+        self.docks[di].panes[pi].workspace = name.clone();
+        let container = self.docks[di].container.clone();
+        fill_pane_container(&container, &self.docks[di].panes, &self.active_workspace);
+        self.sync_dock_visibility();
+        self.status = format!("Pane moved to workspace {name}");
+    }
+
+    /// The workspace `delta` steps from `from`. A numeric workspace steps by
+    /// number (`1`→`2`), creating it implicitly when the pane lands there; a
+    /// named/special workspace steps through the workspaces Hyprland currently
+    /// reports, wrapping around.
+    fn neighbor_workspace(&self, from: &str, delta: i32) -> String {
+        if let Ok(id) = from.parse::<i64>() {
+            return (id + delta as i64).max(1).to_string();
+        }
+        let Some(hypr) = &self.hypr else { return String::new() };
+        let names = hypr.workspace_names();
+        if names.is_empty() {
+            return from.to_owned();
+        }
+        match names.iter().position(|name| name == from) {
+            Some(i) => {
+                let j = (i as i32 + delta).rem_euclid(names.len() as i32) as usize;
+                names[j].clone()
+            }
+            None => names[0].clone(),
+        }
+    }
+
+    /// Reconcile the active workspace's show/hide intent with what is actually
+    /// mapped: shown while at least one dock is visible. Drives the no-argument
+    /// toggle. Only the active workspace's intent is touched.
     fn refresh_visible(&mut self) {
-        self.visible = self.docks.iter().any(|dock| dock.window.is_visible());
+        let any = self.docks.iter().any(|dock| dock.window.is_visible());
+        self.set_visible(any);
     }
 
     /// The current width of `side`'s dock.
@@ -1604,11 +1950,17 @@ impl App {
         });
     }
 
-    /// Return the index of the dock on `side`, creating it (with a seeded pane
-    /// from session state) when missing. The primary dock is always the
-    /// config/default side.
-    fn ensure_dock(&mut self, side: PanelSide, seed: bool, sender: &ComponentSender<Self>) -> usize {
-        if let Some((di, _)) = self.docks.iter().enumerate().find(|(_, d)| d.side == side) {
+    /// Return the index of the dock on `(side, monitor)`, creating it (with a
+    /// seeded pane from `[startup]`) when missing. `monitor` is the monitor the
+    /// new dock should dock to; `None` lets the compositor pick.
+    fn ensure_dock(
+        &mut self,
+        side: PanelSide,
+        monitor: Option<gdk::Monitor>,
+        seed: bool,
+        sender: &ComponentSender<Self>,
+    ) -> usize {
+        if let Some(di) = self.dock_index_of(side, monitor.as_ref()) {
             if seed && self.docks[di].panes.is_empty() {
                 // The dock exists but was emptied; give it a pane again.
                 let startup = self.config.startup.clone();
@@ -1621,17 +1973,8 @@ impl App {
         let config = &self.config;
         let width = self.width_for(side);
         let window = gtk::Window::new();
-        init_layer_window(&window, config, side, width);
+        init_layer_window(&window, config, side, width, monitor.as_ref());
         window.set_default_size(width as i32, 520);
-        // As with the primary dock, hand focus to this dock's pane once its
-        // surface is mapped (grab_focus before that no-ops).
-        {
-            let sender = sender.clone();
-            window.connect_map(move |_| {
-                let sender = sender.clone();
-                glib::idle_add_local_once(move || sender.input(AppMsg::FocusVisible));
-            });
-        }
         if layer_shell_available() {
             attach_resize_controls(&window, side, sender);
         }
@@ -1646,11 +1989,23 @@ impl App {
         let di = self.docks.len();
         self.docks.push(Dock {
             side,
+            monitor,
             window,
             container,
             panes: Vec::new(),
             active_pane: None,
         });
+        // As with the primary dock, resolve the monitor and hand focus to this
+        // dock's pane once its surface is mapped (grab_focus before that no-ops).
+        {
+            let sender = sender.clone();
+            let window = self.docks[di].window.clone();
+            window.connect_map(move |_| {
+                let sender = sender.clone();
+                sender.input(AppMsg::ResolveDockMonitor { di });
+                glib::idle_add_local_once(move || sender.input(AppMsg::FocusVisible));
+            });
+        }
         if seed {
             let startup = self.config.startup.clone();
             if let Some(root) = default_root(&startup) {
@@ -1671,7 +2026,8 @@ impl App {
         let parent = self.docks[di].window.clone();
         let side = self.docks[di].side;
         let width = self.width_for(side);
-        let pane = make_pane(&self.config, parent, id, side, width, sender.clone());
+        let workspace = self.active_workspace.clone();
+        let pane = make_pane(&self.config, parent, id, side, width, workspace, sender.clone());
         let mut pane = pane;
         match &root {
             Some(root) => pane.tree.emit(TreeMsg::OpenRoot(root.clone())),
@@ -1688,7 +2044,7 @@ impl App {
         dock.panes.push(pane);
         dock.active_pane = Some(id);
         let container = dock.container.clone();
-        fill_pane_container(&container, &dock.panes);
+        fill_pane_container(&container, &dock.panes, &self.active_workspace);
         // Give the new pane keyboard focus once GTK has allocated it, so the
         // app (and each new split) is usable without a click.
         let focus_sender = sender.clone();
@@ -1708,6 +2064,170 @@ impl App {
                 sender.input(AppMsg::OpenFolderPicked { id, path });
             },
         );
+    }
+
+    /// The absolute top-left of dock `di`'s surface, derived from its monitor
+    /// geometry, side, width and the configured margin. Turns window-relative
+    /// drag coordinates into screen coordinates for target detection.
+    fn dock_origin(&self, di: usize) -> (f64, f64) {
+        let dock = &self.docks[di];
+        let margin = self.config.panel.margin as f64;
+        let width = self.width_for(dock.side) as f64;
+        let (mx, my, mw) = match dock.monitor.as_ref().map(gdk::Monitor::geometry) {
+            Some(g) => (g.x() as f64, g.y() as f64, g.width() as f64),
+            None => (0.0, 0.0, 0.0),
+        };
+        let x = match dock.side {
+            PanelSide::Left => mx + margin,
+            PanelSide::Right => mx + mw - width - margin,
+        };
+        (x, my + margin)
+    }
+
+    /// The `(side, monitor)` under an absolute screen point, or `None` when the
+    /// point is outside every monitor. The side is the nearer edge of the
+    /// monitor under the pointer.
+    fn point_target(&self, point: (f64, f64)) -> Option<(PanelSide, gdk::Monitor)> {
+        let (x, y) = point;
+        let monitors = gdk::Display::default()?.monitors();
+        for i in 0..monitors.n_items() {
+            let Some(monitor) = monitors.item(i).and_downcast::<gdk::Monitor>() else {
+                continue;
+            };
+            let g = monitor.geometry();
+            let (x0, y0) = (g.x() as f64, g.y() as f64);
+            let (w, h) = (g.width() as f64, g.height() as f64);
+            if x >= x0 && x < x0 + w && y >= y0 && y < y0 + h {
+                let side = if x < x0 + w / 2.0 { PanelSide::Left } else { PanelSide::Right };
+                return Some((side, monitor));
+            }
+        }
+        None
+    }
+
+    /// Begin a pane-move drag: remember the pane and the pointer's absolute
+    /// start position, and cue the source pane.
+    fn begin_pane_drag(&mut self, id: u64, start: (f64, f64)) {
+        let Some((di, pi)) = self.dock_pane_of(id) else { return };
+        // Compute the grip's top-left within the pane's current window. Doing
+        // this here (rather than in the gesture closure) keeps it correct after
+        // the pane has been moved to a different dock/window.
+        let grip_origin = {
+            let grip = &self.docks[di].panes[pi].grip;
+            let window = &self.docks[di].window;
+            grip.compute_point(window, &relm4::gtk::graphene::Point::new(0.0, 0.0))
+                .map(|p| (p.x() as f64, p.y() as f64))
+                .unwrap_or((0.0, 0.0))
+        };
+        let origin = self.dock_origin(di);
+        let base = (origin.0 + grip_origin.0 + start.0, origin.1 + grip_origin.1 + start.1);
+        self.docks[di].panes[pi].widget.add_css_class("pane-moving");
+        self.pane_drag = Some(PaneDrag { id, base, highlighted: None });
+        self.status = "Drag the pane to the edge of a screen to move it".to_owned();
+    }
+
+    /// Update the drop target for a drag in progress: highlight the target dock
+    /// and describe it in the status line.
+    fn update_pane_drag(&mut self, id: u64, offset: (f64, f64)) {
+        let Some(drag) = self.pane_drag.as_ref() else { return };
+        if drag.id != id {
+            return;
+        }
+        let point = (drag.base.0 + offset.0, drag.base.1 + offset.1);
+        let target = self.point_target(point);
+        let highlight = target
+            .as_ref()
+            .and_then(|(side, monitor)| self.dock_index_of(*side, Some(monitor)));
+        if let Some(drag) = self.pane_drag.as_mut()
+            && drag.highlighted != highlight
+        {
+            if let Some(di) = drag.highlighted
+                && let Some(dock) = self.docks.get(di)
+            {
+                dock.window.remove_css_class("pane-drop-target");
+            }
+            if let Some(di) = highlight
+                && let Some(dock) = self.docks.get(di)
+            {
+                dock.window.add_css_class("pane-drop-target");
+            }
+            drag.highlighted = highlight;
+        }
+        self.status = match target {
+            Some((side, monitor)) => format!(
+                "Drop to move the pane to the {} panel on {}",
+                side.name(),
+                monitor_label(&monitor)
+            ),
+            None => "Drag the pane to the edge of a screen to move it".to_owned(),
+        };
+    }
+
+    /// Finish a pane drag: move the pane to the target under the pointer, or
+    /// cancel when it was dropped outside every monitor.
+    fn end_pane_drag(&mut self, id: u64, offset: (f64, f64), sender: &ComponentSender<Self>) {
+        let Some(drag) = self.pane_drag.take() else { return };
+        if drag.id != id {
+            self.pane_drag = Some(drag);
+            return;
+        }
+        if let Some((di, pi)) = self.dock_pane_of(id) {
+            self.docks[di].panes[pi].widget.remove_css_class("pane-moving");
+        }
+        if let Some(di) = drag.highlighted
+            && let Some(dock) = self.docks.get(di)
+        {
+            dock.window.remove_css_class("pane-drop-target");
+        }
+        let point = (drag.base.0 + offset.0, drag.base.1 + offset.1);
+        match self.point_target(point) {
+            Some((side, monitor)) => self.move_pane_to(id, side, monitor, sender),
+            None => self.status.clear(),
+        }
+    }
+
+    /// Move pane `id` into the dock on `(side, monitor)`, creating that dock if
+    /// it does not exist yet. A no-op when the pane is already there.
+    fn move_pane_to(
+        &mut self,
+        id: u64,
+        side: PanelSide,
+        monitor: gdk::Monitor,
+        sender: &ComponentSender<Self>,
+    ) {
+        let Some((sdi, spi)) = self.dock_pane_of(id) else { return };
+        if self.dock_index_of(side, Some(&monitor)) == Some(sdi) {
+            self.status.clear();
+            return;
+        }
+        let pane = self.docks[sdi].panes.remove(spi);
+        remove_from_parent(pane.widget.upcast_ref());
+        if self.docks[sdi].active_pane == Some(id) {
+            self.docks[sdi].active_pane = self.docks[sdi].panes.last().map(|p| p.id);
+        }
+        if self.docks[sdi].panes.is_empty() {
+            if sdi == 0 {
+                // The primary dock is the relm4 root window; hide it rather
+                // than destroy the app (see `ClosePane`).
+                self.docks[sdi].window.set_visible(false);
+            } else {
+                let dock = self.docks.remove(sdi);
+                dock.window.close();
+            }
+        } else {
+            let container = self.docks[sdi].container.clone();
+            fill_pane_container(&container, &self.docks[sdi].panes, &self.active_workspace);
+        }
+        let tdi = self.ensure_dock(side, Some(monitor), false, sender);
+        pane.tree.emit(TreeMsg::SetSide(side));
+        self.docks[tdi].panes.push(pane);
+        self.docks[tdi].active_pane = Some(id);
+        let container = self.docks[tdi].container.clone();
+        fill_pane_container(&container, &self.docks[tdi].panes, &self.active_workspace);
+        self.sync_dock_visibility();
+        self.refresh_all_bookmarks(sender);
+        self.focus_pane_later(id);
+        self.status = format!("Moved pane to the {} panel", side.name());
     }
 }
 
@@ -1772,7 +2292,7 @@ fn nav_button(
     button.connect_clicked(move |_| {
         sender.input(AppMsg::PaneToolbar {
             id,
-            out: ToolbarOutput::PaneItem(ShortcutTarget::Builtin(action)),
+            out: ToolbarOutput::PaneItem(ContextAction::Builtin(action)),
         });
     });
     button
@@ -1784,6 +2304,7 @@ fn make_pane(
     id: u64,
     side: PanelSide,
     width: u32,
+    workspace: String,
     sender: ComponentSender<App>,
 ) -> Pane {
     // The pane overlay: the toolbar's completion dropdown is added to it so it
@@ -1805,6 +2326,30 @@ fn make_pane(
             panel: PanelConfig { width, ..config.panel },
         })
         .forward(sender.input_sender(), move |out| AppMsg::PaneTree { id, out });
+
+    // The toolbar grip starts a pane-move drag. The gesture reports the press
+    // point and offsets relative to it; the app adds them to the pane's
+    // absolute origin (computed against the pane's *current* window, which
+    // changes when the pane is moved) to find the target edge/monitor.
+    let grip = toolbar.model().grip().clone();
+    {
+        let drag = gtk::GestureDrag::new();
+        drag.set_button(gdk::BUTTON_PRIMARY);
+        drag.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let s = sender.clone();
+        drag.connect_drag_begin(move |_, start_x, start_y| {
+            s.input(AppMsg::PaneDragBegin { id, start: (start_x, start_y) });
+        });
+        let s = sender.clone();
+        drag.connect_drag_update(move |_, offset_x, offset_y| {
+            s.input(AppMsg::PaneDragUpdate { id, offset: (offset_x, offset_y) });
+        });
+        let s = sender.clone();
+        drag.connect_drag_end(move |_, offset_x, offset_y| {
+            s.input(AppMsg::PaneDragEnd { id, offset: (offset_x, offset_y) });
+        });
+        grip.add_controller(drag);
+    }
 
     let widget = gtk::Box::new(gtk::Orientation::Vertical, 0);
     widget.append(toolbar.widget());
@@ -1916,6 +2461,7 @@ fn make_pane(
         id,
         toolbar,
         tree,
+        workspace,
         root: None,
         canonical_root: None,
         history: NavHistory::default(),
@@ -1928,6 +2474,7 @@ fn make_pane(
         bookmark_nav,
         nav_buttons,
         widget: overlay,
+        grip,
         shortcuts,
     }
 }
@@ -1961,21 +2508,24 @@ fn pane_widget(pane: &Pane) -> gtk::Widget {
     pane.widget.clone().upcast()
 }
 
-/// Rebuild a dock's container Box to show its panes in a nested Paned
-/// structure.
+/// Rebuild a dock's container Box to show the panes of `active` (the active
+/// workspace) in a nested Paned structure. Panes on other workspaces are
+/// detached but kept alive.
 ///
-/// Layout for N panes:
+/// Layout for N visible panes:
 ///   N=1 → container has the single pane widget.
 ///   N=2 → container has Paned { pane[0], pane[1] }
 ///   N=3 → container has Paned { pane[0], Paned { pane[1], pane[2] } }
 ///   etc.
 ///
-/// Called on every split/close so widget references are always fresh.
-fn fill_pane_container(container: &gtk::Box, panes: &[Pane]) {
-    // Detach the pane boxes from their old parents *first*, using each
-    // parent's removal API. A raw `unparent()` alone is not enough: a Paned
-    // keeps stale child slots that re-unparent the widget when the old chain
-    // is finally destroyed (possibly after we have re-appended it).
+/// Called on every split/close/workspace change so widget references are always
+/// fresh.
+fn fill_pane_container(container: &gtk::Box, panes: &[Pane], active: &str) {
+    // Detach every pane box from its old parent *first*, using each parent's
+    // removal API. A raw `unparent()` alone is not enough: a Paned keeps stale
+    // child slots that re-unparent the widget when the old chain is finally
+    // destroyed (possibly after we have re-appended it). Hidden panes are
+    // detached too, so they are not left behind in the discarded structure.
     for pane in panes {
         remove_from_parent(pane.widget.upcast_ref());
     }
@@ -1984,21 +2534,22 @@ fn fill_pane_container(container: &gtk::Box, panes: &[Pane]) {
         container.remove(&child);
     }
 
-    match panes {
+    let visible: Vec<&Pane> = panes.iter().filter(|pane| pane.workspace == active).collect();
+    match visible.as_slice() {
         [] => {}
         [single] => {
             let w = pane_widget(single);
             w.set_vexpand(true);
             container.append(&w);
         }
-        panes => {
+        visible => {
             // Build a right-nested Paned from the last two, then keep
             // wrapping from right to left.
-            let n = panes.len();
-            let last_w = pane_widget(&panes[n - 1]);
+            let n = visible.len();
+            let last_w = pane_widget(visible[n - 1]);
             last_w.set_vexpand(true);
             let mut right: gtk::Widget = last_w.clone().upcast();
-            for pane in panes[..n - 1].iter().rev() {
+            for pane in visible[..n - 1].iter().rev() {
                 let left_w = pane_widget(pane);
                 left_w.set_vexpand(true);
                 let split = gtk::Paned::new(gtk::Orientation::Vertical);
@@ -2041,7 +2592,7 @@ fn fill_pane_container(container: &gtk::Box, panes: &[Pane]) {
 /// window itself is destroyed.
 fn stop_video_widgets(widget: &gtk::Widget) {
     if let Some(video) = widget.downcast_ref::<gtk::Video>() {
-        video.set_media_stream(None::<&gtk::MediaStream>);
+        crate::ui::stop_video_stream(video);
     }
     let mut child = widget.first_child();
     while let Some(current) = child {
@@ -2169,7 +2720,13 @@ fn layer_shell_available() -> bool {
 /// plain, decorated, freely-floating toplevel (a usable, undocked fallback
 /// rather than a silently broken layer); check [`layer_shell_available`] when
 /// docked-only behavior (like interactive resize) must be skipped.
-fn init_layer_window(window: &gtk::Window, config: &Config, side: PanelSide, width: u32) {
+fn init_layer_window(
+    window: &gtk::Window,
+    config: &Config,
+    side: PanelSide,
+    width: u32,
+    monitor: Option<&gdk::Monitor>,
+) {
     if !layer_shell_available() {
         configure_plain_window(window, width);
         return;
@@ -2179,6 +2736,9 @@ fn init_layer_window(window: &gtk::Window, config: &Config, side: PanelSide, wid
     }
     window.init_layer_shell();
     window.set_namespace(Some(crate::ui::LAYER_NAMESPACE));
+    // Pin to the monitor before the surface is mapped; `None` leaves the
+    // compositor to pick (the primary dock resolves its monitor after mapping).
+    window.set_monitor(monitor);
     window.set_layer(layer_of(config.panel.layer));
     let edge = match side {
         PanelSide::Left => Edge::Left,
@@ -2265,6 +2825,36 @@ fn has_visible_popover(widget: &gtk::Widget) -> bool {
     false
 }
 
+/// A stable key for a monitor, used to compare docks. Prefers the connector
+/// name; falls back to model + geometry for backends (often Wayland) that do
+/// not expose a connector.
+fn monitor_key(monitor: &gdk::Monitor) -> String {
+    if let Some(connector) = monitor.connector().filter(|c| !c.is_empty()) {
+        return connector.to_string();
+    }
+    let g = monitor.geometry();
+    let model = monitor.model().map(|m| m.to_string()).unwrap_or_default();
+    format!("{model}:{}x{}+{}+{}", g.width(), g.height(), g.x(), g.y())
+}
+
+/// Whether an existing, emptied dock should be given a fresh pane when showing.
+/// A side-specific show does; a whole-panel show does not, as long as a pane is
+/// still open somewhere — showing should reveal the existing pane, not spawn a
+/// new one.
+fn should_seed_empty(panes_exist: bool, seed: bool, whole_panel: bool) -> bool {
+    seed && (!whole_panel || !panes_exist)
+}
+
+/// A human label for a monitor, for the drag status line.
+fn monitor_label(monitor: &gdk::Monitor) -> String {
+    monitor
+        .connector()
+        .filter(|c| !c.is_empty())
+        .or_else(|| monitor.model())
+        .map(|name| name.to_string())
+        .unwrap_or_else(|| "this monitor".to_owned())
+}
+
 fn layer_of(layer: PanelLayer) -> Layer {
     use PanelLayer::*;
     match layer {
@@ -2279,10 +2869,11 @@ fn layer_of(layer: PanelLayer) -> Layer {
 /// dynamically-sized font rule, which is appended last so `tree.font_size`
 /// still wins over anything the stylesheet sets.
 fn install_css(config: &Config) {
-    let stylesheet = load_stylesheet();
+    let stylesheet = load_stylesheet(&config.theme);
     if let Some(problem) = &stylesheet.problem {
-        eprintln!("tree-space: could not read stylesheet: {problem:?}");
+        eprintln!("tree-space: could not load stylesheet: {problem:?}");
     }
+    crate::highlight::set_palette(crate::theme::syntax_palette(&config.theme));
     let css = format!(
         "{}\n.tree-row label, .tree-rename-entry, .tree-menu, .hamburger-menu {{ font-size: {}px; }}",
         stylesheet.css, config.tree.font_size
@@ -2419,6 +3010,19 @@ mod visibility_tests {
         let p = plan(VisibilityIntent::ToggleSide(R), &[L, R], &[L]);
         assert_eq!(p.show, vec![R]);
         assert!(!p.hide.contains(&L));
+    }
+
+    #[test]
+    fn whole_panel_show_does_not_seed_while_a_pane_is_open() {
+        // A whole-panel show with a pane still open elsewhere must reveal it,
+        // not spawn a fresh pane in the emptied dock.
+        assert!(!should_seed_empty(true, true, true));
+        // With nothing open anywhere it does seed, or "show" would be empty.
+        assert!(should_seed_empty(false, true, true));
+        // A side-specific show always seeds an empty dock it was asked to show.
+        assert!(should_seed_empty(true, true, false));
+        // No seed requested is never overridden.
+        assert!(!should_seed_empty(false, false, false));
     }
 }
 

@@ -30,6 +30,7 @@ use crate::fs::meta::format_size;
 use crate::fs::model::{Change, SortKey, StdDirSource, TreeModel, VisibleRow};
 use crate::fs::ops::FileOps;
 use crate::fs::watcher::{RecursiveMode, RecommendedWatcher, Watcher, spawn as spawn_watcher};
+use crate::highlight::{self, Span, TokenClass};
 use crate::preview::{
     self, ArchiveData, DocumentData, DocumentLines, ParseStatus, PreviewKind, TableData,
 };
@@ -324,6 +325,9 @@ pub enum TreeMsg {
     /// The panel geometry changed (interactive width resize): re-measure the
     /// column so inline thumbnails follow the new width.
     SetPanel(PanelConfig),
+    /// The pane moved to a dock on the other side: update the side used for
+    /// context-menu labels ("In {left|right} panel").
+    SetSide(PanelSide),
 
     MoveUp,
     MoveDown,
@@ -474,6 +478,11 @@ pub enum TreeMsg {
     DropIntoRoot { sources: Vec<PathBuf>, copy: bool },
     /// The user confirmed a drag-to-move; perform it.
     DropIntoConfirmed { target: PathBuf, sources: Vec<PathBuf> },
+    /// Pause every playing preview, keeping the widgets, so a tree that is
+    /// hidden (bookmarks view, panel hidden, workspace switched away) stops
+    /// making noise. Unlike [`Self::Shutdown`], the previews survive and are
+    /// still usable when the tree is shown again.
+    Suspend,
     /// Drop every thumbnail and stop all media playback ahead of app exit.
     Shutdown,
     /// Do nothing. Produced for actions that are dispatched elsewhere (the
@@ -672,11 +681,20 @@ impl Component for Tree {
         let capture_sender = sender.clone();
         let capture_state = renaming_state.clone();
         let capture_keys = keys.clone();
+        let capture_focus = widgets.scrolled.clone();
         controller.connect_key_pressed(move |_ctrl, key, _keycode, state| {
+            // A focused inline text preview owns its keys: selection, copy and
+            // cursor movement must reach the `GtkTextView`, not the tree's
+            // shortcuts (Ctrl+C, Ctrl+A, arrows...).
+            let preview_focused = capture_focus
+                .root()
+                .and_then(|root| gtk::prelude::RootExt::focus(&root))
+                .is_some_and(|focus| focus.has_css_class("tree-preview-text"));
             handle_key(
                 key,
                 state,
                 capture_state.get(),
+                preview_focused,
                 &capture_keys,
                 &capture_sender,
             )
@@ -815,8 +833,16 @@ impl Component for Tree {
                         if button == 1
                             && let Some((x, y)) = event.position()
                         {
-                            down.set(true);
-                            *origin.borrow_mut() = Some(DragOrigin { x, y });
+                            // A press on the selectable text preview is not a
+                            // file drag: arming one here would turn a drag to
+                            // select text into a DND drag. Leave it to the view.
+                            let on_text = drag_root
+                                .pick(x, y, gtk::PickFlags::DEFAULT)
+                                .is_some_and(|widget| in_text_preview(&widget));
+                            if !on_text {
+                                down.set(true);
+                                *origin.borrow_mut() = Some(DragOrigin { x, y });
+                            }
                         }
                     }
                     gdk::EventType::ButtonRelease => {
@@ -984,6 +1010,8 @@ impl Tree {
                 }
             }
             TreeMsg::SetPanel(panel) => self.content_width = thumbnail_content_width(panel),
+            TreeMsg::SetSide(side) => self.side = side,
+            TreeMsg::Suspend => self.suspend_media(),
             TreeMsg::Shutdown => self.shutdown(),
             TreeMsg::Noop => {}
 
@@ -1573,11 +1601,13 @@ fn handle_key(
     key: gdk::Key,
     state: gdk::ModifierType,
     renaming: bool,
+    preview_focused: bool,
     keys: &[KeyBinding],
     sender: &ComponentSender<Tree>,
 ) -> glib::Propagation {
-    // While a rename entry is focused, let it win all keys.
-    if renaming {
+    // While a rename entry or an inline text preview is focused, let it win all
+    // keys (the text view handles selection, copy and cursor movement itself).
+    if renaming || preview_focused {
         return glib::Propagation::Proceed;
     }
 
@@ -1708,8 +1738,14 @@ fn rebuild(tree: &mut Tree, widgets: &mut <Tree as Component>::Widgets, sender: 
     // Likewise the previous render's audio players: `audio_tick` must never
     // touch controls that this rebuild is about to free.
     tree.audio_widgets.borrow_mut().clear();
-    // Stop media for rows that are no longer rendered, whatever the reason.
-    let visible: HashSet<PathBuf> = rows.iter().map(|row| row.path.clone()).collect();
+    // Stop media for rows that no longer render a preview, whatever the reason
+    // (collapsed, filtered out, preview turned off, view switched). A row that
+    // is still listed but whose thumbnail was closed must not keep its stream.
+    let visible: HashSet<PathBuf> = rows
+        .iter()
+        .filter(|row| tree.wants_preview(row))
+        .map(|row| row.path.clone())
+        .collect();
     tree.retain_visible_media(&visible);
 
     for (index, row) in rows.iter().enumerate() {
@@ -1798,14 +1834,22 @@ fn rebuild(tree: &mut Tree, widgets: &mut <Tree as Component>::Widgets, sender: 
         let s = sender.clone();
         let focus_row = list_row.clone();
         click.connect_pressed(move |gesture, _n_press, x, y| {
-            // Clicks on an inline player's controls belong to that player.
-            // Handling them here would select the row and rebuild it,
-            // destroying the control before its click completes — so skip any
-            // click that lands inside a video or the audio player.
-            if focus_row
-                .pick(x, y, gtk::PickFlags::DEFAULT)
-                .is_some_and(|widget| in_inline_media(&widget))
+            // Clicks on an inline player's controls, or on the selectable text
+            // preview, belong to that widget. Handling them here would select
+            // the row and rebuild it, destroying the widget before its click
+            // completes — so skip any click that lands inside one.
+            if let Some(widget) = focus_row.pick(x, y, gtk::PickFlags::DEFAULT)
+                && in_inline_media(&widget)
             {
+                // A click on the selectable text preview must keep focus on the
+                // text view. The list box moves focus back to the tree once the
+                // event settles, so restore it on the next idle (after that has
+                // happened). Media controls do not need focus.
+                if let Some(view) = inline_text_view(&widget) {
+                    glib::idle_add_local_once(move || {
+                        view.grab_focus();
+                    });
+                }
                 return;
             }
             // Nothing else claims keyboard focus for us: without this, a
@@ -1840,10 +1884,23 @@ fn rebuild(tree: &mut Tree, widgets: &mut <Tree as Component>::Widgets, sender: 
             // was deferred (see `RowPress`), so a multi-selection click still
             // collapses once we know no drag is in flight.
             let s = sender.clone();
-            click.connect_released(move |gesture, _n_press, _x, _y| {
-                if gesture.current_button() == 1 {
-                    s.input(TreeMsg::RowRelease { path: release_path.clone() });
+            let release_row = list_row.clone();
+            click.connect_released(move |gesture, _n_press, x, y| {
+                if gesture.current_button() != 1 {
+                    return;
                 }
+                // A click on the selectable text preview keeps focus there; the
+                // list box moves focus back to the tree on release, so reclaim
+                // it once that has settled.
+                if let Some(widget) = release_row.pick(x, y, gtk::PickFlags::DEFAULT)
+                    && let Some(view) = inline_text_view(&widget)
+                {
+                    glib::idle_add_local_once(move || {
+                        view.grab_focus();
+                    });
+                    return;
+                }
+                s.input(TreeMsg::RowRelease { path: release_path.clone() });
             });
         }
         list_row.add_controller(click);
@@ -2225,6 +2282,9 @@ fn builtin_message(action: BuiltinAction, path: &Path) -> TreeMsg {
         | BuiltinAction::Collapse
         | BuiltinAction::ClosePane
         | BuiltinAction::ToggleBookmarks
+        | BuiltinAction::MoveToPreviousWorkspace
+        | BuiltinAction::MoveToNextWorkspace
+        | BuiltinAction::MoveToWorkspace
         | BuiltinAction::NewBookmark
         | BuiltinAction::NewBookmarkFolder => unreachable!("pane action in a row context menu"),
         // Bookmark-only actions are handled by the bookmarks view, never a tree.
@@ -2360,12 +2420,42 @@ fn in_list_row(widget: &gtk::Widget) -> bool {
 fn in_inline_media(widget: &gtk::Widget) -> bool {
     let mut current = Some(widget.clone());
     while let Some(widget) = current {
-        if widget.downcast_ref::<gtk::Video>().is_some() || widget.has_css_class("tree-audio") {
+        if widget.downcast_ref::<gtk::Video>().is_some()
+            || widget.has_css_class("tree-audio")
+            || widget.has_css_class("tree-preview-scroll")
+            || widget.has_css_class("tree-preview-text")
+        {
             return true;
         }
         current = widget.parent();
     }
     false
+}
+
+/// Whether `widget` is the inline text preview (or its scroller), which owns
+/// pointer drags for text selection rather than starting a file drag.
+fn in_text_preview(widget: &gtk::Widget) -> bool {
+    let mut current = Some(widget.clone());
+    while let Some(widget) = current {
+        if widget.has_css_class("tree-preview-text") || widget.has_css_class("tree-preview-scroll") {
+            return true;
+        }
+        current = widget.parent();
+    }
+    false
+}
+
+/// The inline text preview under `widget`, if the widget is one or a descendant
+/// of one.
+fn inline_text_view(widget: &gtk::Widget) -> Option<gtk::TextView> {
+    let mut current = Some(widget.clone());
+    while let Some(widget) = current {
+        if widget.has_css_class("tree-preview-text") {
+            return widget.downcast::<gtk::TextView>().ok();
+        }
+        current = widget.parent();
+    }
+    None
 }
 
 /// Width in px available to a depth-0 thumbnail: the panel's inner width, minus
@@ -2516,7 +2606,13 @@ fn build_audio_player(player: &Rc<AudioPlayer>, margin_start: i32) -> (gtk::Box,
 /// Widest a table cell is allowed to grow before it ellipsizes.
 const PREVIEW_CELL_CHARS: i32 = 12;
 
-/// Append a monospaced text excerpt (a document, or a structured file's source).
+/// Tallest the inline text box grows before it scrolls internally, in pixels
+/// (roughly 18 rows).
+const PREVIEW_TEXT_MAX_HEIGHT: i32 = 260;
+
+/// Append a scrollable, selectable monospaced text view for a document (or a
+/// structured file's source). The view wraps long lines and is syntax
+/// highlighted from the spans cached with the document.
 fn append_text_lines(container: &gtk::Box, margin_start: i32, lines: &DocumentLines) {
     if lines.lines.is_empty() {
         return;
@@ -2525,15 +2621,57 @@ fn append_text_lines(container: &gtk::Box, margin_start: i32, lines: &DocumentLi
     if lines.more {
         text.push_str("\n…");
     }
-    let label = gtk::Label::new(Some(&text));
-    label.add_css_class("tree-preview-text");
-    label.set_xalign(0.0);
-    label.set_hexpand(true);
-    label.set_wrap(true);
-    label.set_wrap_mode(pango::WrapMode::Char);
-    label.set_margin_start(margin_start);
-    label.set_margin_bottom(6);
-    container.append(&label);
+
+    let view = gtk::TextView::new();
+    view.add_css_class("tree-preview-text");
+    view.set_editable(false);
+    view.set_cursor_visible(false);
+    view.set_can_focus(true);
+    view.set_focus_on_click(true);
+    view.set_monospace(true);
+    view.set_wrap_mode(gtk::WrapMode::WordChar);
+    view.set_left_margin(6);
+    view.set_right_margin(6);
+    view.set_top_margin(3);
+    view.set_bottom_margin(3);
+    let buffer = view.buffer();
+    buffer.set_text(&text);
+    apply_syntax(&buffer, &lines.syntax);
+
+    // A small box that scrolls internally rather than growing the row: it is as
+    // tall as its content up to the cap, then scrolls. Nested inside the tree's
+    // scroller, GTK hands wheel events to the inner view until it hits an edge.
+    let scrolled = gtk::ScrolledWindow::new();
+    scrolled.add_css_class("tree-preview-scroll");
+    scrolled.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    scrolled.set_propagate_natural_height(true);
+    scrolled.set_max_content_height(PREVIEW_TEXT_MAX_HEIGHT);
+    scrolled.set_child(Some(&view));
+    scrolled.set_margin_start(margin_start);
+    scrolled.set_margin_bottom(6);
+    container.append(&scrolled);
+}
+
+/// Paint the cached syntax spans onto `buffer` as foreground-colored tags. One
+/// tag is created per token class actually used.
+fn apply_syntax(buffer: &gtk::TextBuffer, spans: &[Span]) {
+    if spans.is_empty() {
+        return;
+    }
+    let palette = highlight::palette();
+    let table = buffer.tag_table();
+    let mut tags: HashMap<TokenClass, gtk::TextTag> = HashMap::new();
+    for span in spans {
+        let tag = tags.entry(span.class).or_insert_with(|| {
+            let tag = gtk::TextTag::new(None);
+            tag.set_foreground(Some(palette.color(span.class)));
+            table.add(&tag);
+            tag
+        });
+        let start = buffer.iter_at_offset(span.start as i32);
+        let end = buffer.iter_at_offset(span.end as i32);
+        buffer.apply_tag(tag, &start, &end);
+    }
 }
 
 /// Append the validity line under a structured preview.
@@ -2885,6 +3023,24 @@ impl Tree {
         }
     }
 
+    /// Pause every playing preview but keep its widgets, so a hidden tree stops
+    /// making noise and its previews are still there (paused) when shown again.
+    /// Called via [`TreeMsg::Suspend`] when the pane switches to bookmarks, the
+    /// panel is hidden, or its workspace is left.
+    fn suspend_media(&mut self) {
+        for video in self.video_widgets.values() {
+            if let Some(stream) = video.media_stream() {
+                stream.set_playing(false);
+            }
+        }
+        for player in self.audio.values() {
+            player.set_playing(false);
+        }
+        // Stop the GIF ticker; the frames it owns are rebuilt on demand.
+        self.gif_anims.borrow_mut().clear();
+        self.playing.clear();
+    }
+
     /// Tear down all media ahead of app exit. Called via [`TreeMsg::Shutdown`]
     /// while the main loop is still running: the queued message drops every
     /// thumbnail, so the following rebuild destroys the `GtkVideo` widgets and
@@ -2934,7 +3090,7 @@ impl Tree {
     fn stop_videos_under(&mut self, prefix: &Path) {
         self.video_widgets.retain(|path, video| {
             if path.starts_with(prefix) {
-                video.set_media_stream(None::<&gtk::MediaStream>);
+                crate::ui::stop_video_stream(video);
                 false
             } else {
                 true
@@ -2945,7 +3101,7 @@ impl Tree {
     /// Detach every video stream from its widget and drop all handles.
     fn stop_all_videos(&mut self) {
         for video in self.video_widgets.values() {
-            video.set_media_stream(None::<&gtk::MediaStream>);
+            crate::ui::stop_video_stream(video);
         }
         self.video_widgets.clear();
     }
@@ -2960,7 +3116,7 @@ impl Tree {
             if visible.contains(path) {
                 true
             } else {
-                video.set_media_stream(None::<&gtk::MediaStream>);
+                crate::ui::stop_video_stream(video);
                 false
             }
         });

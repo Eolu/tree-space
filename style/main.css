@@ -1,5 +1,8 @@
 /* Omarchy "Tokyo Night" palette (mirrors
-   ~/.local/state/omarchy/current/theme/colors.toml, core bg #191a24). */
+   ~/.local/state/omarchy/current/theme/colors.toml, core bg #191a24).
+   Everything above the structure marker is a palette: with
+   `[theme] mode = "system"` tree-space replaces these definitions with the
+   active desktop theme's colors and reuses the CSS below unchanged. */
 @define-color tn_bg #191a24;
 @define-color tn_bg_dark #13141c;
 @define-color tn_bg_darker #0e0e14;
@@ -10,6 +13,11 @@
 @define-color tn_muted #414868;
 @define-color tn_selection #292e42;
 @define-color tn_blue #7aa2f7;
+@define-color tn_accent #7aa2f7;
+@define-color tn_green #9ece6a;
+@define-color tn_red #f7768e;
+
+/* --- structure (theme-independent; system themes replace the colors above) --- */
 
 .panel {
     background-color: @tn_bg;
@@ -107,6 +115,30 @@
 
 .nav-toolbar button:disabled {
     color: alpha(@tn_fg, 0.35);
+}
+
+/* ── pane-move drag (toolbar grip) ───────────────────────────────────────── */
+.pane-grip {
+    margin: 0 2px;
+    opacity: 0.45;
+    color: @tn_fg;
+    -gtk-icon-size: 16px;
+}
+
+.pane-grip:hover {
+    opacity: 0.9;
+    color: @tn_fg_bright;
+}
+
+/* The pane being dragged, and the dock it would drop into. */
+.pane-moving {
+    outline: 1px solid @tn_blue;
+    outline-offset: -1px;
+}
+
+.pane-drop-target {
+    outline: 2px solid @tn_blue;
+    outline-offset: -2px;
 }
 
 /* ── status bar ───────────────────────────────────────────────────────────── */
@@ -435,13 +467,32 @@ popover.hamburger-popover > arrow {
 }
 
 /* ── inline document previews (text, tables, structured data, archives) ──── */
+/* A scrollable, selectable text view. The theme paints the view's `text` node,
+   so the box background/foreground are set on both the view and that node. */
+.tree-preview-text,
+.tree-preview-text text {
+    background-color: alpha(@tn_fg, 0.04);
+    color: @tn_fg;
+}
+
 .tree-preview-text {
     font-family: monospace;
     font-size: 0.82em;
-    color: @tn_fg;
-    background-color: alpha(@tn_fg, 0.04);
     border-radius: 4px;
-    padding: 3px 6px;
+}
+
+.tree-preview-text selection {
+    background-color: @tn_selection;
+    color: @tn_fg_bright;
+}
+
+.tree-preview-scroll {
+    background: none;
+    border: none;
+}
+
+.tree-preview-scroll scrollbar range {
+    background-color: alpha(@tn_muted, 0.35);
 }
 
 .tree-preview-status {
@@ -451,11 +502,11 @@ popover.hamburger-popover > arrow {
 
 /* Tokyo Night green/red for a parse result. */
 .tree-preview-status.ok {
-    color: #9ece6a;
+    color: @tn_green;
 }
 
 .tree-preview-status.error {
-    color: #f7768e;
+    color: @tn_red;
 }
 
 .tree-preview-table {

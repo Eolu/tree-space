@@ -21,9 +21,13 @@
 //! tested headlessly with `cargo test`.
 
 pub mod config;
+pub mod theme;
+pub mod highlight;
 pub mod fs;
 pub mod cmd;
+pub mod freedesktop;
 pub mod ipc;
+pub mod workspace;
 pub mod audio;
 pub mod preview;
 pub mod ui;

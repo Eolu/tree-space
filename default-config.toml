@@ -20,6 +20,20 @@ width = 300          # panel width in px (clamped to 160–2000)
 margin = 0           # gap from the screen edge in px (clamped to 0–200)
 nav_toolbar = false  # show a nav toolbar (up, back, forward) below the path bar
 
+# -- Theme --------------------------------------------------------------------
+# How the panel is styled:
+#   "custom" - load main.css from this directory (the default; edit that file to
+#              change colors, fonts and layout)
+#   "system" - ignore main.css entirely (it is neither read nor created) and
+#              follow the desktop theme below for colors and fonts
+[theme]
+mode = "custom"
+
+# Which desktop theme to follow when mode = "system". Currently only "omarchy":
+# uses Omarchy's active theme colors (~/.local/state/omarchy/current/theme) and
+# its monospace font.
+system = "omarchy"
+
 # -- Bookmarks ----------------------------------------------------------------
 # Bookmarks are a pane view: a panel opened without a directory shows them as
 # suggested places to jump to, and clicking one replaces the view with that
@@ -229,6 +243,17 @@ items = [
     { action = "Sort by Modified", shortcut = "Ctrl+3" },
     { action = "Sort by Type", shortcut = "Ctrl+4" },
     { action = "Reverse Sort Order", shortcut = "Ctrl+Shift+r" },
+
+    "---",
+    # Move the whole panel to another workspace. The panel is pinned to the
+    # workspace it was launched on and only visible there; these entries
+    # switch to the target workspace as they move. "Move to Workspace" needs a
+    # `workspace = "..."` target (a Hyprland workspace name). Hidden so they
+    # only contribute their shortcuts, not menu rows.
+    { action = "Move to Previous Workspace", shortcut = "Ctrl+Alt+Left", hidden = true },
+    { action = "Move to Next Workspace", shortcut = "Ctrl+Alt+Right", hidden = true },
+    { action = "Move to Workspace", workspace = "1", shortcut = "Ctrl+Alt+1", hidden = true },
+    { action = "Move to Workspace", workspace = "2", shortcut = "Ctrl+Alt+2", hidden = true },
 
     "---",
     "Collapse",

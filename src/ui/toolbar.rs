@@ -28,7 +28,7 @@ use std::cell::{Cell, RefCell};
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use crate::config::{BuiltinAction, ContextAction, PaneMenu, ShortcutTarget};
+use crate::config::{BuiltinAction, ContextAction, PaneMenu};
 use relm4::gtk;
 use relm4::gtk::gdk;
 use relm4::gtk::prelude::*;
@@ -52,10 +52,10 @@ pub enum ToolbarOutput {
     Collapse,
     /// The user requested to close this pane (exits the app on the last one).
     ClosePane,
-    /// A configurable pane-menu item resolved to a tree builtin or custom
-    /// command. The app routes builtins to the pane's tree and reports errors
-    /// for commands.
-    PaneItem(ShortcutTarget),
+    /// A configurable pane-menu item (a tree builtin, a custom command, or a
+    /// parameterized builtin such as "Move to Workspace"). The app routes it:
+    /// pane actions are performed there, everything else goes to the tree.
+    PaneItem(ContextAction),
 }
 
 /// Messages the app can send into the toolbar.
@@ -82,6 +82,8 @@ pub struct ToolbarInit {
 pub struct Toolbar {
     root: PathBuf,
     path_entry: gtk::Entry,
+    /// The pane-move drag handle the app attaches its gesture to.
+    grip: gtk::Image,
     menu_button: gtk::MenuButton,
     /// Items of the normal pane menu and of the bookmarks-view menu; the
     /// popover is rebuilt from one or the other as the body switches.
@@ -134,6 +136,17 @@ impl SimpleComponent for Toolbar {
                 set_valign: gtk::Align::Center,
                 add_css_class: "path-entry",
             },
+
+            // ── drag handle ───────────────────────────────────────────────────
+            // A grip the app turns into a pane-move gesture (drag it to another
+            // edge or monitor). A plain image, not a button, so it never
+            // competes with the menu or the path entry.
+            append: grip = &gtk::Image {
+                set_icon_name: Some("list-drag-handle-symbolic"),
+                set_tooltip_text: Some("Drag to move this pane to another edge or monitor"),
+                set_valign: gtk::Align::Center,
+                add_css_class: "pane-grip",
+            },
         }
     }
 
@@ -174,6 +187,7 @@ impl SimpleComponent for Toolbar {
         let model = Toolbar {
             root: PathBuf::new(),
             path_entry: entry,
+            grip: widgets.grip.clone(),
             menu_button: widgets.menu_button.clone(),
             pane_items: init.pane_menu.items.clone(),
             bookmarks_items: init.bookmarks_menu.clone(),
@@ -204,6 +218,13 @@ impl SimpleComponent for Toolbar {
                 self.menu_button.set_popover(Some(&popover));
             }
         }
+    }
+}
+
+impl Toolbar {
+    /// The pane-move drag handle, so the app can attach a [`gtk::GestureDrag`].
+    pub fn grip(&self) -> &gtk::Image {
+        &self.grip
     }
 }
 
@@ -530,7 +551,7 @@ fn dispatch_pane_action(action: &ContextAction, sender: &ComponentSender<Toolbar
         ContextAction::Builtin(a) => *a,
         ContextAction::Entry(e) => e.action,
         ContextAction::Command(cmd) => {
-            let _ = sender.output(ToolbarOutput::PaneItem(ShortcutTarget::Command(cmd.clone())));
+            let _ = sender.output(ToolbarOutput::PaneItem(ContextAction::Command(cmd.clone())));
             return;
         }
         // A submenu row never dispatches; its children carry the actions.
@@ -545,10 +566,10 @@ fn dispatch_pane_action(action: &ContextAction, sender: &ComponentSender<Toolbar
         // Navigation actions are pane-level too; route them through the shared
         // pane-item path so the app's dispatcher performs them.
         BuiltinAction::Up | BuiltinAction::Back | BuiltinAction::Forward => {
-            ToolbarOutput::PaneItem(ShortcutTarget::Builtin(target))
+            ToolbarOutput::PaneItem(ContextAction::Builtin(target))
         }
         BuiltinAction::Separator => return,
-        other => ToolbarOutput::PaneItem(ShortcutTarget::Builtin(other)),
+        other => ToolbarOutput::PaneItem(ContextAction::Builtin(other)),
     };
     let _ = sender.output(out);
 }

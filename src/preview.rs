@@ -20,6 +20,8 @@ use std::path::Path;
 
 use relm4::gtk::gio;
 
+use crate::highlight::{self, Language, Span};
+
 /// What an inline preview can render for a file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PreviewKind {
@@ -69,8 +71,10 @@ impl PreviewKind {
 const SNIFF_BYTES: u64 = 8192;
 /// How much of a document is read at all.
 const PREVIEW_BYTES: u64 = 64 * 1024;
-/// Lines shown for a text or structured preview.
-const PREVIEW_LINES: usize = 20;
+/// Lines kept for a text or structured preview. The preview is scrollable; this
+/// cap (with [`PREVIEW_BYTES`]) keeps a rebuild cheap while still showing far
+/// more than the panel height.
+const PREVIEW_LINES: usize = 300;
 /// Lines shown for a CSV/TSV preview (the first is treated as a header).
 const TABLE_ROWS: usize = 8;
 /// Columns shown for a CSV/TSV preview.
@@ -319,15 +323,16 @@ pub enum DocumentData {
 /// Load the document behind `kind`. `None` when the file can't be read or the
 /// kind is media (media is decoded by the tree, not here).
 pub fn load_document(path: &Path, kind: PreviewKind) -> Option<DocumentData> {
+    let language = highlight::language_for(path);
     match kind {
         PreviewKind::Text => {
             let text = read_text(path, PREVIEW_BYTES)?;
-            Some(DocumentData::Lines(lines_from(&text, PREVIEW_LINES)))
+            Some(DocumentData::Lines(lines_from(&text, PREVIEW_LINES, language)))
         }
         PreviewKind::Json | PreviewKind::Toml | PreviewKind::Yaml => {
             let text = read_text(path, PREVIEW_BYTES)?;
             Some(DocumentData::Structured {
-                lines: lines_from(&text, PREVIEW_LINES),
+                lines: lines_from(&text, PREVIEW_LINES, language),
                 status: parse_status(&text, kind),
             })
         }
@@ -338,11 +343,14 @@ pub fn load_document(path: &Path, kind: PreviewKind) -> Option<DocumentData> {
 }
 
 /// The first `max_lines` lines of `text`, each capped in length, plus whether
-/// the file continues past what is shown.
+/// the file continues past what is shown and the syntax spans over the joined
+/// text (empty for a language that isn't highlighted).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DocumentLines {
     pub lines: Vec<String>,
     pub more: bool,
+    /// Highlight spans over `lines.join("\n")`, in character offsets.
+    pub syntax: Vec<Span>,
 }
 
 /// A parsed table: up to `max_rows` rows of up to `max_cols` cells.
@@ -393,13 +401,15 @@ fn read_text(path: &Path, max: u64) -> Option<String> {
     Some(String::from_utf8_lossy(&bytes).into_owned())
 }
 
-/// Split `text` into at most `max_lines` display lines.
-fn lines_from(text: &str, max_lines: usize) -> DocumentLines {
+/// Split `text` into at most `max_lines` display lines, highlighting the result
+/// as `language`. The spans index the joined text the tree renders.
+fn lines_from(text: &str, max_lines: usize, language: Language) -> DocumentLines {
     let mut all = text.lines();
     let lines: Vec<String> = all.by_ref().take(max_lines).map(truncate_line).collect();
     // `all` is not exhausted if the file continued past the cap.
     let more = all.next().is_some();
-    DocumentLines { lines, more }
+    let syntax = highlight::highlight(language, &lines.join("\n"));
+    DocumentLines { lines, more, syntax }
 }
 
 /// Cap a line so a minified file can't produce an unbounded label.
@@ -703,13 +713,35 @@ mod tests {
     #[test]
     fn lines_are_capped_and_note_more() {
         let text = "one\ntwo\nthree\nfour\n";
-        let lines = lines_from(text, 2);
+        let lines = lines_from(text, 2, Language::Plain);
         assert_eq!(lines.lines, vec!["one", "two"]);
         assert!(lines.more);
 
-        let lines = lines_from(text, 99);
+        let lines = lines_from(text, 99, Language::Plain);
         assert_eq!(lines.lines.len(), 4);
         assert!(!lines.more);
+        assert!(lines.syntax.is_empty());
+    }
+
+    #[test]
+    fn text_preview_carries_syntax_spans() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("demo.rs");
+        std::fs::write(&path, "fn main() { let x = 1; // c\n}\n").unwrap();
+        let Some(DocumentData::Lines(lines)) = load_document(&path, PreviewKind::Text) else {
+            panic!("expected text lines");
+        };
+        assert!(!lines.syntax.is_empty());
+        // The first span is the `fn` keyword.
+        assert_eq!(lines.syntax[0].start, 0);
+        assert_eq!(lines.syntax[0].class, crate::highlight::TokenClass::Keyword);
+        // A plain `.txt` file gets no spans.
+        let plain = dir.path().join("note.txt");
+        std::fs::write(&plain, "just text\n").unwrap();
+        let Some(DocumentData::Lines(lines)) = load_document(&plain, PreviewKind::Text) else {
+            panic!("expected text lines");
+        };
+        assert!(lines.syntax.is_empty());
     }
 
     #[test]

@@ -22,3 +22,19 @@ pub mod tree;
 /// compositor rules can target the panel and its dialogs by name instead of the
 /// built-in `gtk4-layer-shell` default.
 pub(crate) const LAYER_NAMESPACE: &str = "tree-space";
+
+/// Pause and detach a `GtkVideo`'s media stream.
+///
+/// Detaching alone does not stop a clip: the `GtkMediaStream` (a
+/// `GtkMediaFile`) can outlive the widget — a row GTK has removed is freed
+/// lazily, and the media cache may still hold it — so it keeps its GStreamer
+/// pipeline, audio included, running even after the thumbnail is gone. Pausing
+/// first actually stops playback; detaching then releases the widget's
+/// reference.
+pub(crate) fn stop_video_stream(video: &relm4::gtk::Video) {
+    use relm4::gtk::prelude::*;
+    if let Some(stream) = video.media_stream() {
+        stream.set_playing(false);
+    }
+    video.set_media_stream(None::<&relm4::gtk::MediaStream>);
+}
