@@ -1,0 +1,8 @@
+[D-BUS Service]
+Name=org.freedesktop.FileManager1
+# Started only when a call arrives and no file manager already owns the name,
+# e.g. an Electron app's "Open Containing Folder" before the panel is up. A
+# running panel owns the name itself (`src/freedesktop.rs`), so this is the
+# cold-start path. Installing it under ~/.local/share/dbus-1/services shadows
+# the system file Nautilus ships.
+Exec=ts

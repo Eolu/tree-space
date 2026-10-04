@@ -4,7 +4,7 @@ Version=1.0
 Name=Tree Space
 GenericName=File Manager
 Comment=Dockable, keyboard-first file manager panel
-Exec=tree-space --select %u
+Exec=ts --select %u
 Icon=system-file-manager
 Terminal=false
 Categories=System;FileManager;FileTools;
@@ -17,6 +17,8 @@ StartupNotify=false
 # to start us over the session bus.
 DBusActivatable=false
 # Register as a handler for folders and the generic file:// scheme so
-# `xdg-open <dir>`, portal "Show in folder" requests, and double-clicking a
-# folder in another app all route here.
+# `xdg-open <dir>` and double-clicking a folder in another app route here.
+# Electron/portal "Show in folder" requests bypass the MIME database and use
+# the FileManager1 D-Bus interface instead; see
+# resources/org.freedesktop.FileManager1.service and src/freedesktop.rs.
 MimeType=inode/directory;x-scheme-handler/file;

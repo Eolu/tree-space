@@ -2,6 +2,8 @@
 
 A wayland file manager that lives on the edge of your screen, inspired by the vscode explorer.
 
+<img src="docs/hero.png" alt="The tree-space panel docked to the left edge of the screen, showing a file tree with an inline image preview." width="340">
+
 tree-space docks a keyboard-driven file tree to a screen edge, out of the way of your normal windows. It is built for
 people who want a real, full-featured file manager that is always one keystroke
 away instead of a window they have to open, arrange, and lose behind other
@@ -32,9 +34,10 @@ whole selection, not just one row.
 open it in the opposite dock, filter the current listing, and choose what the
 panel opens to on startup.
 
-**Previews.** Toggle an inline preview below any row: image thumbnails inline, or
-an expandable player for video and audio (play/pause, seek, volume). Animated
-GIFs and videos play on click.
+**Previews.** Toggle an inline preview below any row. Images, video and audio
+(play/pause, seek, volume), animated GIFs that play on click, text and source
+snippets, CSV/TSV tables, JSON/TOML/YAML with a validity check, and archive
+contents. The type is sniffed from the file's bytes, not just its extension.
 
 **Details when you need them.** A Properties dialog modelled on Nautilus, with
 editable name, MIME type, size, timestamps, free space, link targets, and a
@@ -42,6 +45,12 @@ live permissions/ownership editor.
 
 **Selection.** Ctrl+click, Shift+click, Shift+Arrow, and Ctrl+Shift+Arrow
 selection, with a context menu that acts on the whole selection at once.
+
+**Bookmarks.** A new panel opens showing bookmarks: a list of suggested
+directories to jump to. Clicking one replaces the view with that folder, so a
+split starts as a launcher rather than an empty tree. Bookmark entries can be
+renamed, re-pointed, or deleted from their right-click menu. See
+[Bookmarks](#bookmarks).
 
 **Configurable context menus and hotkeys.** Every context menu is an ordered list of rules, and a rule can
 match on almost anything: whether the row is a directory, files with no
@@ -60,7 +69,7 @@ the main config. See [Context menus](#context-menus).
 ## Usage
 
 ```
-tree-space [OPTIONS] [PATH ...]
+ts [OPTIONS] [PATH ...]
 ```
 
 Run with no arguments it starts the panel (or toggles an already-running one).
@@ -74,16 +83,18 @@ file opens its containing folder and selects the file.
 | `--select <PATH>` | Reveal a path: open its containing folder and select it. This is what the `.desktop` entry uses. |
 | `-H, --hidden` | Launch (or keep) the panel hidden. Never shows it. |
 | `-w, --width <W>` | Resize a dock: `420` is an absolute width in px, `+40`/`-40` is a delta. `--side` picks the dock. Never changes visibility. |
+| `-k, --key <ACCEL>` | Run a configured shortcut (`Ctrl+c`, `F2`, `Alt+Left`, …) against the active pane as if the key were pressed. Needs no keyboard focus, so an external button deck can drive the panel. Never changes visibility. |
 | `-h, --help` | Print the usage message. |
 
 ```
-tree-space                        # start the panel, or toggle it if it is open
-tree-space ~/dev                  # open a pane rooted there
-tree-space ~/notes.md             # open the folder and select notes.md
-tree-space --side right /tmp      # dock a pane to the right edge
-tree-space --hidden               # start hidden (or hide a running panel)
-tree-space --width +40            # widen the running panel by 40px
-TREE_SPACE_DIRS=/a:/b tree-space  # open panes for directories from the environment
+ts                        # start the panel, or toggle it if it is open
+ts ~/dev                  # open a pane rooted there
+ts ~/notes.md             # open the folder and select notes.md
+ts --side right /tmp      # dock a pane to the right edge
+ts --hidden               # start hidden (or hide a running panel)
+ts --width +40            # widen the running panel by 40px
+ts --key Ctrl+c           # copy the cursor row without focusing the panel
+TREE_SPACE_DIRS=/a:/b ts  # open panes for directories from the environment
 ```
 
 Only one panel runs at a time. A second invocation forwards its intent to the
@@ -93,9 +104,10 @@ running instance over a socket and exits; see
 ## Configuration
 
 Everything is optional. On first launch tree-space writes a commented
-`config.toml` and `main.css` to `~/.config/tree-space/` for you to edit. A
-partial config is merged with the defaults, a broken one falls back to the
-defaults with a message in the status bar, and out-of-range values are clamped.
+`config.toml`, `main.css`, and `bookmarks.toml` to `~/.config/tree-space/` for
+you to edit. A partial config is merged with the defaults, a broken one falls
+back to the defaults with a message in the status bar, and out-of-range values
+are clamped.
 
 ```toml
 [panel]
@@ -103,6 +115,7 @@ side = "left"      # which edge to dock to: "left" | "right"
 layer = "bottom"   # stacking layer: "background" | "bottom" | "top" | "overlay"
 width = 300        # width in px
 margin = 0         # gap from the screen edge in px
+nav_toolbar = false # show a nav toolbar (up, back, forward) below the path bar
 
 [tree]
 dirs_first = true          # list directories above files
@@ -112,13 +125,24 @@ show_hidden = false
 font_size = 13
 icon_size = 18
 confirm_drop_move = false  # ask before a drag-and-drop move
+
+[bookmarks]
+file = "bookmarks.toml" # the list, relative to this config (or absolute)
 ```
 
-Two things are worth calling out:
+`[panel] nav_toolbar` adds a small row of navigation buttons (up one level,
+back, forward) directly below the path bar. They mirror the corresponding
+`[pane_menu]` actions, and each button's enabled state follows the pane (Up
+only when there is a parent directory and the tree is showing; Back/Forward
+only when history exists that way). It is off by default.
+
+Three things are worth calling out:
 
 - **Context menus and hotkeys** are configured with `[[context_menu.rules]]`.
   This is the heart of the project; the full syntax is in
   [Context menus](#context-menus).
+- **Bookmarks** are the default view of a new panel: a list of directories to
+  jump from, stored in their own file. See [Bookmarks](#bookmarks).
 - **The stylesheet** is a plain CSS file at `~/.config/tree-space/main.css`. Edit
   it and restart to restyle the tree, menus, dialogs, and drag badges. See
   [Styling](#styling).
@@ -146,6 +170,8 @@ Right-click menus on tree rows are configurable. The config is an ordered list
 of rules, checked top-down; the **first rule with a matching entry wins** and
 supplies the whole menu. Rows that no rule claims get the built-in default menu
 (the classic file-manager items with their default shortcuts).
+
+<img src="docs/context-menu.gif" alt="Right-clicking a directory row in the panel opens its configurable context menu." width="420">
 
 ```toml
 [[context_menu.rules]]
@@ -300,6 +326,7 @@ different menu; the first binding for a key wins.
 | Sort by Name / Size / Modified / Type | `Ctrl+1` / `Ctrl+2` / `Ctrl+3` / `Ctrl+4` |
 | Reverse Sort Order | `Ctrl+Shift+r` |
 | Back / Forward / Up One Level (pane) | `Alt+Left` / `Alt+Right` / `Alt+Up` |
+| Bookmarks (pane) | `Ctrl+b` |
 | Close Pane (pane) | `Ctrl+w` |
 
 A plain-string built-in uses its default shortcut; the table form
@@ -323,20 +350,44 @@ The plain-string spelling is also the menu label.
 - `"Create Link"` — create a symlink next to the row.
 - `"Properties"` — open the Properties dialog.
 - `"Copy Path"` / `"Copy Relative Path"` — copy the absolute or root-relative path.
+- `"Add Bookmark"` — bookmark the directory row (directories only).
+- `"Edit Bookmark"` / `"Delete Bookmark"` — bookmark-only: rename/re-point or remove the entry from a bookmark's menu. See [Bookmark menus](#bookmark-menus).
+- `"New Bookmark"` / `"New Bookmark Folder"` — bookmarks view: create a bookmark or an (empty) folder from the hamburger or the blank-area menu.
+- `"Bookmarks"` — pane-level: show the [bookmarks](#bookmarks) view in this pane. See [Bookmarks](#bookmarks).
 - `"Move to Trash"` / `"Delete Permanently"`.
 
 The panel/split actions (`"In new panel"`, `"In opposite panel"`, `"Open in Split
 View"`) only apply to directories and are dropped from file rows; `"Open With
-Default"` only applies to files.
+Default"` only applies to files, and `"Add Bookmark"` to directories.
 
 ## Previews
 
-`"View Thumbnail"` toggles an inline preview below a row: a preview of an image
-file, or of every previewable file inside a directory. Images show inline;
-animated GIFs and videos show their first frame and play on click (videos
-looping, with audio, via the built-in player). For audio files the item reads
-**"Show Player"** and expands a compact transport: play/pause, seek, elapsed and
-total time, and volume.
+`"View Thumbnail"` toggles an inline preview below a row: the file's own preview,
+or every previewable file inside a directory. What a file shows depends on its
+kind:
+
+<img src="docs/previews.gif" alt="Inline previews cycling through an image, a CSV table, an archive listing, and syntax-highlighted source." width="260">
+
+- **Images** show a thumbnail; **animated GIFs** and **videos** show their first
+  frame and play on click (videos looping, with audio, via the built-in player).
+- **Audio** expands a compact transport — play/pause, seek, elapsed/total time
+  and volume. The item reads **"Show Player"**.
+- **Text, source code and logs** show a small scrollable box (lines wrap; scroll,
+  select and copy like any text view) with lightweight syntax highlighting for
+  common extensions — Rust, C/C++, JavaScript/TypeScript, Python, shell, Go,
+  JSON, TOML/INI, YAML, HTML/XML, CSS and Markdown. Highlighting is a single
+  linear pass cached with the loaded document, so it is not recomputed on redraw;
+  a `.txt`/`.log` preview is left plain. Colors follow the active theme (the
+  Omarchy palette in `[theme] mode = "system"`, otherwise the built-in one).
+- **CSV/TSV** render as a small table (the first row is treated as a header).
+- **JSON, TOML and YAML** show the source plus a **valid** / `line N: …` result.
+- **Archives** (`zip`, `tar`, `tar.gz`) list their first entries and sizes; other
+  compressed containers are labelled without a listing.
+
+The kind is detected from the file's content, not just its extension: the first
+bytes are handed to GIO's MIME sniffer, so an extensionless image is still an
+image and a text file misnamed `.png` is still text. Menus read accordingly
+(**"Show Preview"**, **"Show Contents"**, ...).
 
 Previews are sized to the column (images never enlarge past their natural size)
 and are non-persistent — they disappear when the directory collapses or the pane
@@ -361,6 +412,126 @@ closes.
 
 When several rows are selected, Properties shows a read-only summary of the
 selection: the count, combined size, shared parent folder, and the list of names.
+
+## Bookmarks
+
+Bookmarks are a **pane view**, not a sidebar. A panel opened without a directory
+(the `bookmarks` startup — the default — a **Split View**, or any new panel)
+shows a list of suggested directories in its body, above the usual toolbar with
+its hamburger menu and path entry. It is an ordinary pane; the list is just what
+it shows until you pick somewhere to go.
+
+<img src="docs/bookmarks.gif" alt="Opening the bookmarks pane, navigating the list, and opening a bookmark into the tree." width="260">
+
+**Click** a bookmark and the pane jumps to that directory, replacing the
+bookmarks view with the tree. **Right-click** a bookmark for its menu: the same
+context menu that directory would get in the tree (the actions run against it
+without opening it), plus the bookmark-specific **Edit Bookmark** / **Delete
+Bookmark** items. Editing opens a small dialog where the **name** and **path**
+can both be changed, with a **Browse...** folder picker (a blank name falls back
+to the directory's own name).
+
+Because a new panel starts on the bookmarks view, opening a split is a quick way
+to get a launcher: split, see your saved places, and jump. To bring the view back
+in an existing pane, use the hamburger's **Bookmarks** item (default `Ctrl+b`).
+Back/forward (or `Alt+Left` / `Alt+Right`) step through the view like any
+directory, and **Filter...** narrows the list by name or path.
+
+The bookmarks view is navigable from the keyboard alone. The first entry is
+focused when the view opens; **Up**/**Down** move the cursor, **Home**/**End**
+jump to the ends, **Left**/**Right** collapse and expand a folder, and
+**Enter**/**Space** open the entry (or toggle a folder). The pane's and
+bookmarks' menu shortcuts work from the list too, since focus is in the pane.
+Opening an entry moves the keyboard to the tree, so you can keep going without
+touching the mouse.
+
+Entries can be **dragged** to reorganize the list: drop one on a folder to move
+it inside, on an entry to place it just before that entry, or on the empty space
+below the list to move it back to the top level. A dragged leaf also carries its
+directory, so it can be dropped onto another application.
+
+The list is stored in `bookmarks.toml` beside the config (the `[bookmarks] file`
+key), created with a single home bookmark on first launch. It is a compact array
+of inline tables — a `name` plus a `path` for a bookmark, or nested `items` for a
+folder:
+
+```toml
+bookmarks = [
+    { name = "eolu", path = "/home/eolu" },
+    { name = "Work", expanded = true, items = [
+        { name = "Main repo", path = "/srv/work/repo" },
+        { name = "Archived", items = [
+            { name = "Old repo", path = "/srv/work/old" },
+        ] },
+    ] },
+]
+```
+
+A folder has no `path` of its own; a leaf has a `path` and opens it on click. An
+entry can have both (it is clickable and holds children). `expanded = true`
+starts a folder open. (The older `[[bookmarks]]` / `[[bookmarks.items]]` table
+form is still read, so an existing file keeps working until it is next saved.)
+
+Add leaf entries with **Add Bookmark** in a directory's right-click menu
+(directories only); a directory already bookmarked anywhere is not added twice.
+Folders are defined in the file.
+
+You can also create entries from the bookmarks view itself: **New Bookmark** and
+**New Bookmark Folder** open a small dialog (the same shape as the editor — a
+name and, for a bookmark, a path with **Browse...**). They live in the view's
+hamburger menu and in the menu that opens when you right-click the empty space
+below the entries.
+
+### Bookmark menus
+
+The bookmarks view has its **own hamburger menu** (`[bookmarks] menu`), separate
+from `[pane_menu]` — so it can offer just what makes sense there and none of the
+row actions:
+
+```toml
+[bookmarks]
+file = "bookmarks.toml"
+menu = [
+    "New Bookmark",
+    "New Bookmark Folder",
+
+    "---",
+    "Open Folder...",
+    "Filter...",
+    "Split View",
+
+    "---",
+    { action = "Back", shortcut = "Alt+Left" },
+    { action = "Forward", shortcut = "Alt+Right" },
+
+    "---",
+    "Collapse",
+    { action = "Close Pane", shortcut = "Ctrl+w" },
+]
+context = [
+    "---",
+    "Edit Bookmark",
+    "Delete Bookmark",
+]
+blank = [
+    "New Bookmark",
+    "New Bookmark Folder",
+]
+```
+
+A bookmark's right-click menu is built from two sources: the context menu the
+bookmarked directory would get in the tree (reduced to actions that work on a
+bare path — Open, split/opposite panel, Open With, Duplicate, Create Link, Copy
+Path/Relative Path, Properties, Trash/Delete, Add Bookmark, and any custom
+commands), followed by the `[bookmarks] context` extras. Put bookmark-specific
+items in `context`; `Edit Bookmark` and `Delete Bookmark` are the builtins for
+renaming and removing the entry. `blank` is the menu for right-clicking empty
+space below the entries (by default the two **New...** actions). All three lists
+use the same item syntax as everything else.
+
+`startup = "bookmarks"` (the shipped default) opens a single pane on this view.
+Launching with a path, or with `startup = "home"` / `"last"` / a fixed path,
+opens a directory pane directly.
 
 ## Pane menu (hamburger)
 
@@ -388,6 +559,7 @@ items = [
     { action = "Reverse Sort Order", shortcut = "Ctrl+Shift+r" },
     "---",
     "Collapse",
+    { action = "Bookmarks", shortcut = "Ctrl+b" },
     { action = "Close Pane", shortcut = "Ctrl+w" },
 ]
 ```
@@ -397,6 +569,7 @@ Pane-menu actions:
 - `"Open Folder..."` / `"Filter..."` / `"Split View"` / `"Collapse"` / `"Close Pane"` — the toolbar's own actions.
 - `"Back"` / `"Forward"` / `"Up One Level"` — navigation. Each pane keeps its own visit history; `Up One Level` opens the enclosing folder (a no-op at the filesystem root).
 - `"Toggle Hidden Files"`, `"Sort by Name/Size/Modified/Type"`, `"Reverse Sort Order"` — view actions applied to every open directory in the pane for the current session. The `[tree]` keys make them permanent.
+- `"Bookmarks"` — replace this pane's view with the [bookmarks](#bookmarks) list.
 
 Shortcuts on pane-menu items fire anywhere in the pane — the tree, the path
 entry, the filter bar, or with nothing focused — so a pane action like
@@ -405,13 +578,31 @@ items) still require the tree to have focus.
 
 ## Styling
 
-`~/.config/tree-space/main.css` (written on first launch) defines the panel's
-look. Edit it and restart to restyle the tree, menus, property dialogs, badges,
-and everything else. The window class names (`tree-row`, `tree-menu`,
-`hamburger-menu`, `props`, ...) are what the shipped file targets, so you can
-adapt its rules directly.
+The panel is styled by a stylesheet, chosen with `[theme] mode`:
 
-`tree.font_size` from the config is applied **after** your stylesheet, so it
+```toml
+[theme]
+mode = "custom"     # load main.css (the default)
+# mode = "system"   # follow the desktop theme instead
+system = "omarchy"  # which desktop theme, when mode = "system"
+```
+
+**`custom`** reads `~/.config/tree-space/main.css` (written on first launch).
+Edit it and restart to restyle the tree, menus, property dialogs, badges, and
+everything else. The window class names (`tree-row`, `tree-menu`,
+`hamburger-menu`, `props`, ...) are what the shipped file targets, so you can
+adapt its rules directly. The file's palette is a block of `@define-color`s at
+the top; everything after the structure marker is the theme-independent CSS.
+
+**`system`** ignores `main.css` entirely — it is neither read nor created — and
+derives the palette and font from the desktop theme. Today the only provider is
+`system = "omarchy"`, which reads the active Omarchy theme
+(`~/.local/state/omarchy/current/theme/colors.toml`) and Omarchy's monospace
+font. Switch Omarchy themes and relaunch tree-space to pick up the new colors.
+If no Omarchy theme can be read, the shipped default palette is used and a note
+is shown in the status bar.
+
+`tree.font_size` from the config is applied **after** the stylesheet, so it
 always wins over any font size you set for the row and menu fonts.
 
 ## Startup
@@ -419,12 +610,14 @@ always wins over any font size you set for the row and menu fonts.
 Where the panel opens when launched with **no path argument**:
 
 ```toml
-startup = "home"                      # always open the home directory (default)
+startup = "bookmarks"                 # open a bookmarks pane (the default)
+# startup = "home"                    # always open the home directory
 # startup = "last"                    # reopen the last-used directory
 # startup = { path = "/some/dir" }    # always open a fixed directory (~ = $HOME)
 ```
 
-An explicit path argument on the command line always takes precedence.
+A directory startup, or an explicit path argument on the command line, opens a
+directory pane directly.
 
 ## Selecting rows
 
@@ -468,11 +661,23 @@ Directories may also be passed via `TREE_SPACE_DIRS` as a colon-separated list.
 
 ## Using tree-space as your file manager
 
-tree-space registers itself as an XDG handler for folders (`inode/directory`) and
-`file://` URIs, so `xdg-open <folder>`, portal "Show in folder" requests, and
-double-clicking a folder elsewhere can all route here. The `.desktop` entry
-(`resources/tree-space.desktop`) runs `tree-space --select %u`, which reveals the
-path in the running panel or starts one.
+tree-space registers itself as an XDG handler for folders (`inode/directory`)
+and `file://` URIs, so `xdg-open <folder>` and double-clicking a folder
+elsewhere route here. The `.desktop` entry (`resources/tree-space.desktop`)
+runs `ts --select %u`, which reveals the path in the running panel or starts
+one.
+
+A few integrations ignore the MIME database and ask the desktop's file manager
+over D-Bus instead. The portal's "Show in folder"
+(`org.freedesktop.portal.OpenURI.OpenDirectory`, used by Electron apps such as
+VS Code's "Open Containing Folder" and by file choosers) is defined to call
+`org.freedesktop.FileManager1.ShowItems`, falling back to the MIME default only
+when nothing provides that service. The running panel claims that name on the
+session bus and answers `ShowItems`, `ShowFolders` and `ShowItemProperties` by
+revealing the paths, so those requests land here too;
+`resources/org.freedesktop.FileManager1.service` covers the cold-start case
+where a call arrives before the panel is up. Without it, whichever other file
+manager ships that service (usually Nautilus) would handle the request.
 
 Because tree-space is a docked panel rather than a normal window, "opening" a
 folder shows and focuses the panel instead of spawning a window. The
@@ -483,11 +688,14 @@ file is funnelled through the same socket.
 ## Resizing the panel
 
 The panel is a layer-shell surface, so the compositor's own window resizing does
-not apply. The left and right docks are sized independently:
+not apply. Its surfaces (the panel and its dialogs) carry the layer-shell
+namespace `tree-space`, so compositor rules can target them by name rather than
+the library's `gtk4-layer-shell` default. The left and right docks are sized
+independently:
 
 - **Super + right-drag** anywhere on a dock resizes it live (a left dock grows as you drag right; a right dock mirrors that). A plain right-drag without the modifier still opens the row menu.
 - **Super + plus / Super + minus** step that dock's width.
-- **`tree-space --width +-N`** changes a dock's width from outside; `--side` picks which.
+- **`ts --width +-N`** changes a dock's width from outside; `--side` picks which.
 
 Each dock's width is remembered across launches. `[panel] width` is only the
 initial default.
@@ -497,11 +705,64 @@ initial default.
 > example in `~/.config/hypr/bindings.lua`:
 >
 > ```lua
-> o.bind("SUPER + Minus", "Narrow tree-space", "tree-space --width -24")
-> o.bind("SUPER + Equal", "Widen tree-space",  "tree-space --width +24")
+> o.bind("SUPER + Minus", "Narrow tree-space", "ts --width -24")
+> o.bind("SUPER + Equal", "Widen tree-space",  "ts --width +24")
 > ```
 >
 > Those target the primary dock; add `--side right` for the right dock.
+
+## Moving a pane
+
+A pane can be moved to the other side of its screen, or onto another monitor,
+without losing its directory or history: drag the grip at the right end of its
+top bar to the edge of the target screen. While dragging, the pane is outlined
+and the status line names the destination ("Drop to move the pane to the right
+panel on DP-1"); release over the target side to move it, or anywhere outside a
+monitor to cancel.
+
+- Moving the only pane off the primary side hides that dock; the pane reappears
+  in a dock on the target side, created there if it does not exist yet.
+- Moving one of several split panes leaves the others where they are.
+- Docks are keyed by side *and* monitor, so the left and right docks on one
+  screen, and the same side across two screens, are all independent.
+
+## Workspaces
+
+Under Hyprland each pane is scoped to the workspace it was opened on: the panel
+shows only the panes of the active workspace, and a dock with no pane on the
+active workspace stays hidden. (Without Hyprland's IPC there is a single empty
+workspace name, so every pane is always shown, as before.) Switching workspaces
+never moves the panel — it just swaps which panes are visible.
+
+Show/hide is per workspace too: `ts --hidden` (and the plain `ts` toggle) affect
+only the workspace you run them on, so hiding the panel here leaves it visible
+wherever it was already shown elsewhere.
+
+The workspace actions move *only the active pane*, never the panel:
+
+- `Move to Previous Workspace` / `Move to Next Workspace` send the active pane
+  to the neighbouring workspace. A numeric workspace steps by number (`1`→`2`,
+  created when you switch there); a named/special one steps through the
+  workspaces Hyprland currently reports, wrapping around.
+- `Move to Workspace` sends it to a specific workspace, named in the item's
+  `workspace` field.
+
+They are ordinary `[pane_menu]` items, so bind keys to them like any other pane
+action. The pane disappears from the current workspace and appears on the
+target:
+
+```toml
+[pane_menu]
+items = [
+    # … existing items …
+    { action = "Move to Previous Workspace", shortcut = "Ctrl+Alt+Left", hidden = true },
+    { action = "Move to Next Workspace",     shortcut = "Ctrl+Alt+Right", hidden = true },
+    { action = "Move to Workspace", workspace = "2", shortcut = "Ctrl+Alt+2", hidden = true },
+]
+```
+
+The shipped default includes those (`hidden = true`, so they only contribute
+shortcuts). Workspace names are Hyprland's, including `"special:scratch"`.
 
 ## Keyboard focus
 
@@ -510,8 +771,11 @@ focus when it is mapped and while the pointer moves over it, and drops the claim
 when the pointer leaves. Dropping the claim on pointer-leave matters on
 Hyprland: a layer surface that keeps focus does not update the compositor's
 notion of the focused window, which makes clicking the previously-focused window
-a no-op. The launch pane and every newly split pane are handed focus
-automatically, so a fresh panel or split is usable without a click.
+a no-op. When a surface is mapped the panel also focuses its current row — the
+tree's cursor row, or the first bookmark in the bookmarks view — so a freshly
+launched panel (or split) takes arrow keys, Enter, and hotkeys immediately,
+with no click needed. Focus follows body switches too: opening a bookmark hands
+the keyboard to the tree, and toggling back to bookmarks hands it to the list.
 
 ## Building
 
