@@ -2606,9 +2606,11 @@ fn build_audio_player(player: &Rc<AudioPlayer>, margin_start: i32) -> (gtk::Box,
 /// Widest a table cell is allowed to grow before it ellipsizes.
 const PREVIEW_CELL_CHARS: i32 = 12;
 
-/// Tallest the inline text box grows before it scrolls internally, in pixels
-/// (roughly 18 rows).
-const PREVIEW_TEXT_MAX_HEIGHT: i32 = 260;
+/// Most lines the inline text box shows before it scrolls internally. Sizing by
+/// line count (rather than `propagate-natural-height`) avoids the wrapped-text
+/// measurement GTK reports at the natural width, which made the box far shorter
+/// than the lines it actually held.
+const PREVIEW_TEXT_MAX_LINES: usize = 18;
 
 /// Append a scrollable, selectable monospaced text view for a document (or a
 /// structured file's source). The view wraps long lines and is syntax
@@ -2638,14 +2640,19 @@ fn append_text_lines(container: &gtk::Box, margin_start: i32, lines: &DocumentLi
     buffer.set_text(&text);
     apply_syntax(&buffer, &lines.syntax);
 
-    // A small box that scrolls internally rather than growing the row: it is as
-    // tall as its content up to the cap, then scrolls. Nested inside the tree's
-    // scroller, GTK hands wheel events to the inner view until it hits an edge.
+    // A small box that scrolls internally rather than growing the row. Its
+    // height is computed from the number of lines (up to the cap) so it always
+    // shows a readable chunk; `propagate-natural-height` is left off because it
+    // measures wrapped text at its natural width and under-reports the height.
+    let line_height = view.create_pango_layout(Some("Mg")).pixel_size().1.max(1);
+    let shown = lines.lines.len().clamp(1, PREVIEW_TEXT_MAX_LINES) as i32;
+    let height = line_height * shown + 6; // the view's 3px top and bottom margins
     let scrolled = gtk::ScrolledWindow::new();
     scrolled.add_css_class("tree-preview-scroll");
     scrolled.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
-    scrolled.set_propagate_natural_height(true);
-    scrolled.set_max_content_height(PREVIEW_TEXT_MAX_HEIGHT);
+    scrolled.set_min_content_height(height);
+    scrolled.set_max_content_height(height);
+    scrolled.set_propagate_natural_height(false);
     scrolled.set_child(Some(&view));
     scrolled.set_margin_start(margin_start);
     scrolled.set_margin_bottom(6);
