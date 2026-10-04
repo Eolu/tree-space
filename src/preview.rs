@@ -398,7 +398,39 @@ fn read_prefix(path: &Path, max: u64) -> Option<Vec<u8>> {
 
 fn read_text(path: &Path, max: u64) -> Option<String> {
     let bytes = read_prefix(path, max)?;
-    Some(String::from_utf8_lossy(&bytes).into_owned())
+    Some(decode_text(&bytes))
+}
+
+/// Decode preview bytes as text: honour a UTF-16 BOM (common in Windows
+/// `desktop.ini` files), otherwise treat the bytes as UTF-8. NUL bytes are
+/// always dropped — GTK string APIs panic on interior NULs, so a binary or
+/// UTF-16 file opened as text must never take the panel down.
+fn decode_text(bytes: &[u8]) -> String {
+    let decoded = if bytes.starts_with(&[0xFF, 0xFE]) {
+        utf16_to_string(&bytes[2..], true)
+    } else if bytes.starts_with(&[0xFE, 0xFF]) {
+        utf16_to_string(&bytes[2..], false)
+    } else {
+        String::from_utf8_lossy(bytes).into_owned()
+    };
+    decoded.replace('\0', "")
+}
+
+/// Decode UTF-16 code units (the byte pairs after a BOM) into a string.
+fn utf16_to_string(bytes: &[u8], little_endian: bool) -> String {
+    let units: Vec<u16> = bytes
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| {
+            if little_endian {
+                u16::from_le_bytes(*pair)
+            } else {
+                u16::from_be_bytes(*pair)
+            }
+        })
+        .collect();
+    String::from_utf16_lossy(&units)
 }
 
 /// Split `text` into at most `max_lines` display lines, highlighting the result
@@ -742,6 +774,29 @@ mod tests {
             panic!("expected text lines");
         };
         assert!(lines.syntax.is_empty());
+    }
+
+    #[test]
+    fn decode_text_honours_utf16_bom_and_drops_nuls() {
+        // UTF-8 passes through unchanged.
+        assert_eq!(decode_text(b"plain text\n"), "plain text\n");
+
+        // UTF-16LE with a BOM (a Windows desktop.ini): decoded, not NUL-riddled.
+        let mut le = vec![0xFF, 0xFE];
+        for unit in "[.ShellClassInfo]\r\n".encode_utf16() {
+            le.extend_from_slice(&unit.to_le_bytes());
+        }
+        assert_eq!(decode_text(&le), "[.ShellClassInfo]\r\n");
+
+        // UTF-16BE with a BOM.
+        let mut be = vec![0xFE, 0xFF];
+        for unit in "hé".encode_utf16() {
+            be.extend_from_slice(&unit.to_be_bytes());
+        }
+        assert_eq!(decode_text(&be), "hé");
+
+        // A stray NUL in otherwise-UTF-8 bytes is dropped (GTK would panic).
+        assert_eq!(decode_text(b"a\0b"), "ab");
     }
 
     #[test]
