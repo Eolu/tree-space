@@ -19,8 +19,8 @@ provides=('tree-space')
 conflicts=('tree-space-git')
 install=tree-space.install
 source=("${pkgname}-${pkgver}.tar.gz::https://github.com/Eolu/tree-space/archive/refs/tags/v${pkgver}.tar.gz")
-# Replace with the real hash once the tag is published: run `updpkgsums`.
-sha256sums=('SKIP')
+# Refresh with `updpkgsums` whenever pkgver changes.
+sha256sums=('80180a61710d527ab346789db336aacee74aa4aaf9a69b40bf8f5b88380e45dc')
 
 prepare() {
     cd "${srcdir}/${pkgname}-${pkgver}"
