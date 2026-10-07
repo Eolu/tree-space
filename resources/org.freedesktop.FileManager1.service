@@ -5,4 +5,4 @@ Name=org.freedesktop.FileManager1
 # running panel owns the name itself (`src/freedesktop.rs`), so this is the
 # cold-start path. Installing it under ~/.local/share/dbus-1/services shadows
 # the system file Nautilus ships.
-Exec=ts
+Exec=tree-space

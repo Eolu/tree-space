@@ -66,6 +66,62 @@ the main config. See [Context menus](#context-menus).
 > normal, freely floating window instead and prints a one-line notice on
 > startup. Everything else works; it just does not stick to the screen edge.
 
+## Installation
+
+tree-space is Wayland-only and needs a compositor that implements
+`wlr-layer-shell` (Hyprland, sway, river, niri, and other wlroots-based
+compositors). On a compositor that does not provide it (GNOME/Mutter,
+KDE/KWin) the panel still runs, but as a floating window rather than a dock.
+
+### Arch / Omarchy (AUR)
+
+```bash
+yay -S tree-space       # builds from source
+yay -S tree-space-bin   # prebuilt binary
+```
+
+The package installs `/usr/bin/tree-space`, the desktop entry and the icon. It
+does **not** change your default file manager; see
+[Making it your default file manager](#making-it-your-default-file-manager).
+
+### cargo install
+
+```bash
+cargo install tree-space                          # inline audio player (GStreamer)
+cargo install tree-space --no-default-features    # no GStreamer dependency
+```
+
+This installs both `ts` (short, for interactive use) and `tree-space` (used by
+desktop entries and packaging). The system libraries below must be present.
+
+### From source
+
+```bash
+git clone https://github.com/Eolu/tree-space
+cd tree-space
+./install.sh              # build + install to ~/.local
+```
+
+`./install.sh` builds the release binary and installs it, the desktop entry,
+the icon and the folder/file MIME handler under `~/.local`. `./uninstall.sh`
+undoes it. Run `./install.sh --help` for the options (`--prefix DIR`,
+`--no-build`, `--no-desktop`); `--no-desktop` installs the binary only.
+
+### Build dependencies
+
+Rust **1.88 or newer** (edition 2024), plus the GTK4,
+`gtk4-layer-shell` and (optionally) GStreamer development packages:
+
+| Distribution | Packages |
+| --- | --- |
+| Arch / Omarchy | `gtk4 gtk4-layer-shell gstreamer gst-plugins-base gst-plugins-good pkgconf` |
+| Debian / Ubuntu | `libgtk-4-dev libgtk4-layer-shell-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev pkg-config` |
+| Fedora | `gtk4-devel gtk4-layer-shell-devel gstreamer1-devel gstreamer1-plugins-base-devel pkgconf` |
+
+The inline audio player needs GStreamer; build with `--no-default-features` to
+drop that dependency (audio files then have no inline player). See
+[Building](#building).
+
 ## Usage
 
 ```
@@ -74,7 +130,8 @@ ts [OPTIONS] [PATH ...]
 
 Run with no arguments it starts the panel (or toggles an already-running one).
 Passing one or more paths opens a pane for each — a directory opens itself, a
-file opens its containing folder and selects the file.
+file opens its containing folder and selects the file. The examples below use
+`ts`, the short alias for the `tree-space` binary; both are identical.
 
 | Argument | Meaning |
 | --- | --- |
@@ -84,6 +141,7 @@ file opens its containing folder and selects the file.
 | `-H, --hidden` | Launch (or keep) the panel hidden. Never shows it. |
 | `-w, --width <W>` | Resize a dock: `420` is an absolute width in px, `+40`/`-40` is a delta. `--side` picks the dock. Never changes visibility. |
 | `-k, --key <ACCEL>` | Run a configured shortcut (`Ctrl+c`, `F2`, `Alt+Left`, …) against the active pane as if the key were pressed. Needs no keyboard focus, so an external button deck can drive the panel. Never changes visibility. |
+| `-V, --version` | Print the version and exit. |
 | `-h, --help` | Print the usage message. |
 
 ```
@@ -457,7 +515,7 @@ folder:
 
 ```toml
 bookmarks = [
-    { name = "eolu", path = "/home/eolu" },
+    { name = "Home", path = "/home/user" },
     { name = "Work", expanded = true, items = [
         { name = "Main repo", path = "/srv/work/repo" },
         { name = "Archived", items = [
@@ -661,11 +719,36 @@ Directories may also be passed via `TREE_SPACE_DIRS` as a colon-separated list.
 
 ## Using tree-space as your file manager
 
+### Making it your default file manager
+
+The AUR package installs the application entry and icon but leaves your
+defaults alone. To route folders and `file://` links to tree-space for your
+user:
+
+```bash
+xdg-mime default org.tree_space.panel.desktop inode/directory
+xdg-mime default org.tree_space.panel.desktop x-scheme-handler/file
+```
+
+`./install.sh` (from source) does this for you. To also answer the
+`org.freedesktop.FileManager1` D-Bus calls that portals and Electron apps make
+(the cold-start path below), install the service file into your session bus:
+
+```bash
+install -Dm644 resources/org.freedesktop.FileManager1.service \
+    ~/.local/share/dbus-1/services/org.freedesktop.FileManager1.service
+```
+
+This is user-scoped on purpose: a system-wide copy under
+`/usr/share/dbus-1/services/` would shadow Nautilus for every user and collide
+with the file Nautilus ships. `./uninstall.sh` removes the service and hands
+folder handling back to Nautilus.
+
 tree-space registers itself as an XDG handler for folders (`inode/directory`)
 and `file://` URIs, so `xdg-open <folder>` and double-clicking a folder
-elsewhere route here. The `.desktop` entry (`resources/tree-space.desktop`)
-runs `ts --select %u`, which reveals the path in the running panel or starts
-one.
+elsewhere route here. The `.desktop` entry
+(`resources/org.tree_space.panel.desktop`) runs `tree-space --select %u`, which
+reveals the path in the running panel or starts one.
 
 A few integrations ignore the MIME database and ask the desktop's file manager
 over D-Bus instead. The portal's "Show in folder"
@@ -780,11 +863,14 @@ the keyboard to the tree, and toggling back to bookmarks hands it to the list.
 ## Building
 
 ```
-cargo build --release
+cargo build --release --locked
 ```
 
-Wayland-only; there is no X11 support. The inline audio player is an optional
-feature (on by default); build without the `gstreamer` binding dependency with:
+Requires Rust 1.88+ and the system development packages listed under
+[Build dependencies](#build-dependencies). This produces two identical binaries,
+`ts` and `tree-space`. Wayland-only; there is no X11 support. The inline audio
+player is an optional feature (on by default); build without the `gstreamer`
+binding dependency with:
 
 ```
 cargo build --release --no-default-features
@@ -792,4 +878,4 @@ cargo build --release --no-default-features
 
 ## License
 
-MIT
+MIT — see [LICENSE](LICENSE).

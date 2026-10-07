@@ -21,6 +21,7 @@
 //! tested headlessly with `cargo test`.
 
 pub mod config;
+pub mod entry;
 pub mod theme;
 pub mod highlight;
 pub mod fs;

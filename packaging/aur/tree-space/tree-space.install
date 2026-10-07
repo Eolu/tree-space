@@ -1,0 +1,15 @@
+post_install() {
+    update-desktop-database -q
+    gtk-update-icon-cache -qtf usr/share/icons/hicolor &>/dev/null || true
+    echo "tree-space installed. Start it with: tree-space"
+    echo "To make it your default file manager, see /usr/share/tree-space/README.md"
+}
+
+post_upgrade() {
+    post_install
+}
+
+post_remove() {
+    update-desktop-database -q
+    gtk-update-icon-cache -qtf usr/share/icons/hicolor &>/dev/null || true
+}

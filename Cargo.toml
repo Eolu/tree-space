@@ -1,14 +1,34 @@
 [package]
 name = "tree-space"
-version = "0.1.9"
+version = "0.2.0"
 edition = "2024"
+# edition 2024 requires Rust 1.85; slice::as_chunks (src/preview.rs) needs 1.88.
+rust-version = "1.88"
 description = "A dockable, keyboard-first file manager panel for Wayland/Hyprland"
 license = "MIT"
+authors = ["Eolu"]
 repository = "https://github.com/Eolu/tree-space/"
+homepage = "https://github.com/Eolu/tree-space/"
+readme = "README.md"
+keywords = ["file-manager", "wayland", "hyprland", "gtk4", "panel"]
+categories = ["command-line-utilities", "filesystem", "gui"]
+# The screenshots/GIFs under docs/ are for the README (crates.io rewrites those
+# relative links to the GitHub repo), not needed to build: keep them out of the
+# published crate so `cargo install` does not download ~800 KiB of images.
+exclude = ["docs/"]
+
+# Two names for one entry point. `ts` is the short interactive name; packaging
+# installs `tree-space` because /usr/bin/ts belongs to moreutils on Arch.
+# Auto-discovery is disabled so the two targets are declared explicitly.
+autobins = false
 
 [[bin]]
 name = "ts"
 path = "src/main.rs"
+
+[[bin]]
+name = "tree-space"
+path = "src/bin/tree-space.rs"
 
 [dependencies]
 # Elm-style GTK4 framework. Re-exports gtk/gdk/gio/glib as relm4::gtk::*

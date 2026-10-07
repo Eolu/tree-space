@@ -1,0 +1,63 @@
+# Maintainer: Eolu
+pkgname=tree-space
+pkgver=0.2.0
+pkgrel=1
+pkgdesc="Dockable, keyboard-first file manager panel for Wayland/Hyprland"
+arch=('x86_64' 'aarch64')
+url="https://github.com/Eolu/tree-space"
+license=('MIT')
+depends=('gcc-libs' 'glibc' 'gtk4' 'gtk4-layer-shell' 'gstreamer' 'gst-plugins-base')
+makedepends=('cargo' 'pkgconf' 'rust')
+optdepends=(
+    'gst-plugins-good: common audio and video codecs'
+    'gst-plugins-bad: additional audio and video codecs'
+    'gst-libav: FFmpeg-backed codecs'
+    'xdg-utils: xdg-mime / xdg-open integration'
+    'desktop-file-utils: update-desktop-database install hook'
+)
+provides=('tree-space')
+conflicts=('tree-space-git')
+install=tree-space.install
+source=("${pkgname}-${pkgver}.tar.gz::https://github.com/Eolu/tree-space/archive/refs/tags/v${pkgver}.tar.gz")
+# Replace with the real hash once the tag is published: run `updpkgsums`.
+sha256sums=('SKIP')
+
+prepare() {
+    cd "${srcdir}/${pkgname}-${pkgver}"
+    export CARGO_HOME="${srcdir}/cargo-home"
+    cargo fetch --locked
+}
+
+build() {
+    cd "${srcdir}/${pkgname}-${pkgver}"
+    export CARGO_HOME="${srcdir}/cargo-home"
+    # The inline audio player links GStreamer (a runtime dependency above).
+    # For a GStreamer-free build, add --no-default-features and drop the
+    # gstreamer/gst-plugins-base depends.
+    cargo build --release --locked --offline
+}
+
+package() {
+    cd "${srcdir}/${pkgname}-${pkgver}"
+
+    # Note: /usr/bin/ts is intentionally not installed; it belongs to moreutils.
+    install -Dm755 target/release/tree-space "${pkgdir}/usr/bin/tree-space"
+
+    install -Dm644 resources/org.tree_space.panel.desktop \
+        "${pkgdir}/usr/share/applications/org.tree_space.panel.desktop"
+    install -Dm644 resources/icons/hicolor/scalable/apps/org.tree_space.panel.svg \
+        "${pkgdir}/usr/share/icons/hicolor/scalable/apps/org.tree_space.panel.svg"
+
+    # Shipped dormant: not installed under dbus-1/services, so it never shadows
+    # another file manager. See /usr/share/tree-space/README.md to opt in.
+    install -Dm644 resources/org.freedesktop.FileManager1.service \
+        "${pkgdir}/usr/share/tree-space/org.freedesktop.FileManager1.service"
+    install -Dm644 default-config.toml \
+        "${pkgdir}/usr/share/tree-space/default-config.toml"
+    install -Dm644 packaging/aur/README.md \
+        "${pkgdir}/usr/share/tree-space/README.md"
+
+    install -Dm644 LICENSE "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+    install -Dm644 README.md "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+    install -Dm644 CHANGELOG.md "${pkgdir}/usr/share/doc/${pkgname}/CHANGELOG.md"
+}
