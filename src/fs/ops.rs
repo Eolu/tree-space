@@ -442,7 +442,10 @@ mod tests {
         let ops = FileOps::new();
         let p = ops.create_file(dir.path(), "hi.txt").unwrap();
         assert_eq!(fs::read_to_string(&p).unwrap(), "");
-        assert!(matches!(ops.create_file(dir.path(), "hi.txt"), Err(OpsError::Conflict(_))));
+        assert!(matches!(
+            ops.create_file(dir.path(), "hi.txt"),
+            Err(OpsError::Conflict(_))
+        ));
     }
 
     #[test]
@@ -451,7 +454,10 @@ mod tests {
         let ops = FileOps::new();
         let p = ops.create_dir(dir.path(), "sub").unwrap();
         assert!(p.is_dir());
-        assert!(matches!(ops.create_dir(dir.path(), "sub"), Err(OpsError::Conflict(_))));
+        assert!(matches!(
+            ops.create_dir(dir.path(), "sub"),
+            Err(OpsError::Conflict(_))
+        ));
     }
 
     #[test]
@@ -522,7 +528,10 @@ mod tests {
         assert!(out.join("sub/child.txt").is_file());
         assert_eq!(fs::read_to_string(out.join("sub/child.txt")).unwrap(), "c");
         #[cfg(unix)]
-        assert_eq!(fs::read_link(out.join("link")).unwrap(), Path::new("root.txt"));
+        assert_eq!(
+            fs::read_link(out.join("link")).unwrap(),
+            Path::new("root.txt")
+        );
     }
 
     #[test]
@@ -541,11 +550,9 @@ mod tests {
         // A rename that answers EXDEV must fall back to copy + remove.
         let fallback_src = write(src.path(), "x.txt", "pay");
         let fallback_dst = dst.path().join("x.txt");
-        ops.rename_with_fallback(
-            &fallback_src,
-            &fallback_dst,
-            |_from, _to| Err(io::Error::from_raw_os_error(EXDEV)),
-        )
+        ops.rename_with_fallback(&fallback_src, &fallback_dst, |_from, _to| {
+            Err(io::Error::from_raw_os_error(EXDEV))
+        })
         .unwrap();
         assert!(!fallback_src.exists());
         assert_eq!(fs::read_to_string(&fallback_dst).unwrap(), "pay");
@@ -593,15 +600,33 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let ops = FileOps::new();
         let missing = dir.path().join("nope");
-        assert!(matches!(ops.copy(&missing, dir.path()), Err(OpsError::NotFound(_))));
-        assert!(matches!(ops.move_(&missing, dir.path()), Err(OpsError::NotFound(_))));
+        assert!(matches!(
+            ops.copy(&missing, dir.path()),
+            Err(OpsError::NotFound(_))
+        ));
+        assert!(matches!(
+            ops.move_(&missing, dir.path()),
+            Err(OpsError::NotFound(_))
+        ));
     }
 
     #[test]
     fn split_extension_handles_dotfiles() {
-        assert_eq!(split_extension("photo.png"), ("photo".to_owned(), ".png".to_owned()));
-        assert_eq!(split_extension(".bashrc"), (".bashrc".to_owned(), String::new()));
-        assert_eq!(split_extension("noext"), ("noext".to_owned(), String::new()));
-        assert_eq!(split_extension("a.tar.gz"), ("a.tar".to_owned(), ".gz".to_owned()));
+        assert_eq!(
+            split_extension("photo.png"),
+            ("photo".to_owned(), ".png".to_owned())
+        );
+        assert_eq!(
+            split_extension(".bashrc"),
+            (".bashrc".to_owned(), String::new())
+        );
+        assert_eq!(
+            split_extension("noext"),
+            ("noext".to_owned(), String::new())
+        );
+        assert_eq!(
+            split_extension("a.tar.gz"),
+            ("a.tar".to_owned(), ".gz".to_owned())
+        );
     }
 }

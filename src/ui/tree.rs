@@ -23,13 +23,13 @@ use std::time::{Duration, SystemTime};
 
 use crate::audio::AudioPlayer;
 use crate::config::{
-    BuiltinAction, ContextAction, ContextMenu, PanelConfig, PanelSide, ShortcutTarget,
-    TreeConfig, action_command,
+    BuiltinAction, ContextAction, ContextMenu, PanelConfig, PanelSide, ShortcutTarget, TreeConfig,
+    action_command,
 };
 use crate::fs::meta::format_size;
 use crate::fs::model::{Change, SortKey, StdDirSource, TreeModel, VisibleRow};
 use crate::fs::ops::FileOps;
-use crate::fs::watcher::{RecursiveMode, RecommendedWatcher, Watcher, spawn as spawn_watcher};
+use crate::fs::watcher::{RecommendedWatcher, RecursiveMode, Watcher, spawn as spawn_watcher};
 use crate::highlight::{self, Span, TokenClass};
 use crate::preview::{
     self, ArchiveData, DocumentData, DocumentLines, ParseStatus, PreviewKind, TableData,
@@ -140,7 +140,11 @@ fn resolve_drop(target: &Path, sources: Vec<PathBuf>, copy: bool) -> DropPlan {
     if sources.iter().any(|src| target.starts_with(src)) {
         return DropPlan::Reject("Cannot move a folder into itself".to_string());
     }
-    if copy { DropPlan::Copy(sources) } else { DropPlan::Move(sources) }
+    if copy {
+        DropPlan::Copy(sources)
+    } else {
+        DropPlan::Move(sources)
+    }
 }
 
 /// The inclusive index range between two rows, regardless of order. Pure so the
@@ -195,10 +199,7 @@ fn provider_for_paths(paths: &[PathBuf]) -> gdk::ContentProvider {
 /// (`gtk-dnd-drag-threshold`, 8px by default); a cast guards against a
 /// nonsensical negative value.
 pub(crate) fn past_drag_threshold(row: &gtk::Widget, start: (f64, f64), now: (f64, f64)) -> bool {
-    let threshold = row
-        .settings()
-        .gtk_dnd_drag_threshold()
-        .max(1) as f64;
+    let threshold = row.settings().gtk_dnd_drag_threshold().max(1) as f64;
     (now.0 - start.0).abs() > threshold || (now.1 - start.1).abs() > threshold
 }
 
@@ -358,12 +359,19 @@ pub enum TreeMsg {
     /// immediately on every press. For files, a second quick click opens the
     /// file (double-click detection happens in the handler, since the click
     /// gesture is rebuilt with the rows).
-    RowPress { path: PathBuf, is_dir: bool, ctrl: bool, shift: bool },
+    RowPress {
+        path: PathBuf,
+        is_dir: bool,
+        ctrl: bool,
+        shift: bool,
+    },
     /// A left button released on a row. Used only to finish a click whose
     /// selection collapse was deferred at press time (see
     /// [`Self::RowPress`] and the tree's `pending_click`): if no drag started,
     /// the deferred press is applied now.
-    RowRelease { path: PathBuf },
+    RowRelease {
+        path: PathBuf,
+    },
     /// A row drag has begun (`DragSource::drag-begin`). Marks the in-flight
     /// drag so a click's release does not treat it as a plain click.
     DragStarted,
@@ -377,7 +385,10 @@ pub enum TreeMsg {
     Menu(PathBuf),
     /// Right-click on the blank area below the rows: open the context menu for
     /// the currently open directory (the tree root), anchored at the click.
-    MenuAt { x: f64, y: f64 },
+    MenuAt {
+        x: f64,
+        y: f64,
+    },
     RenameAt(PathBuf),
     /// Trash a single, explicit path (used by the context menu, which always
     /// targets the row it was opened on regardless of the current selection).
@@ -393,7 +404,10 @@ pub enum TreeMsg {
     ConfirmPermanentDelete(Vec<PathBuf>),
     /// Run a configured custom command against `path` (via `{path}`/`{dir}`
     /// substitution in the config template).
-    RunCommand { command: String, path: PathBuf },
+    RunCommand {
+        command: String,
+        path: PathBuf,
+    },
     /// Open the row's path as a brand-new split pane (directories only).
     OpenSplit(PathBuf),
     /// Open the directory as a pane in the *opposite* side's dock.
@@ -417,17 +431,25 @@ pub enum TreeMsg {
     CopyRelativePaths(Vec<PathBuf>),
     /// Run a configured custom command once per path, in visual top-to-bottom
     /// order (multi-select form of [`Self::RunCommand`]).
-    RunCommandEach { command: String, paths: Vec<PathBuf> },
+    RunCommandEach {
+        command: String,
+        paths: Vec<PathBuf>,
+    },
     /// Rename `path` to the bare file name `name` (used by the Properties
     /// dialog's editable Name field).
-    RenameTo { path: PathBuf, name: String },
+    RenameTo {
+        path: PathBuf,
+        name: String,
+    },
     /// Toggle the inline thumbnail preview for the row (an image, or every
     /// image inside a directory).
     ToggleThumbnail(PathBuf),
     /// Clicked an inline thumbnail: play/pause a video, or animate a GIF.
     ToggleThumbnailPlay(PathBuf),
     /// A configured shortcut fired against the row under the keyboard cursor.
-    RunShortcut { target: ShortcutTarget },
+    RunShortcut {
+        target: ShortcutTarget,
+    },
     /// Run a configured shortcut by accelerator string (e.g. `Ctrl+c`, `Down`),
     /// as if the key were pressed. Used by the IPC `--key` command so external
     /// button decks can drive the tree without it holding keyboard focus.
@@ -446,6 +468,9 @@ pub enum TreeMsg {
     AddBookmark(PathBuf),
 
     RenameCommit,
+    /// The rename entry with the given generation lost keyboard focus. Commits
+    /// only if that entry is still the current one (see `Tree::rename_gen`).
+    RenameFocusLost(u64),
     RenameCancel,
 
     Copy,
@@ -453,7 +478,11 @@ pub enum TreeMsg {
     Paste,
     /// Paths decoded from the system clipboard, delivered asynchronously by
     /// [`read_clipboard_files`] after a Paste with no internal clipboard.
-    PastePaths(Vec<PathBuf>),
+    /// `cut` is set when the payload carried a cut (`move`) verb.
+    PastePaths {
+        paths: Vec<PathBuf>,
+        cut: bool,
+    },
     NewFile,
     NewFolder,
 
@@ -472,12 +501,22 @@ pub enum TreeMsg {
     /// it) onto directory `target`. Copies happen immediately; moves are
     /// confirmed first (see [`TreeMsg::DropIntoConfirmed`]). `copy` is set by
     /// holding Ctrl during the drop.
-    DropInto { target: PathBuf, sources: Vec<PathBuf>, copy: bool },
+    DropInto {
+        target: PathBuf,
+        sources: Vec<PathBuf>,
+        copy: bool,
+    },
     /// A drop landed on empty space below the rows (or a non-directory row);
     /// resolved to the current tree root.
-    DropIntoRoot { sources: Vec<PathBuf>, copy: bool },
+    DropIntoRoot {
+        sources: Vec<PathBuf>,
+        copy: bool,
+    },
     /// The user confirmed a drag-to-move; perform it.
-    DropIntoConfirmed { target: PathBuf, sources: Vec<PathBuf> },
+    DropIntoConfirmed {
+        target: PathBuf,
+        sources: Vec<PathBuf>,
+    },
     /// Pause every playing preview, keeping the widgets, so a tree that is
     /// hidden (bookmarks view, panel hidden, workspace switched away) stops
     /// making noise. Unlike [`Self::Shutdown`], the previews survive and are
@@ -600,6 +639,10 @@ pub struct Tree {
 
     /// Shared with the key-capture closure so it can defer to the rename entry.
     renaming_state: Rc<Cell<bool>>,
+    /// Identity of the rename entry currently rendered. Bumped every time one is
+    /// (re)built, so a focus-leave from an entry that a background rebuild has
+    /// already replaced is ignored instead of committing the wrong entry.
+    rename_gen: u64,
 
     /// Set by a message that only changed the selection/cursor (no structural
     /// change). `update_with_view` then updates the `tree-row-selected` class on
@@ -706,7 +749,10 @@ impl Component for Tree {
         // the tree's current root. Attached once here — unlike the per-row
         // drop targets rebuilt with their rows, `list` itself persists across
         // rebuilds, so adding this in `rebuild` would pile up duplicates.
-        let root_drop = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::MOVE | gdk::DragAction::COPY);
+        let root_drop = gtk::DropTarget::new(
+            gdk::FileList::static_type(),
+            gdk::DragAction::MOVE | gdk::DragAction::COPY,
+        );
         let root_drop_sender = sender.clone();
         root_drop.connect_drop(move |target, value, _x, _y| {
             let Ok(list) = value.get::<gdk::FileList>() else {
@@ -716,7 +762,9 @@ impl Component for Tree {
             if sources.is_empty() {
                 return false;
             }
-            let copy = target.current_event_state().contains(gdk::ModifierType::CONTROL_MASK);
+            let copy = target
+                .current_event_state()
+                .contains(gdk::ModifierType::CONTROL_MASK);
             root_drop_sender.input(TreeMsg::DropIntoRoot { sources, copy });
             true
         });
@@ -736,7 +784,9 @@ impl Component for Tree {
             // Super+right is the panel-resize drag: release the sequence so the
             // window's drag gesture can claim it instead of opening the menu.
             if gesture.current_button() == 3
-                && gesture.current_event_state().contains(gdk::ModifierType::SUPER_MASK)
+                && gesture
+                    .current_event_state()
+                    .contains(gdk::ModifierType::SUPER_MASK)
             {
                 gesture.set_state(gtk::EventSequenceState::Denied);
                 return;
@@ -747,6 +797,10 @@ impl Component for Tree {
             if on_row {
                 return;
             }
+            // A click on the blank area is also "outside" an active rename
+            // entry (which is itself a focusable row), so finalize it first.
+            // `RenameCommit` is a no-op when no rename is in progress.
+            blank_sender.input(TreeMsg::RenameCommit);
             match gesture.current_button() {
                 1 => blank_sender.input(TreeMsg::Deselect),
                 3 => blank_sender.input(TreeMsg::MenuAt { x, y }),
@@ -792,6 +846,7 @@ impl Component for Tree {
             menu_target: None,
             menu_point: None,
             renaming_state,
+            rename_gen: 0,
             selection_dirty: false,
             typeahead: TypeAhead::default(),
             scroll_to: None,
@@ -1066,7 +1121,12 @@ impl Tree {
                 self.range_select(&path);
                 self.selection_dirty = true;
             }
-            TreeMsg::RowPress { path, is_dir, ctrl, shift } => {
+            TreeMsg::RowPress {
+                path,
+                is_dir,
+                ctrl,
+                shift,
+            } => {
                 // The press point and button state are tracked by the drag
                 // controller on the scrolled window (which survives the rebuild
                 // this message triggers). Here we only snapshot what a drag
@@ -1148,6 +1208,16 @@ impl Tree {
             }
             TreeMsg::Menu(path) => self.open_menu(&path),
             TreeMsg::MenuAt { x, y } => {
+                // Right-clicking the blank area targets the open directory, so
+                // drop any row selection first: New File / Paste / ... act on
+                // the outer directory instead of whatever was selected before.
+                // The following `rebuild` renders the cleared selection and
+                // anchors the menu, so do not set `selection_dirty` (that would
+                // take the fast class-update path and skip the menu build).
+                self.selected.clear();
+                self.cursor = None;
+                self.anchor = None;
+                self.typeahead.clear();
                 if let Some(root) = self.tree.as_ref().map(|t| t.root().to_path_buf()) {
                     self.open_menu_at(&root, (x, y));
                 }
@@ -1213,7 +1283,9 @@ impl Tree {
             }
             TreeMsg::Duplicate(path) => match self.ops.duplicate(&path) {
                 Ok(new_path) => {
-                    self.apply_change(Change::Created { path: new_path.clone() });
+                    self.apply_change(Change::Created {
+                        path: new_path.clone(),
+                    });
                     self.select(&new_path);
                 }
                 Err(err) => self.status(format!("Could not duplicate: {err}"), &sender),
@@ -1262,7 +1334,9 @@ impl Tree {
             },
             TreeMsg::CreateLink(path) => match self.ops.create_link(&path) {
                 Ok(new_path) => {
-                    self.apply_change(Change::Created { path: new_path.clone() });
+                    self.apply_change(Change::Created {
+                        path: new_path.clone(),
+                    });
                 }
                 Err(err) => self.status(format!("Could not create link: {err}"), &sender),
             },
@@ -1279,7 +1353,10 @@ impl Tree {
                     .collect::<Vec<_>>()
                     .join("\n");
                 set_clipboard_text(&text);
-                self.status(format!("Copied {} paths to clipboard", paths.len()), &sender);
+                self.status(
+                    format!("Copied {} paths to clipboard", paths.len()),
+                    &sender,
+                );
             }
             TreeMsg::CopyRelativePaths(paths) => {
                 let root = self.tree.as_ref().map(|t| t.root().to_path_buf());
@@ -1370,34 +1447,12 @@ impl Tree {
                 }
             }
 
-            TreeMsg::RenameCommit => {
-                let text = self
-                    .rename_entry
-                    .as_ref()
-                    .map(|e| e.text().to_string())
-                    .unwrap_or_default();
-                let Some(old) = self.renaming.take() else {
-                    return;
-                };
-                self.renaming_state.set(false);
-                self.rename_entry = None;
-                let trimmed = text.trim().to_string();
-                let unchanged = old
-                    .file_name()
-                    .map(|n| n.to_string_lossy() == trimmed.as_str())
-                    .unwrap_or(false);
-                if trimmed.is_empty() || unchanged {
-                    return;
-                }
-                match self.ops.rename(&old, &trimmed) {
-                    Ok(new_path) => {
-                        self.apply_change(Change::Renamed {
-                            from: old,
-                            to: new_path.clone(),
-                        });
-                        self.select(&new_path);
-                    }
-                    Err(err) => self.status(format!("Could not rename: {err}"), &sender),
+            TreeMsg::RenameCommit => self.commit_rename(&sender),
+            TreeMsg::RenameFocusLost(generation) => {
+                // Only the entry that is still current may commit; a leave from
+                // one a background rebuild replaced is stale.
+                if self.renaming.is_some() && generation == self.rename_gen {
+                    self.commit_rename(&sender);
                 }
             }
             TreeMsg::RenameCancel => {
@@ -1409,19 +1464,27 @@ impl Tree {
             TreeMsg::Copy => {
                 let paths = self.selected_for_clipboard();
                 if !paths.is_empty() {
-                    self.clipboard = Some(Clipboard { op: ClipboardOp::Copy, paths: paths.clone() });
+                    set_clipboard_files(&paths, false);
+                    self.clipboard = Some(Clipboard {
+                        op: ClipboardOp::Copy,
+                        paths: paths.clone(),
+                    });
                     self.status(format!("Copying {} item(s)", paths.len()), &sender);
                 }
             }
             TreeMsg::Cut => {
                 let paths = self.selected_for_clipboard();
                 if !paths.is_empty() {
-                    self.clipboard = Some(Clipboard { op: ClipboardOp::Cut, paths: paths.clone() });
+                    set_clipboard_files(&paths, true);
+                    self.clipboard = Some(Clipboard {
+                        op: ClipboardOp::Cut,
+                        paths: paths.clone(),
+                    });
                     self.status(format!("Cutting {} item(s)", paths.len()), &sender);
                 }
             }
             TreeMsg::Paste => self.paste(&sender),
-            TreeMsg::PastePaths(paths) => self.paste_paths(paths, &sender),
+            TreeMsg::PastePaths { paths, cut } => self.paste_paths(paths, cut, &sender),
 
             TreeMsg::NewFile => self.create_entry(false, &sender),
             TreeMsg::NewFolder => self.create_entry(true, &sender),
@@ -1435,12 +1498,9 @@ impl Tree {
                 self.pending.push(change);
                 if self.flush_source.is_none() {
                     let s = sender.clone();
-                    let id = glib::timeout_add_local_once(
-                        Duration::from_millis(100),
-                        move || {
-                            s.input(TreeMsg::FlushChanges);
-                        }
-                    );
+                    let id = glib::timeout_add_local_once(Duration::from_millis(100), move || {
+                        s.input(TreeMsg::FlushChanges);
+                    });
                     self.flush_source = Some(id);
                 }
             }
@@ -1457,7 +1517,11 @@ impl Tree {
                 let _ = sender.output(TreeOutput::OpenFolderRequested);
             }
 
-            TreeMsg::DropInto { target, sources, copy } => {
+            TreeMsg::DropInto {
+                target,
+                sources,
+                copy,
+            } => {
                 self.request_drop_into(target, sources, copy, &sender);
             }
             TreeMsg::DropIntoRoot { sources, copy } => {
@@ -1640,10 +1704,7 @@ fn handle_key(
 /// existing `ListBoxRow`s in place (O(rows) class toggles, no widget
 /// construction). Returns `false` when the row set no longer matches the model
 /// (so the caller falls back to a full rebuild).
-fn update_selection_classes(
-    tree: &mut Tree,
-    widgets: &mut <Tree as Component>::Widgets,
-) -> bool {
+fn update_selection_classes(tree: &mut Tree, widgets: &mut <Tree as Component>::Widgets) -> bool {
     // If the row count drifted (a background change), rebuild instead.
     let mut existing = 0;
     let mut child = widgets.list.first_child();
@@ -1700,7 +1761,11 @@ fn scroll_row_into_view(widgets: &<Tree as Component>::Widgets, index: usize) {
     }
 }
 
-fn rebuild(tree: &mut Tree, widgets: &mut <Tree as Component>::Widgets, sender: ComponentSender<Tree>) {
+fn rebuild(
+    tree: &mut Tree,
+    widgets: &mut <Tree as Component>::Widgets,
+    sender: ComponentSender<Tree>,
+) {
     let list = &widgets.list;
 
     // The context-menu popover is parented to one of the rows below (see
@@ -1782,6 +1847,22 @@ fn rebuild(tree: &mut Tree, widgets: &mut <Tree as Component>::Widgets, sender: 
                 let s = sender.clone();
                 entry.connect_activate(move |_| s.input(TreeMsg::RenameCommit));
             }
+            // Clicking anywhere outside the entry commits the name, matching
+            // the usual file-manager behaviour; Enter still works too. Escape
+            // (below) cancels and clears `renaming` first, so the focus-leave
+            // that follows is a no-op in `RenameCommit`. The leave is tagged
+            // with this entry's generation: a leave from an entry that a
+            // background rebuild (e.g. the watcher event caused by creating the
+            // file) has already replaced is ignored, so the rename is not
+            // closed prematurely.
+            {
+                tree.rename_gen = tree.rename_gen.wrapping_add(1);
+                let generation = tree.rename_gen;
+                let focus = gtk::EventControllerFocus::new();
+                let s = sender.clone();
+                focus.connect_leave(move |_| s.input(TreeMsg::RenameFocusLost(generation)));
+                entry.add_controller(focus);
+            }
             let esc_controller = gtk::EventControllerKey::new();
             let s = sender.clone();
             esc_controller.connect_key_pressed(move |_, key, _code, _state| {
@@ -1795,7 +1876,15 @@ fn rebuild(tree: &mut Tree, widgets: &mut <Tree as Component>::Widgets, sender: 
             entry.add_controller(esc_controller);
             hbox.append(&entry);
             tree.rename_entry = Some(entry.clone());
-            entry.grab_focus();
+            // Rows are built while the list is detached from the scrolled
+            // window, so focusing the entry here — before it is realized —
+            // leaves its text unselected and the user cannot start typing.
+            // Grab focus and select the name once it is back in the tree.
+            let select_end = rename_selection_end(&row.name, row.is_dir);
+            glib::idle_add_local_once(move || {
+                entry.grab_focus();
+                entry.select_region(0, select_end);
+            });
         } else {
             let label = gtk::Label::new(Some(&row.name));
             label.set_xalign(0.0);
@@ -1877,7 +1966,12 @@ fn rebuild(tree: &mut Tree, widgets: &mut <Tree as Component>::Widgets, sender: 
             let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
             // Directories toggle on the first press, so the action must be
             // immediate; a following second press is swallowed in the handler.
-            s.input(TreeMsg::RowPress { path: path.clone(), is_dir, ctrl, shift });
+            s.input(TreeMsg::RowPress {
+                path: path.clone(),
+                is_dir,
+                ctrl,
+                shift,
+            });
         });
         {
             // A release with no drag finishes a press whose selection collapse
@@ -1900,7 +1994,9 @@ fn rebuild(tree: &mut Tree, widgets: &mut <Tree as Component>::Widgets, sender: 
                     });
                     return;
                 }
-                s.input(TreeMsg::RowRelease { path: release_path.clone() });
+                s.input(TreeMsg::RowRelease {
+                    path: release_path.clone(),
+                });
             });
         }
         list_row.add_controller(click);
@@ -1915,7 +2011,10 @@ fn rebuild(tree: &mut Tree, widgets: &mut <Tree as Component>::Widgets, sender: 
         // Drop target: only directories accept drops (files within the tree
         // are moved/copied into whichever directory row they land on).
         if row.is_dir {
-            let drop = gtk::DropTarget::new(gdk::FileList::static_type(), gdk::DragAction::MOVE | gdk::DragAction::COPY);
+            let drop = gtk::DropTarget::new(
+                gdk::FileList::static_type(),
+                gdk::DragAction::MOVE | gdk::DragAction::COPY,
+            );
             let s = sender.clone();
             let target_dir = row.path.clone();
             let active = tree.drag_active.clone();
@@ -1924,17 +2023,24 @@ fn rebuild(tree: &mut Tree, widgets: &mut <Tree as Component>::Widgets, sender: 
                 let Ok(list) = value.get::<gdk::FileList>() else {
                     return false;
                 };
-                let sources: Vec<PathBuf> = list.files().iter().filter_map(gio::File::path).collect();
+                let sources: Vec<PathBuf> =
+                    list.files().iter().filter_map(gio::File::path).collect();
                 if sources.is_empty() {
                     return false;
                 }
-                let copy = target.current_event_state().contains(gdk::ModifierType::CONTROL_MASK);
+                let copy = target
+                    .current_event_state()
+                    .contains(gdk::ModifierType::CONTROL_MASK);
                 // An in-tree drag landing here is handled by `drop_into`; mark
                 // it so `drag-end` does not also act on the source.
                 if active.get() {
                     landed.set(true);
                 }
-                s.input(TreeMsg::DropInto { target: target_dir.clone(), sources, copy });
+                s.input(TreeMsg::DropInto {
+                    target: target_dir.clone(),
+                    sources,
+                    copy,
+                });
                 true
             });
             list_row.add_controller(drop);
@@ -1950,13 +2056,26 @@ fn rebuild(tree: &mut Tree, widgets: &mut <Tree as Component>::Widgets, sender: 
     // is built after the loop instead of inside the menu handler. The open
     // directory has no row of its own, so that menu anchors at the click point.
     if let Some(row) = menu_row {
-        let target = tree.menu_target.take().expect("menu_row set implies a target");
+        let target = tree
+            .menu_target
+            .take()
+            .expect("menu_row set implies a target");
         let selection = tree.selected.clone();
-        tree.popover = Some(build_menu(&row, &target, &tree.menu, &selection, tree.side, &sender));
+        tree.popover = Some(build_menu(
+            &row, &target, &tree.menu, &selection, tree.side, &sender,
+        ));
         tree.menu_point = None;
     } else if let (Some(target), Some(at)) = (tree.menu_target.take(), tree.menu_point.take()) {
         let selection = tree.selected.clone();
-        tree.popover = Some(build_menu_at(&widgets.scrolled, at, &target, &tree.menu, &selection, tree.side, &sender));
+        tree.popover = Some(build_menu_at(
+            &widgets.scrolled,
+            at,
+            &target,
+            &tree.menu,
+            &selection,
+            tree.side,
+            &sender,
+        ));
     }
     tree.menu_target = None;
     tree.menu_point = None;
@@ -1978,7 +2097,9 @@ fn action_builtin(action: &ContextAction) -> Option<BuiltinAction> {
 pub(crate) fn menu_label(action: &ContextAction, path: &Path, side: PanelSide) -> String {
     let dynamic = match action_builtin(action) {
         Some(BuiltinAction::OpenWithDefault) => default_app_label(path),
-        Some(BuiltinAction::InOppositePanel) => Some(format!("In {} panel", side.opposite().name())),
+        Some(BuiltinAction::InOppositePanel) => {
+            Some(format!("In {} panel", side.opposite().name()))
+        }
         // Not every preview is a picture: audio has a player, text a snippet, an
         // archive its contents. Let those say what they show.
         Some(BuiltinAction::ViewThumbnail) => preview::detect(path)
@@ -2234,7 +2355,9 @@ fn action_message(action: BuiltinAction, path: &Path, selection: &[PathBuf]) -> 
             BuiltinAction::Trash => return TreeMsg::DeleteSelected,
             BuiltinAction::DeletePermanently => return TreeMsg::PermanentDeleteSelected,
             BuiltinAction::CopyPath => return TreeMsg::CopyPaths(selection.to_vec()),
-            BuiltinAction::CopyRelativePath => return TreeMsg::CopyRelativePaths(selection.to_vec()),
+            BuiltinAction::CopyRelativePath => {
+                return TreeMsg::CopyRelativePaths(selection.to_vec());
+            }
             BuiltinAction::Properties => return TreeMsg::PropertiesSelected(selection.to_vec()),
             _ => {}
         }
@@ -2334,20 +2457,30 @@ const ARCHIVE_EXTENSIONS: [&str; 8] = ["zip", "tar", "gz", "xz", "bz2", "zst", "
 fn has_extension(path: &Path, extensions: &[&str]) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| extensions.iter().any(|candidate| ext.eq_ignore_ascii_case(candidate)))
+        .is_some_and(|ext| {
+            extensions
+                .iter()
+                .any(|candidate| ext.eq_ignore_ascii_case(candidate))
+        })
 }
 
 fn icon_name(row: &VisibleRow) -> &'static str {
     if row.is_dir {
-        return if row.expanded { "folder-open-symbolic" } else { "folder-symbolic" };
+        return if row.expanded {
+            "folder-open-symbolic"
+        } else {
+            "folder-symbolic"
+        };
     }
     // Match on the extension only (case-insensitively) rather than lowercasing
     // the whole path string, which allocated a new `String` for every row on
     // every rebuild.
     if has_extension(&row.path, &["pdf"]) {
         "application-pdf-symbolic"
-    } else if has_extension(&row.path, &["jpg", "jpeg", "png", "gif", "svg", "webp", "bmp", "avif"])
-    {
+    } else if has_extension(
+        &row.path,
+        &["jpg", "jpeg", "png", "gif", "svg", "webp", "bmp", "avif"],
+    ) {
         "image-x-generic-symbolic"
     } else if has_extension(&row.path, &["mp3", "flac", "wav", "ogg", "m4a", "opus"]) {
         "audio-x-generic-symbolic"
@@ -2437,7 +2570,8 @@ fn in_inline_media(widget: &gtk::Widget) -> bool {
 fn in_text_preview(widget: &gtk::Widget) -> bool {
     let mut current = Some(widget.clone());
     while let Some(widget) = current {
-        if widget.has_css_class("tree-preview-text") || widget.has_css_class("tree-preview-scroll") {
+        if widget.has_css_class("tree-preview-text") || widget.has_css_class("tree-preview-scroll")
+        {
             return true;
         }
         current = widget.parent();
@@ -2865,14 +2999,17 @@ impl Tree {
     }
 
     fn cursor_path(&self) -> Option<PathBuf> {
-        self.cursor.and_then(|i| self.rows.get(i)).map(|r| r.path.clone())
+        self.cursor
+            .and_then(|i| self.rows.get(i))
+            .map(|r| r.path.clone())
     }
 
     fn cursor_delta(&mut self, delta: isize) {
         if self.rows.is_empty() {
             return;
         }
-        let next = (self.cursor.unwrap_or(0) as isize + delta).clamp(0, self.rows.len() as isize - 1) as usize;
+        let next = (self.cursor.unwrap_or(0) as isize + delta)
+            .clamp(0, self.rows.len() as isize - 1) as usize;
         let path = self.rows[next].path.clone();
         self.cursor = Some(next);
         self.set_single_selection(path);
@@ -2898,10 +3035,14 @@ impl Tree {
             .clamp(0, self.rows.len() as isize - 1) as usize;
         self.cursor = Some(next);
         self.anchor = Some(anchor.clone());
-        let (Some(a), Some(b)) = (self.rows.iter().position(|r| r.path == anchor), Some(next)) else {
+        let (Some(a), Some(b)) = (self.rows.iter().position(|r| r.path == anchor), Some(next))
+        else {
             return;
         };
-        self.selected = self.rows[index_range(a, b)].iter().map(|r| r.path.clone()).collect();
+        self.selected = self.rows[index_range(a, b)]
+            .iter()
+            .map(|r| r.path.clone())
+            .collect();
         self.scroll_to = Some(next);
         self.selection_dirty = true;
     }
@@ -2989,7 +3130,10 @@ impl Tree {
             self.select(path);
             return;
         };
-        self.selected = self.rows[index_range(a, b)].iter().map(|r| r.path.clone()).collect();
+        self.selected = self.rows[index_range(a, b)]
+            .iter()
+            .map(|r| r.path.clone())
+            .collect();
         self.cursor = Some(b);
     }
 
@@ -3078,15 +3222,22 @@ impl Tree {
     /// a video or audio stream playing.
     fn clear_thumbnails_under(&mut self, prefix: &Path) {
         self.thumbnails.retain(|path| !path.starts_with(prefix));
-        self.preview_kinds.retain(|path, _| !path.starts_with(prefix));
+        self.preview_kinds
+            .retain(|path, _| !path.starts_with(prefix));
         self.documents.retain(|path, _| !path.starts_with(prefix));
         self.thumb_cache.retain(|path, _| !path.starts_with(prefix));
         self.playing.retain(|path| !path.starts_with(prefix));
         self.stop_videos_under(prefix);
         self.media.retain(|path, _| !path.starts_with(prefix));
-        self.gif_anims.borrow_mut().retain(|path, _| !path.starts_with(prefix));
-        self.gif_widgets.borrow_mut().retain(|path, _| !path.starts_with(prefix));
-        self.audio_widgets.borrow_mut().retain(|path, _| !path.starts_with(prefix));
+        self.gif_anims
+            .borrow_mut()
+            .retain(|path, _| !path.starts_with(prefix));
+        self.gif_widgets
+            .borrow_mut()
+            .retain(|path, _| !path.starts_with(prefix));
+        self.audio_widgets
+            .borrow_mut()
+            .retain(|path, _| !path.starts_with(prefix));
         // Dropping a player returns its pipeline to NULL.
         self.audio.retain(|path, _| !path.starts_with(prefix));
     }
@@ -3129,7 +3280,9 @@ impl Tree {
         });
         self.media.retain(|path, _| visible.contains(path));
         self.playing.retain(|path| visible.contains(path));
-        self.gif_anims.borrow_mut().retain(|path, _| visible.contains(path));
+        self.gif_anims
+            .borrow_mut()
+            .retain(|path, _| visible.contains(path));
         // Dropping a player returns its pipeline to NULL.
         self.audio.retain(|path, _| visible.contains(path));
     }
@@ -3224,7 +3377,9 @@ impl Tree {
                 return;
             };
             let iter = animation.iter(Some(SystemTime::now()));
-            self.gif_anims.borrow_mut().insert(path.to_path_buf(), GifAnim { iter });
+            self.gif_anims
+                .borrow_mut()
+                .insert(path.to_path_buf(), GifAnim { iter });
             self.playing.insert(path.to_path_buf());
             self.ensure_gif_ticker();
         }
@@ -3282,8 +3437,7 @@ impl Tree {
                 };
                 let position = player.position();
                 let duration = player.duration();
-                if duration > 0
-                    && (widgets.seek.adjustment().upper() - duration as f64).abs() > 0.5
+                if duration > 0 && (widgets.seek.adjustment().upper() - duration as f64).abs() > 0.5
                 {
                     widgets.seek.adjustment().set_upper(duration as f64);
                 }
@@ -3401,7 +3555,9 @@ impl Tree {
                     // a compact transport (play/pause, seek, clock, volume) that
                     // the ticker keeps in sync with the stream.
                     let (controls, widgets) = build_audio_player(&player, label_start);
-                    self.audio_widgets.borrow_mut().insert(path.to_path_buf(), widgets);
+                    self.audio_widgets
+                        .borrow_mut()
+                        .insert(path.to_path_buf(), widgets);
                     container.append(&controls);
                     self.ensure_audio_ticker();
                 }
@@ -3589,7 +3745,10 @@ impl Tree {
             ClipboardOp::Copy => "Copied",
             ClipboardOp::Cut => "Moved",
         };
-        self.status(format!("{verb} {count} item(s) into {}", dir.display()), sender);
+        self.status(
+            format!("{verb} {count} item(s) into {}", dir.display()),
+            sender,
+        );
         if clip.op == ClipboardOp::Cut {
             self.clipboard = None;
         }
@@ -3604,11 +3763,13 @@ impl Tree {
             return;
         }
         let s = sender.clone();
-        read_clipboard_files(move |paths| s.input(TreeMsg::PastePaths(paths)));
+        read_clipboard_files(move |paths, cut| s.input(TreeMsg::PastePaths { paths, cut }));
     }
 
-    /// Perform the actual paste of externally-sourced paths as copies.
-    fn paste_paths(&mut self, paths: Vec<PathBuf>, sender: &ComponentSender<Self>) {
+    /// Perform the actual paste of externally-sourced paths. Copies by default;
+    /// when the clipboard carried a cut (`move`) verb, moves instead so a cut in
+    /// another pane or application keeps its "move" semantics.
+    fn paste_paths(&mut self, paths: Vec<PathBuf>, cut: bool, sender: &ComponentSender<Self>) {
         let Some(dir) = self.target_dir() else {
             return;
         };
@@ -3622,10 +3783,18 @@ impl Tree {
             if src == dir {
                 continue;
             }
-            match self.ops.copy(&src, &dir) {
+            let result = if cut {
+                self.ops.move_(&src, &dir)
+            } else {
+                self.ops.copy(&src, &dir)
+            };
+            match result {
                 Ok(dest) => {
                     count += 1;
                     self.apply_change(Change::Created { path: dest });
+                    if cut {
+                        self.apply_change(Change::Removed { path: src });
+                    }
                 }
                 Err(err) => {
                     failed = Some(err.to_string());
@@ -3637,7 +3806,11 @@ impl Tree {
             self.status(failed, sender);
             return;
         }
-        self.status(format!("Pasted {count} item(s) into {}", dir.display()), sender);
+        let verb = if cut { "Moved" } else { "Pasted" };
+        self.status(
+            format!("{verb} {count} item(s) into {}", dir.display()),
+            sender,
+        );
         self.cursor_snap();
     }
 
@@ -3687,7 +3860,10 @@ impl Tree {
                     .unwrap_or_else(|| single.display().to_string());
                 format!("Move \u{201c}{name}\u{201d} into \u{201c}{target_name}\u{201d}?")
             }
-            many => format!("Move {} items into \u{201c}{target_name}\u{201d}?", many.len()),
+            many => format!(
+                "Move {} items into \u{201c}{target_name}\u{201d}?",
+                many.len()
+            ),
         };
         let dialog = gtk::AlertDialog::builder()
             .modal(true)
@@ -3725,7 +3901,11 @@ impl Tree {
                 failed = Some("Cannot move a folder into itself".to_string());
                 break;
             }
-            let result = if copy { self.ops.copy(src, target) } else { self.ops.move_(src, target) };
+            let result = if copy {
+                self.ops.copy(src, target)
+            } else {
+                self.ops.move_(src, target)
+            };
             match result {
                 Ok(dest) => {
                     count += 1;
@@ -3746,7 +3926,10 @@ impl Tree {
         }
         if count > 0 {
             let verb = if copy { "Copied" } else { "Moved" };
-            self.status(format!("{verb} {count} item(s) into {}", target.display()), sender);
+            self.status(
+                format!("{verb} {count} item(s) into {}", target.display()),
+                sender,
+            );
         }
         self.cursor_snap();
     }
@@ -3763,7 +3946,9 @@ impl Tree {
         };
         match result {
             Ok(new_path) => {
-                self.apply_change(Change::Created { path: new_path.clone() });
+                self.apply_change(Change::Created {
+                    path: new_path.clone(),
+                });
                 self.renaming = Some(new_path.clone());
                 self.renaming_state.set(true);
                 self.select(&new_path);
@@ -3772,11 +3957,50 @@ impl Tree {
         }
     }
 
+    /// Commit an in-progress rename, using the live entry's text. A no-op when
+    /// there is no rename in progress or the name is empty/unchanged. Shared by
+    /// the Enter activation and a genuine focus-leave.
+    fn commit_rename(&mut self, sender: &ComponentSender<Self>) {
+        let text = self
+            .rename_entry
+            .as_ref()
+            .map(|e| e.text().to_string())
+            .unwrap_or_default();
+        let Some(old) = self.renaming.take() else {
+            return;
+        };
+        self.renaming_state.set(false);
+        self.rename_entry = None;
+        let trimmed = text.trim().to_string();
+        let unchanged = old
+            .file_name()
+            .map(|n| n.to_string_lossy() == trimmed.as_str())
+            .unwrap_or(false);
+        if trimmed.is_empty() || unchanged {
+            return;
+        }
+        match self.ops.rename(&old, &trimmed) {
+            Ok(new_path) => {
+                self.apply_change(Change::Renamed {
+                    from: old,
+                    to: new_path.clone(),
+                });
+                self.select(&new_path);
+            }
+            Err(err) => self.status(format!("Could not rename: {err}"), sender),
+        }
+    }
+
     /// The directory new items paste into / are created inside: the cursor's
     /// directory itself, or its parent when the cursor is on a file.
     fn target_dir(&self) -> Option<PathBuf> {
         if let Some(path) = self.cursor_path() {
-            let is_dir = self.rows.iter().find(|r| r.path == path).map(|r| r.is_dir).unwrap_or(false);
+            let is_dir = self
+                .rows
+                .iter()
+                .find(|r| r.path == path)
+                .map(|r| r.is_dir)
+                .unwrap_or(false);
             if is_dir {
                 return Some(path);
             }
@@ -3802,7 +4026,11 @@ impl Tree {
             tree.reload_all(&StdDirSource);
             self.refresh_rows();
         }
-        let label = if show { "Showing hidden files." } else { "Hiding hidden files." };
+        let label = if show {
+            "Showing hidden files."
+        } else {
+            "Hiding hidden files."
+        };
         self.status(label.to_string(), sender);
     }
 
@@ -3829,7 +4057,11 @@ impl Tree {
             tree.reload_all(&StdDirSource);
             self.refresh_rows();
         }
-        let dir = if opts.ascending { "ascending" } else { "descending" };
+        let dir = if opts.ascending {
+            "ascending"
+        } else {
+            "descending"
+        };
         self.status(format!("Sort order: {dir}."), sender);
     }
 
@@ -3881,9 +4113,7 @@ impl Tree {
         let ShortcutTarget::Builtin(builtin) = target else {
             return;
         };
-        if builtin == BuiltinAction::Separator
-            || (builtin.is_directory_only() && !path.is_dir())
-        {
+        if builtin == BuiltinAction::Separator || (builtin.is_directory_only() && !path.is_dir()) {
             return;
         }
         if matches!(builtin, BuiltinAction::OpenWithDefault) && path.is_dir() {
@@ -3916,9 +4146,28 @@ impl Tree {
 // out-of-component helpers
 // ---------------------------------------------------------------------------
 
+/// The character offset up to which a rename entry's text should be selected
+/// when it opens: the whole name for a directory or an extensionless file, but
+/// only the stem for a file with an extension, so typing a new name keeps the
+/// extension. `-1` selects to the end (used by `gtk::Entry::select_region`).
+fn rename_selection_end(name: &str, is_dir: bool) -> i32 {
+    if is_dir {
+        return -1;
+    }
+    match name.rfind('.') {
+        // A leading dot is part of the name (a dotfile), not an extension.
+        Some(i) if i > 0 && i + 1 < name.len() => name[..i].chars().count() as i32,
+        _ => -1,
+    }
+}
+
 fn fresh_name(dir: &Path, stem: &str) -> String {
     for n in 0.. {
-        let name = if n == 0 { stem.to_string() } else { format!("{stem} {n}") };
+        let name = if n == 0 {
+            stem.to_string()
+        } else {
+            format!("{stem} {n}")
+        };
         if !dir.join(&name).exists() {
             return name;
         }
@@ -3968,9 +4217,8 @@ fn content_type_for(path: &Path) -> Option<glib::GString> {
 /// default is registered.
 fn default_app_label(path: &Path) -> Option<String> {
     let content_type = content_type_for(path)?;
-    gio::AppInfo::default_for_type(&content_type, false).map(|app| {
-        format!("Open With {}", app.display_name())
-    })
+    gio::AppInfo::default_for_type(&content_type, false)
+        .map(|app| format!("Open With {}", app.display_name()))
 }
 
 /// The "Open With..." chooser: a modal dialog listing every application that
@@ -4042,6 +4290,34 @@ fn set_clipboard_text(text: &str) {
     }
 }
 
+/// Put a file list on the system clipboard so the selection can be pasted by
+/// tree-space itself (in another pane or instance), Nautilus, or any other
+/// app. Offers both the portable `text/uri-list` and the GNOME
+/// `x-special/gnome-copied-files` format, the latter carrying the `copy`/`cut`
+/// verb so a cut keeps its move semantics across applications.
+fn set_clipboard_files(paths: &[PathBuf], cut: bool) {
+    let Some(display) = gdk::Display::default() else {
+        return;
+    };
+    let mut uri_list = String::new();
+    for path in paths {
+        if let Ok(uri) = glib::filename_to_uri(path, None::<&str>) {
+            uri_list.push_str(&uri);
+            uri_list.push_str("\r\n");
+        }
+    }
+    if uri_list.is_empty() {
+        return;
+    }
+    let gnome = format!("{}\n{uri_list}", if cut { "cut" } else { "copy" });
+    let uri_provider =
+        gdk::ContentProvider::for_bytes(URI_LIST_MIME, &glib::Bytes::from(uri_list.as_bytes()));
+    let gnome_provider =
+        gdk::ContentProvider::for_bytes(GNOME_CLIP_MIME, &glib::Bytes::from(gnome.as_bytes()));
+    let provider = gdk::ContentProvider::new_union(&[uri_provider, gnome_provider]);
+    let _ = display.clipboard().set_content(Some(&provider));
+}
+
 /// The standard interop MIME type for a file-list clipboard payload. Read by
 /// browsers, terminals and other file managers.
 const URI_LIST_MIME: &str = "text/uri-list";
@@ -4053,11 +4329,12 @@ const GNOME_CLIP_MIME: &str = "x-special/gnome-copied-files";
 
 /// Asynchronously read a file-list payload from the system clipboard and call
 /// `done` with the decoded absolute paths (empty when the clipboard holds
-/// anything else). Prefers the portable `text/uri-list`; falls back to the
-/// GNOME format when only that is offered. The read completes on the main loop.
-fn read_clipboard_files(done: impl FnOnce(Vec<PathBuf>) + 'static) {
+/// anything else) and whether the payload was a cut. Prefers the portable
+/// `text/uri-list`; the GNOME format's leading `copy`/`cut` verb, when present,
+/// selects between copy and move. The read completes on the main loop.
+fn read_clipboard_files(done: impl FnOnce(Vec<PathBuf>, bool) + 'static) {
     let Some(display) = gdk::Display::default() else {
-        done(Vec::new());
+        done(Vec::new(), false);
         return;
     };
     let clipboard = display.clipboard();
@@ -4065,13 +4342,31 @@ fn read_clipboard_files(done: impl FnOnce(Vec<PathBuf>) + 'static) {
     let has_uri = formats.contain_mime_type(URI_LIST_MIME);
     let has_gnome = formats.contain_mime_type(GNOME_CLIP_MIME);
     if !has_uri && !has_gnome {
-        done(Vec::new());
+        done(Vec::new(), false);
         return;
     }
     clipboard.read_text_async(gio::Cancellable::NONE, move |result| {
         let text = result.ok().flatten().unwrap_or_default();
-        done(parse_clipboard_uris(&text, has_gnome && !has_uri));
+        let verb = clipboard_verb(&text);
+        done(
+            parse_clipboard_uris(&text, verb.is_some()),
+            verb == Some(true),
+        );
     });
+}
+
+/// The copy/cut verb on the first line of an `x-special/gnome-copied-files`
+/// payload, if one is present: `Some(true)` for `cut`, `Some(false)` for
+/// `copy`. A plain `text/uri-list` has no verb line and yields `None`.
+fn clipboard_verb(text: &str) -> Option<bool> {
+    let first = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+    if first.eq_ignore_ascii_case("cut") {
+        Some(true)
+    } else if first.eq_ignore_ascii_case("copy") {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 /// Decode paths from a file-list clipboard payload. Accepts both `text/uri-list`
@@ -4084,7 +4379,8 @@ fn parse_clipboard_uris(text: &str, verb_line: bool) -> Vec<PathBuf> {
         .map(str::trim)
         .filter(|line| !line.is_empty() && !line.starts_with('#'))
         .filter_map(|line| {
-            if verb_line && (line.eq_ignore_ascii_case("copy") || line.eq_ignore_ascii_case("cut")) {
+            if verb_line && (line.eq_ignore_ascii_case("copy") || line.eq_ignore_ascii_case("cut"))
+            {
                 return None;
             }
             let (path, _host) = glib::filename_from_uri(line).ok()?;
@@ -4095,7 +4391,10 @@ fn parse_clipboard_uris(text: &str, verb_line: bool) -> Vec<PathBuf> {
 
 fn spawn_command(cmd: &[String]) -> Result<(), std::io::Error> {
     if cmd.is_empty() {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "empty command"));
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "empty command",
+        ));
     }
     let mut process = std::process::Command::new(&cmd[0]);
     for arg in &cmd[1..] {
@@ -4140,13 +4439,25 @@ mod tests {
 
     #[test]
     fn thumbnail_width_tracks_the_panel_and_stays_positive() {
-        let panel = PanelConfig { width: 300, margin: 0, ..PanelConfig::default() };
+        let panel = PanelConfig {
+            width: 300,
+            margin: 0,
+            ..PanelConfig::default()
+        };
         assert_eq!(thumbnail_content_width(panel), 276);
 
-        let panel = PanelConfig { width: 500, margin: 10, ..PanelConfig::default() };
+        let panel = PanelConfig {
+            width: 500,
+            margin: 10,
+            ..PanelConfig::default()
+        };
         assert_eq!(thumbnail_content_width(panel), 456);
 
-        let tiny = PanelConfig { width: 40, margin: 0, ..PanelConfig::default() };
+        let tiny = PanelConfig {
+            width: 40,
+            margin: 0,
+            ..PanelConfig::default()
+        };
         assert_eq!(thumbnail_content_width(tiny), 64);
     }
 
@@ -4186,7 +4497,10 @@ mod tests {
         );
         // GNOME format: a leading verb line that must be skipped.
         let gnome = "cut\nfile:///home/u/x\n";
-        assert_eq!(parse_clipboard_uris(gnome, true), vec![PathBuf::from("/home/u/x")]);
+        assert_eq!(
+            parse_clipboard_uris(gnome, true),
+            vec![PathBuf::from("/home/u/x")]
+        );
         // A stray verb line without the flag is not treated specially.
         assert_eq!(parse_clipboard_uris("copy\n", false), Vec::<PathBuf>::new());
         // Non-file and relative entries are dropped.
@@ -4198,11 +4512,42 @@ mod tests {
     }
 
     #[test]
+    fn clipboard_verb_reads_the_gnome_preamble() {
+        // GNOME payloads lead with the operation; a portable uri-list does not.
+        assert_eq!(clipboard_verb("cut\nfile:///home/u/x\n"), Some(true));
+        assert_eq!(clipboard_verb("copy\nfile:///home/u/x\n"), Some(false));
+        assert_eq!(clipboard_verb("COPY\r\nfile:///x\r\n"), Some(false));
+        // Leading blank lines are skipped before the verb is read.
+        assert_eq!(clipboard_verb("\ncut\nfile:///x\n"), Some(true));
+        // A plain uri-list has no verb.
+        assert_eq!(clipboard_verb("file:///home/u/x\n"), None);
+        assert_eq!(clipboard_verb(""), None);
+    }
+
+    #[test]
+    fn rename_selection_end_keeps_extensions_and_selects_dirs() {
+        // A directory selects its whole name.
+        assert_eq!(rename_selection_end("photos", true), -1);
+        // A file selects only its stem, keeping the extension.
+        assert_eq!(rename_selection_end("photo.png", false), 5);
+        assert_eq!(rename_selection_end("a.tar.gz", false), 5);
+        // No extension, a leading dot, or a trailing dot selects everything.
+        assert_eq!(rename_selection_end("README", false), -1);
+        assert_eq!(rename_selection_end(".bashrc", false), -1);
+        assert_eq!(rename_selection_end("weird.", false), -1);
+        // Multi-byte names select by character, not byte, offset.
+        assert_eq!(rename_selection_end("héllo.txt", false), 5);
+    }
+
+    #[test]
     fn icon_name_matches_extensions_case_insensitively() {
         assert_eq!(icon_name(&row("/a/Photo.JPG")), "image-x-generic-symbolic");
         assert_eq!(icon_name(&row("/a/song.Flac")), "audio-x-generic-symbolic");
         assert_eq!(icon_name(&row("/a/clip.mkv")), "video-x-generic-symbolic");
-        assert_eq!(icon_name(&row("/a/archive.tar")), "package-x-generic-symbolic");
+        assert_eq!(
+            icon_name(&row("/a/archive.tar")),
+            "package-x-generic-symbolic"
+        );
         assert_eq!(icon_name(&row("/a/doc.pdf")), "application-pdf-symbolic");
         assert_eq!(icon_name(&row("/a/notes.txt")), "text-x-generic-symbolic");
         // A directory named like an image is still a folder.
@@ -4219,8 +4564,14 @@ mod tests {
     fn resolve_drop_filters_noops_and_detects_cycles() {
         let target = Path::new("/a/b");
         // Dropping a path onto itself or its own parent is a no-op.
-        assert_eq!(resolve_drop(target, vec![PathBuf::from("/a/b")], false), DropPlan::Ignore);
-        assert_eq!(resolve_drop(target, vec![PathBuf::from("/a/b/c")], false), DropPlan::Ignore);
+        assert_eq!(
+            resolve_drop(target, vec![PathBuf::from("/a/b")], false),
+            DropPlan::Ignore
+        );
+        assert_eq!(
+            resolve_drop(target, vec![PathBuf::from("/a/b/c")], false),
+            DropPlan::Ignore
+        );
         // Moving a directory into itself is rejected.
         assert!(matches!(
             resolve_drop(target, vec![PathBuf::from("/a")], false),
@@ -4281,7 +4632,12 @@ mod tests {
 
     #[test]
     fn typeahead_finds_the_next_matching_row_and_wraps() {
-        let rows = vec![row("/r/apple"), row("/r/banana"), row("/r/apricot"), row("/r/cherry")];
+        let rows = vec![
+            row("/r/apple"),
+            row("/r/banana"),
+            row("/r/apricot"),
+            row("/r/cherry"),
+        ];
         // From the top, "ap" -> apple (index 0); nowhere to go but wrap
         // is only used to *find* the first match from the cursor onward.
         assert_eq!(typeahead_target(&rows, "ap", None), Some(0));
@@ -4295,9 +4651,15 @@ mod tests {
         let mut ta = TypeAhead::default();
         let t0 = std::time::Instant::now();
         assert_eq!(ta.push('a', t0).as_deref(), Some("a"));
-        assert_eq!(ta.push('b', t0 + Duration::from_millis(100)).as_deref(), Some("ab"));
+        assert_eq!(
+            ta.push('b', t0 + Duration::from_millis(100)).as_deref(),
+            Some("ab")
+        );
         // A long pause starts a fresh prefix.
-        assert_eq!(ta.push('c', t0 + Duration::from_millis(2000)).as_deref(), Some("c"));
+        assert_eq!(
+            ta.push('c', t0 + Duration::from_millis(2000)).as_deref(),
+            Some("c")
+        );
         // Non-searchable characters are ignored.
         assert_eq!(ta.push('\u{1}', t0), None);
     }

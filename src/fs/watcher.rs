@@ -63,23 +63,29 @@ pub fn event_to_changes(event: &Event, root: &Path) -> Vec<Change> {
         }),
         EventKind::Modify(ModifyKind::Name(RenameMode::Both)) => {
             if let (Some(from), Some(to)) = (event.paths.first(), event.paths.get(1))
-                && under_root(root, from) {
-                    changes.push(Change::Renamed { from: from.clone(), to: to.clone() });
-                }
+                && under_root(root, from)
+            {
+                changes.push(Change::Renamed {
+                    from: from.clone(),
+                    to: to.clone(),
+                });
+            }
         }
         EventKind::Modify(ModifyKind::Name(RenameMode::To)) => {
-            push_change(&mut changes, event.paths.first(), root, |p| Change::Created { path: p });
+            push_change(&mut changes, event.paths.first(), root, |p| {
+                Change::Created { path: p }
+            });
         }
         EventKind::Modify(ModifyKind::Name(mode))
             if !matches!(mode, RenameMode::To | RenameMode::Both) =>
         {
-            push_change(&mut changes, event.paths.first(), root, |p| Change::Removed {
-                path: p,
+            push_change(&mut changes, event.paths.first(), root, |p| {
+                Change::Removed { path: p }
             });
         }
         EventKind::Modify(ModifyKind::Metadata(_)) => {
-            push_change(&mut changes, event.paths.first(), root, |p| Change::Modified {
-                path: p,
+            push_change(&mut changes, event.paths.first(), root, |p| {
+                Change::Modified { path: p }
             });
         }
         // Data rewrites and everything else do not change tree structure.
@@ -123,14 +129,20 @@ mod tests {
     #[test]
     fn creates_and_removes_map_directly() {
         let e = ev(EventKind::Create(CreateKind::File), &["/home/u/src/a.txt"]);
-        assert_eq!(event_to_changes(&e, Path::new(ROOT)), vec![Change::Created {
-            path: "/home/u/src/a.txt".into()
-        }]);
+        assert_eq!(
+            event_to_changes(&e, Path::new(ROOT)),
+            vec![Change::Created {
+                path: "/home/u/src/a.txt".into()
+            }]
+        );
 
         let e = ev(EventKind::Remove(RemoveKind::Folder), &["/home/u/src/dir"]);
-        assert_eq!(event_to_changes(&e, Path::new(ROOT)), vec![Change::Removed {
-            path: "/home/u/src/dir".into()
-        }]);
+        assert_eq!(
+            event_to_changes(&e, Path::new(ROOT)),
+            vec![Change::Removed {
+                path: "/home/u/src/dir".into()
+            }]
+        );
     }
 
     #[test]
@@ -150,17 +162,27 @@ mod tests {
 
     #[test]
     fn rename_single_sides_become_removed_and_created() {
-        let from_only =
-            ev(EventKind::Modify(ModifyKind::Name(RenameMode::From)), &["/home/u/src/x"]);
-        assert_eq!(event_to_changes(&from_only, Path::new(ROOT)), vec![Change::Removed {
-            path: "/home/u/src/x".into()
-        }]);
+        let from_only = ev(
+            EventKind::Modify(ModifyKind::Name(RenameMode::From)),
+            &["/home/u/src/x"],
+        );
+        assert_eq!(
+            event_to_changes(&from_only, Path::new(ROOT)),
+            vec![Change::Removed {
+                path: "/home/u/src/x".into()
+            }]
+        );
 
-        let to_only =
-            ev(EventKind::Modify(ModifyKind::Name(RenameMode::To)), &["/home/u/src/y"]);
-        assert_eq!(event_to_changes(&to_only, Path::new(ROOT)), vec![Change::Created {
-            path: "/home/u/src/y".into()
-        }]);
+        let to_only = ev(
+            EventKind::Modify(ModifyKind::Name(RenameMode::To)),
+            &["/home/u/src/y"],
+        );
+        assert_eq!(
+            event_to_changes(&to_only, Path::new(ROOT)),
+            vec![Change::Created {
+                path: "/home/u/src/y".into()
+            }]
+        );
     }
 
     #[test]
@@ -169,9 +191,12 @@ mod tests {
             EventKind::Modify(ModifyKind::Metadata(notify::event::MetadataKind::WriteTime)),
             &["/home/u/src/a.txt"],
         );
-        assert_eq!(event_to_changes(&e, Path::new(ROOT)), vec![Change::Modified {
-            path: "/home/u/src/a.txt".into()
-        }]);
+        assert_eq!(
+            event_to_changes(&e, Path::new(ROOT)),
+            vec![Change::Modified {
+                path: "/home/u/src/a.txt".into()
+            }]
+        );
     }
 
     #[test]
@@ -185,7 +210,10 @@ mod tests {
 
     #[test]
     fn events_outside_root_are_dropped() {
-        let e = ev(EventKind::Create(CreateKind::File), &["/tmp/elsewhere/f.txt"]);
+        let e = ev(
+            EventKind::Create(CreateKind::File),
+            &["/tmp/elsewhere/f.txt"],
+        );
         assert_eq!(event_to_changes(&e, Path::new(ROOT)), vec![]);
     }
 
@@ -205,14 +233,19 @@ mod tests {
     fn generic_kinds_are_ignored() {
         let e = ev(EventKind::Any, &["/home/u/src/a"]);
         assert_eq!(event_to_changes(&e, Path::new(ROOT)), vec![]);
-        let e = ev(EventKind::Access(notify::event::AccessKind::Open(notify::event::AccessMode::Any)), &["/home/u/src/a"]);
+        let e = ev(
+            EventKind::Access(notify::event::AccessKind::Open(
+                notify::event::AccessMode::Any,
+            )),
+            &["/home/u/src/a"],
+        );
         assert_eq!(event_to_changes(&e, Path::new(ROOT)), vec![]);
     }
 
     #[test]
     fn rescan_flag_dominates_everything() {
-        let e = Event::new(EventKind::Create(CreateKind::File))
-            .add_path("/home/u/src/a.txt".into());
+        let e =
+            Event::new(EventKind::Create(CreateKind::File)).add_path("/home/u/src/a.txt".into());
         let needs_rescan = Event {
             attrs: {
                 let mut a = notify::event::EventAttributes::new();
@@ -221,6 +254,9 @@ mod tests {
             },
             ..e
         };
-        assert_eq!(event_to_changes(&needs_rescan, Path::new(ROOT)), vec![Change::Rescan]);
+        assert_eq!(
+            event_to_changes(&needs_rescan, Path::new(ROOT)),
+            vec![Change::Rescan]
+        );
     }
 }

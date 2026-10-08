@@ -141,7 +141,10 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         spawn_listener(listener, move |cmd| tx.send(cmd).unwrap());
         assert!(deliver_at(&path, &Command::default()));
-        assert_eq!(rx.recv_timeout(Duration::from_secs(2)), Ok(Command::default()));
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(2)),
+            Ok(Command::default())
+        );
     }
 
     #[test]

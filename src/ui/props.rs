@@ -156,7 +156,10 @@ pub fn show_properties_dialog(parent: &gtk::Window, path: &Path, sender: &Compon
             if name == meta.name {
                 return;
             }
-            sender.input(TreeMsg::RenameTo { path: path.clone(), name });
+            sender.input(TreeMsg::RenameTo {
+                path: path.clone(),
+                name,
+            });
             window.close();
         });
     }
@@ -184,8 +187,10 @@ pub fn show_multi_properties_dialog(parent: &gtk::Window, paths: &[std::path::Pa
             }
         }
     }
-    let parents: std::collections::BTreeSet<_> =
-        paths.iter().filter_map(|p| p.parent().map(Path::to_path_buf)).collect();
+    let parents: std::collections::BTreeSet<_> = paths
+        .iter()
+        .filter_map(|p| p.parent().map(Path::to_path_buf))
+        .collect();
     let shared_parent = if parents.len() == 1 {
         parents.into_iter().next().map(|p| p.display().to_string())
     } else {
@@ -323,26 +328,51 @@ fn basic_tab(meta: &FileMeta) -> BasicTab {
 
     if meta.is_dir {
         if let Some(count) = meta.item_count() {
-            add_row(&grid, row, "Size", &value_label(&meta::item_count_label(count)));
+            add_row(
+                &grid,
+                row,
+                "Size",
+                &value_label(&meta::item_count_label(count)),
+            );
             row += 1;
         }
     } else {
-        add_row(&grid, row, "Size", &value_label(&meta::format_size(meta.size)));
+        add_row(
+            &grid,
+            row,
+            "Size",
+            &value_label(&meta::format_size(meta.size)),
+        );
         row += 1;
     }
 
     if let Some(target) = &meta.link_target {
-        add_row(&grid, row, "Link target", &value_label(&target.display().to_string()));
+        add_row(
+            &grid,
+            row,
+            "Link target",
+            &value_label(&target.display().to_string()),
+        );
         row += 1;
     }
 
     if let Some(parent) = meta.path.parent() {
-        add_row(&grid, row, "Parent folder", &value_label(&parent.display().to_string()));
+        add_row(
+            &grid,
+            row,
+            "Parent folder",
+            &value_label(&parent.display().to_string()),
+        );
         row += 1;
     }
 
     if let Some(free) = meta::available_space(&meta.path) {
-        add_row(&grid, row, "Free space", &value_label(&meta::format_size(free)));
+        add_row(
+            &grid,
+            row,
+            "Free space",
+            &value_label(&meta::format_size(free)),
+        );
         row += 1;
     }
 
@@ -357,7 +387,10 @@ fn basic_tab(meta: &FileMeta) -> BasicTab {
         }
     }
 
-    BasicTab { page: grid.upcast(), name_entry }
+    BasicTab {
+        page: grid.upcast(),
+        name_entry,
+    }
 }
 
 /// Owner/group plus the read/write/execute matrix and the special bits. Every
@@ -680,7 +713,11 @@ fn type_text(meta: &FileMeta) -> String {
         (Some(description), None) => description.clone(),
         (None, Some(mime)) => mime.clone(),
         (None, None) => {
-            if meta.is_dir { "Folder".to_string() } else { "Unknown type".to_string() }
+            if meta.is_dir {
+                "Folder".to_string()
+            } else {
+                "Unknown type".to_string()
+            }
         }
     }
 }

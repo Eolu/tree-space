@@ -54,14 +54,14 @@ use crate::config::{
     PanelLayer, PanelSide, SessionState, ShortcutTarget, StartupRoot, WorkspaceMove,
     bookmark_file_path, load_stylesheet, save_bookmarks_to_path,
 };
-use crate::workspace::Hyprland;
 use crate::fs::SortKey;
 use crate::ipc;
 use crate::ui::bookmarks::{self, BookmarkEvent, MoveTarget};
 use crate::ui::toolbar::{
     PaneShortcuts, Toolbar, ToolbarInit, ToolbarMsg, ToolbarOutput, parse_accelerator,
 };
-use crate::ui::tree::{Tree, TreeInit, TreeOutput, TreeMsg};
+use crate::ui::tree::{Tree, TreeInit, TreeMsg, TreeOutput};
+use crate::workspace::Hyprland;
 
 /// One entry in a pane's history: a directory it showed, or the bookmarks view.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,7 +94,11 @@ impl NavHistory {
         if self.navigating {
             return;
         }
-        if self.entries.get(self.cursor).is_some_and(|cur| cur == &entry) {
+        if self
+            .entries
+            .get(self.cursor)
+            .is_some_and(|cur| cur == &entry)
+        {
             return;
         }
         if self.entries.is_empty() {
@@ -191,6 +195,11 @@ pub struct Pane {
     /// The pane-menu accelerators, kept so the IPC `--key` command can resolve
     /// a shortcut against this pane without a real key event.
     shortcuts: Rc<PaneShortcuts>,
+    /// This pane's share of the vertical `GtkPaned` above it, as a fraction of
+    /// the paned's height (0.5 = 50/50). The widget tree is rebuilt from
+    /// scratch on every workspace switch, so the user's dragged divider
+    /// position is captured here first and restored on rebuild.
+    split: Cell<f64>,
 }
 
 /// The optional navigation toolbar's buttons.
@@ -239,8 +248,8 @@ impl Pane {
         let Some(nav) = &self.nav_buttons else {
             return;
         };
-        let has_parent = !self.on_bookmarks()
-            && self.root.as_deref().and_then(Path::parent).is_some();
+        let has_parent =
+            !self.on_bookmarks() && self.root.as_deref().and_then(Path::parent).is_some();
         nav.up.set_sensitive(has_parent);
         nav.back.set_sensitive(self.history.can_back());
         nav.forward.set_sensitive(self.history.can_forward());
@@ -447,7 +456,11 @@ pub enum AppMsg {
     /// The bookmarks view in pane `id` reported a user action.
     BookmarkEvent { id: u64, event: BookmarkEvent },
     /// The bookmark editor for the entry at `index_path` was saved.
-    BookmarkEditSaved { index_path: Vec<usize>, name: String, path: Option<PathBuf> },
+    BookmarkEditSaved {
+        index_path: Vec<usize>,
+        name: String,
+        path: Option<PathBuf>,
+    },
     /// A new leaf bookmark was created from the bookmarks view.
     BookmarkAdded { name: String, path: PathBuf },
     /// A new (empty) bookmark folder was created from the bookmarks view.
@@ -557,11 +570,17 @@ impl SimpleComponent for App {
         let widths: HashMap<PanelSide, u32> = [
             (
                 PanelSide::Left,
-                session.left_width.unwrap_or(default_width).clamp(PANEL_MIN_WIDTH, PANEL_MAX_WIDTH),
+                session
+                    .left_width
+                    .unwrap_or(default_width)
+                    .clamp(PANEL_MIN_WIDTH, PANEL_MAX_WIDTH),
             ),
             (
                 PanelSide::Right,
-                session.right_width.unwrap_or(default_width).clamp(PANEL_MIN_WIDTH, PANEL_MAX_WIDTH),
+                session
+                    .right_width
+                    .unwrap_or(default_width)
+                    .clamp(PANEL_MIN_WIDTH, PANEL_MAX_WIDTH),
             ),
         ]
         .into_iter()
@@ -575,8 +594,10 @@ impl SimpleComponent for App {
         // we follow the active workspace over IPC; without it every pane shares
         // the empty workspace (i.e. all panes are visible, as before).
         let hypr = Hyprland::connect();
-        let active_workspace =
-            hypr.as_ref().and_then(Hyprland::active_workspace).unwrap_or_default();
+        let active_workspace = hypr
+            .as_ref()
+            .and_then(Hyprland::active_workspace)
+            .unwrap_or_default();
         // Build the primary dock's initial panes from the invocation. With no
         // roots, resolve the configured startup directory; a `bookmarks` startup
         // (the default) resolves to none, so the pane opens the bookmarks view.
@@ -591,7 +612,11 @@ impl SimpleComponent for App {
                 .resolve(last)
                 .filter(|p| p.is_dir())
                 .or_else(home_dir);
-            if let Some(p) = fallback { vec![p] } else { Vec::new() }
+            if let Some(p) = fallback {
+                vec![p]
+            } else {
+                Vec::new()
+            }
         };
 
         let mut panes: Vec<Pane> = Vec::new();
@@ -687,7 +712,13 @@ impl SimpleComponent for App {
             });
         }
 
-        init_layer_window(&model.window, &model.config, primary_side, primary_width, None);
+        init_layer_window(
+            &model.window,
+            &model.config,
+            primary_side,
+            primary_width,
+            None,
+        );
         install_css(&model.config);
         // Interactive resize only makes sense for a docked layer surface; a
         // plain fallback window is resized like any other window.
@@ -821,7 +852,10 @@ impl SimpleComponent for App {
                 self.run_pane_shortcut(id, action, &sender);
             }
 
-            AppMsg::OpenFolderPicked { id, path: Some(path) } => {
+            AppMsg::OpenFolderPicked {
+                id,
+                path: Some(path),
+            } => {
                 self.open_root_in_pane(id, path);
             }
             AppMsg::OpenFolderPicked { path: None, .. } => {}
@@ -901,7 +935,9 @@ impl SimpleComponent for App {
                         self.docks[di].panes[pi].bookmark_filter = filter;
                         self.refresh_all_bookmarks(&sender);
                     } else {
-                        self.docks[di].panes[pi].tree.emit(TreeMsg::SetFilter(filter));
+                        self.docks[di].panes[pi]
+                            .tree
+                            .emit(TreeMsg::SetFilter(filter));
                     }
                 }
             }
@@ -947,16 +983,21 @@ impl SimpleComponent for App {
                 // Let the message above run and GStreamer wind its GL context
                 // down before the window closes and the process exits.
                 let window = self.window.clone();
-                glib::timeout_add_local_once(std::time::Duration::from_millis(SHUTDOWN_GRACE_MS), move || {
-                    window.close();
-                });
+                glib::timeout_add_local_once(
+                    std::time::Duration::from_millis(SHUTDOWN_GRACE_MS),
+                    move || {
+                        window.close();
+                    },
+                );
             }
 
             AppMsg::ResizeBy { side, delta } => self.resize_by(side, delta),
             AppMsg::ResizeCommit => self.persist_session(),
 
             AppMsg::ResolveDockMonitor { di } => {
-                let Some(dock) = self.docks.get(di) else { return };
+                let Some(dock) = self.docks.get(di) else {
+                    return;
+                };
                 if dock.monitor.is_some() {
                     return;
                 }
@@ -996,7 +1037,11 @@ impl SimpleComponent for App {
                     }
                 }
             },
-            AppMsg::BookmarkEditSaved { index_path, name, path } => {
+            AppMsg::BookmarkEditSaved {
+                index_path,
+                name,
+                path,
+            } => {
                 if let Some(entry) = Bookmark::get_mut(&mut self.bookmarks, &index_path) {
                     entry.name = name;
                     // A folder has no path; a leaf always sets one.
@@ -1103,7 +1148,9 @@ impl App {
             if let Some(select) = select
                 && let Some((di, pi)) = self.dock_pane_of(id)
             {
-                self.docks[di].panes[pi].tree.emit(TreeMsg::SelectPath(select));
+                self.docks[di].panes[pi]
+                    .tree
+                    .emit(TreeMsg::SelectPath(select));
             }
         }
         // Show the panel, unless this launch asked to stay hidden.
@@ -1132,8 +1179,10 @@ impl App {
         // (e.g. the default side after its pane was moved to the other side)
         // must not be re-seeded with a fresh pane when a pane is still open
         // elsewhere. Only a side-specific show/creation seeds an empty dock.
-        let whole_panel =
-            matches!(intent, VisibilityIntent::ShowAll | VisibilityIntent::ToggleAll);
+        let whole_panel = matches!(
+            intent,
+            VisibilityIntent::ShowAll | VisibilityIntent::ToggleAll
+        );
         // Only panes on the active workspace count as "open" for seeding: a
         // whole-panel show should reveal them rather than spawn a new pane.
         let panes_exist = self
@@ -1259,7 +1308,8 @@ impl App {
             self.status = format!("{} is already bookmarked", path.display());
             return;
         }
-        self.bookmarks.push(Bookmark::leaf(Bookmark::default_name(&path), path.clone()));
+        self.bookmarks
+            .push(Bookmark::leaf(Bookmark::default_name(&path), path.clone()));
         self.save_bookmarks();
         self.status = format!("Bookmarked {}", path.display());
     }
@@ -1300,7 +1350,9 @@ impl App {
                 if path.is_dir() {
                     self.open_root_in_pane(id, path);
                 } else {
-                    self.docks[di].panes[pi].tree.emit(TreeMsg::OpenWithDefault(path));
+                    self.docks[di].panes[pi]
+                        .tree
+                        .emit(TreeMsg::OpenWithDefault(path));
                 }
             }
             ShortcutTarget::Builtin(action) => {
@@ -1309,9 +1361,10 @@ impl App {
                 }
             }
             ShortcutTarget::Command(cmd) => {
-                self.docks[di].panes[pi]
-                    .tree
-                    .emit(TreeMsg::RunCommand { command: cmd.command, path });
+                self.docks[di].panes[pi].tree.emit(TreeMsg::RunCommand {
+                    command: cmd.command,
+                    path,
+                });
             }
         }
     }
@@ -1320,7 +1373,9 @@ impl App {
     fn show_bookmarks_view(&mut self, id: u64) {
         if let Some((di, pi)) = self.dock_pane_of(id) {
             self.docks[di].panes[pi].show_bookmarks();
-            self.docks[di].panes[pi].history.record(ViewEntry::Bookmarks);
+            self.docks[di].panes[pi]
+                .history
+                .record(ViewEntry::Bookmarks);
             self.docks[di].panes[pi].refresh_nav();
             self.set_active(id);
         }
@@ -1333,18 +1388,31 @@ impl App {
         let Some(bookmark) = Bookmark::get(&self.bookmarks, &index_path).cloned() else {
             return;
         };
-        let Some((di, _pi)) = self.dock_pane_of(id) else { return };
+        let Some((di, _pi)) = self.dock_pane_of(id) else {
+            return;
+        };
         let parent = self.docks[di].window.clone();
         let sender = sender.clone();
-        let path = bookmark.path.as_deref().map(crate::config::expand_bookmark_path);
-        let title = if bookmark.is_folder() { "Edit Folder" } else { "Edit Bookmark" };
+        let path = bookmark
+            .path
+            .as_deref()
+            .map(crate::config::expand_bookmark_path);
+        let title = if bookmark.is_folder() {
+            "Edit Folder"
+        } else {
+            "Edit Bookmark"
+        };
         bookmarks::show_bookmark_dialog(
             &parent,
             title,
             &bookmark.name,
             path.as_deref(),
             move |name, path| {
-                sender.input(AppMsg::BookmarkEditSaved { index_path: index_path.clone(), name, path });
+                sender.input(AppMsg::BookmarkEditSaved {
+                    index_path: index_path.clone(),
+                    name,
+                    path,
+                });
             },
         );
     }
@@ -1352,7 +1420,9 @@ impl App {
     /// Open the "new bookmark" dialog for pane `id`: a name and a path (with a
     /// folder picker), matching the edit dialog.
     fn new_bookmark(&mut self, id: u64, sender: &ComponentSender<Self>) {
-        let Some((di, _pi)) = self.dock_pane_of(id) else { return };
+        let Some((di, _pi)) = self.dock_pane_of(id) else {
+            return;
+        };
         let parent = self.docks[di].window.clone();
         let sender = sender.clone();
         bookmarks::show_bookmark_dialog(
@@ -1370,7 +1440,9 @@ impl App {
 
     /// Open the "new folder" dialog for pane `id`: a name only.
     fn new_bookmark_folder(&mut self, id: u64, sender: &ComponentSender<Self>) {
-        let Some((di, _pi)) = self.dock_pane_of(id) else { return };
+        let Some((di, _pi)) = self.dock_pane_of(id) else {
+            return;
+        };
         let parent = self.docks[di].window.clone();
         let sender = sender.clone();
         bookmarks::show_bookmark_dialog(&parent, "New Folder", "", None, move |name, _path| {
@@ -1502,7 +1574,9 @@ impl App {
         else {
             return;
         };
-        self.docks[di].panes[pi].tree.emit(TreeMsg::OpenRoot(parent));
+        self.docks[di].panes[pi]
+            .tree
+            .emit(TreeMsg::OpenRoot(parent));
         self.focus_pane_later(id);
     }
 
@@ -1602,7 +1676,9 @@ impl App {
         let active = &self.active_workspace;
         dock.active_pane
             .filter(|id| {
-                dock.panes.iter().any(|pane| pane.id == *id && &pane.workspace == active)
+                dock.panes
+                    .iter()
+                    .any(|pane| pane.id == *id && &pane.workspace == active)
             })
             .or_else(|| {
                 dock.panes
@@ -1667,7 +1743,9 @@ impl App {
     /// canonical form of each pane root is cached on the pane, so this does no
     /// filesystem work for the common case.
     fn find_pane_with_dir(&self, path: &PathBuf) -> Option<(usize, usize)> {
-        let canonical = std::fs::canonicalize(path).ok().unwrap_or_else(|| path.clone());
+        let canonical = std::fs::canonicalize(path)
+            .ok()
+            .unwrap_or_else(|| path.clone());
         self.docks.iter().enumerate().find_map(|(di, dock)| {
             dock.panes.iter().enumerate().find_map(|(pi, pane)| {
                 if pane.canonical_root.as_deref() == Some(canonical.as_path()) {
@@ -1741,7 +1819,10 @@ impl App {
     /// Whether dock `di` holds at least one pane on the active workspace.
     fn dock_has_active_pane(&self, di: usize) -> bool {
         let active = &self.active_workspace;
-        self.docks[di].panes.iter().any(|pane| &pane.workspace == active)
+        self.docks[di]
+            .panes
+            .iter()
+            .any(|pane| &pane.workspace == active)
     }
 
     /// The most recently added pane on the active workspace in dock `di`, if any.
@@ -1836,8 +1917,12 @@ impl App {
             self.status = "Workspace moves need a Hyprland session".to_owned();
             return;
         }
-        let Some(id) = self.active_pane_id(None) else { return };
-        let Some((di, pi)) = self.dock_pane_of(id) else { return };
+        let Some(id) = self.active_pane_id(None) else {
+            return;
+        };
+        let Some((di, pi)) = self.dock_pane_of(id) else {
+            return;
+        };
         let from = self.docks[di].panes[pi].workspace.clone();
         let name = match target {
             WorkspaceMove::Named(name) => name,
@@ -1862,7 +1947,9 @@ impl App {
         if let Ok(id) = from.parse::<i64>() {
             return (id + delta as i64).max(1).to_string();
         }
-        let Some(hypr) = &self.hypr else { return String::new() };
+        let Some(hypr) = &self.hypr else {
+            return String::new();
+        };
         let names = hypr.workspace_names();
         if names.is_empty() {
             return from.to_owned();
@@ -1886,7 +1973,10 @@ impl App {
 
     /// The current width of `side`'s dock.
     fn width_for(&self, side: PanelSide) -> u32 {
-        self.widths.get(&side).copied().unwrap_or(self.config.panel.width)
+        self.widths
+            .get(&side)
+            .copied()
+            .unwrap_or(self.config.panel.width)
     }
 
     /// Resize `side`'s dock to `width` px, clamped, telling its trees so inline
@@ -1897,7 +1987,10 @@ impl App {
             return;
         }
         self.widths.insert(side, width);
-        let panel = PanelConfig { width, ..self.config.panel };
+        let panel = PanelConfig {
+            width,
+            ..self.config.panel
+        };
         for dock in self.docks.iter().filter(|dock| dock.side == side) {
             apply_window_width(&dock.window, width);
             for pane in &dock.panes {
@@ -1929,7 +2022,8 @@ impl App {
 
     /// Persist session state now. Invalidates any pending debounced save.
     fn persist_session(&mut self) {
-        self.save_generation.set(self.save_generation.get().wrapping_add(1));
+        self.save_generation
+            .set(self.save_generation.get().wrapping_add(1));
         if let Err(err) = self.session_state().save() {
             self.status = format!("Could not save session: {err}");
         }
@@ -1943,11 +2037,14 @@ impl App {
         self.save_generation.set(generation);
         let current = self.save_generation.clone();
         let state = self.session_state();
-        glib::timeout_add_local_once(std::time::Duration::from_millis(SAVE_DEBOUNCE_MS), move || {
-            if current.get() == generation {
-                let _ = state.save();
-            }
-        });
+        glib::timeout_add_local_once(
+            std::time::Duration::from_millis(SAVE_DEBOUNCE_MS),
+            move || {
+                if current.get() == generation {
+                    let _ = state.save();
+                }
+            },
+        );
     }
 
     /// Return the index of the dock on `(side, monitor)`, creating it (with a
@@ -2020,14 +2117,27 @@ impl App {
 
     /// Append a pane showing `root` to dock `di`, returning its id. A `None`
     /// root opens the bookmarks view instead of a directory.
-    fn add_pane(&mut self, di: usize, root: Option<PathBuf>, sender: &ComponentSender<Self>) -> u64 {
+    fn add_pane(
+        &mut self,
+        di: usize,
+        root: Option<PathBuf>,
+        sender: &ComponentSender<Self>,
+    ) -> u64 {
         let id = self.next_id;
         self.next_id += 1;
         let parent = self.docks[di].window.clone();
         let side = self.docks[di].side;
         let width = self.width_for(side);
         let workspace = self.active_workspace.clone();
-        let pane = make_pane(&self.config, parent, id, side, width, workspace, sender.clone());
+        let pane = make_pane(
+            &self.config,
+            parent,
+            id,
+            side,
+            width,
+            workspace,
+            sender.clone(),
+        );
         let mut pane = pane;
         match &root {
             Some(root) => pane.tree.emit(TreeMsg::OpenRoot(root.clone())),
@@ -2098,7 +2208,11 @@ impl App {
             let (x0, y0) = (g.x() as f64, g.y() as f64);
             let (w, h) = (g.width() as f64, g.height() as f64);
             if x >= x0 && x < x0 + w && y >= y0 && y < y0 + h {
-                let side = if x < x0 + w / 2.0 { PanelSide::Left } else { PanelSide::Right };
+                let side = if x < x0 + w / 2.0 {
+                    PanelSide::Left
+                } else {
+                    PanelSide::Right
+                };
                 return Some((side, monitor));
             }
         }
@@ -2108,7 +2222,9 @@ impl App {
     /// Begin a pane-move drag: remember the pane and the pointer's absolute
     /// start position, and cue the source pane.
     fn begin_pane_drag(&mut self, id: u64, start: (f64, f64)) {
-        let Some((di, pi)) = self.dock_pane_of(id) else { return };
+        let Some((di, pi)) = self.dock_pane_of(id) else {
+            return;
+        };
         // Compute the grip's top-left within the pane's current window. Doing
         // this here (rather than in the gesture closure) keeps it correct after
         // the pane has been moved to a different dock/window.
@@ -2120,16 +2236,25 @@ impl App {
                 .unwrap_or((0.0, 0.0))
         };
         let origin = self.dock_origin(di);
-        let base = (origin.0 + grip_origin.0 + start.0, origin.1 + grip_origin.1 + start.1);
+        let base = (
+            origin.0 + grip_origin.0 + start.0,
+            origin.1 + grip_origin.1 + start.1,
+        );
         self.docks[di].panes[pi].widget.add_css_class("pane-moving");
-        self.pane_drag = Some(PaneDrag { id, base, highlighted: None });
+        self.pane_drag = Some(PaneDrag {
+            id,
+            base,
+            highlighted: None,
+        });
         self.status = "Drag the pane to the edge of a screen to move it".to_owned();
     }
 
     /// Update the drop target for a drag in progress: highlight the target dock
     /// and describe it in the status line.
     fn update_pane_drag(&mut self, id: u64, offset: (f64, f64)) {
-        let Some(drag) = self.pane_drag.as_ref() else { return };
+        let Some(drag) = self.pane_drag.as_ref() else {
+            return;
+        };
         if drag.id != id {
             return;
         }
@@ -2166,13 +2291,17 @@ impl App {
     /// Finish a pane drag: move the pane to the target under the pointer, or
     /// cancel when it was dropped outside every monitor.
     fn end_pane_drag(&mut self, id: u64, offset: (f64, f64), sender: &ComponentSender<Self>) {
-        let Some(drag) = self.pane_drag.take() else { return };
+        let Some(drag) = self.pane_drag.take() else {
+            return;
+        };
         if drag.id != id {
             self.pane_drag = Some(drag);
             return;
         }
         if let Some((di, pi)) = self.dock_pane_of(id) {
-            self.docks[di].panes[pi].widget.remove_css_class("pane-moving");
+            self.docks[di].panes[pi]
+                .widget
+                .remove_css_class("pane-moving");
         }
         if let Some(di) = drag.highlighted
             && let Some(dock) = self.docks.get(di)
@@ -2195,7 +2324,9 @@ impl App {
         monitor: gdk::Monitor,
         sender: &ComponentSender<Self>,
     ) {
-        let Some((sdi, spi)) = self.dock_pane_of(id) else { return };
+        let Some((sdi, spi)) = self.dock_pane_of(id) else {
+            return;
+        };
         if self.dock_index_of(side, Some(&monitor)) == Some(sdi) {
             self.status.clear();
             return;
@@ -2251,7 +2382,9 @@ fn pane_item_message(target: &ShortcutTarget) -> Option<TreeMsg> {
                 target: ShortcutTarget::Builtin(*other),
             }),
         },
-        ShortcutTarget::Command(_) => Some(TreeMsg::RunShortcut { target: target.clone() }),
+        ShortcutTarget::Command(_) => Some(TreeMsg::RunShortcut {
+            target: target.clone(),
+        }),
     }
 }
 
@@ -2262,9 +2395,27 @@ fn build_nav_bar(id: u64, sender: &ComponentSender<App>) -> (gtk::Box, NavButton
     let bar = gtk::Box::new(gtk::Orientation::Horizontal, 2);
     bar.add_css_class("nav-toolbar");
 
-    let up = nav_button("pan-up-symbolic", "Up One Level", BuiltinAction::Up, id, sender);
-    let back = nav_button("pan-start-symbolic", "Back", BuiltinAction::Back, id, sender);
-    let forward = nav_button("pan-end-symbolic", "Forward", BuiltinAction::Forward, id, sender);
+    let up = nav_button(
+        "pan-up-symbolic",
+        "Up One Level",
+        BuiltinAction::Up,
+        id,
+        sender,
+    );
+    let back = nav_button(
+        "pan-start-symbolic",
+        "Back",
+        BuiltinAction::Back,
+        id,
+        sender,
+    );
+    let forward = nav_button(
+        "pan-end-symbolic",
+        "Forward",
+        BuiltinAction::Forward,
+        id,
+        sender,
+    );
 
     bar.append(&up);
     bar.append(&back);
@@ -2316,16 +2467,25 @@ fn make_pane(
             pane_menu: config.pane_menu.clone(),
             bookmarks_menu: config.bookmarks.menu.clone(),
         })
-        .forward(sender.input_sender(), move |out| AppMsg::PaneToolbar { id, out });
+        .forward(sender.input_sender(), move |out| AppMsg::PaneToolbar {
+            id,
+            out,
+        });
     let tree = Tree::builder()
         .launch(TreeInit {
             config: config.tree.clone(),
             parent,
             menu: config.context_menu.clone(),
             side,
-            panel: PanelConfig { width, ..config.panel },
+            panel: PanelConfig {
+                width,
+                ..config.panel
+            },
         })
-        .forward(sender.input_sender(), move |out| AppMsg::PaneTree { id, out });
+        .forward(sender.input_sender(), move |out| AppMsg::PaneTree {
+            id,
+            out,
+        });
 
     // The toolbar grip starts a pane-move drag. The gesture reports the press
     // point and offsets relative to it; the app adds them to the pane's
@@ -2338,15 +2498,24 @@ fn make_pane(
         drag.set_propagation_phase(gtk::PropagationPhase::Capture);
         let s = sender.clone();
         drag.connect_drag_begin(move |_, start_x, start_y| {
-            s.input(AppMsg::PaneDragBegin { id, start: (start_x, start_y) });
+            s.input(AppMsg::PaneDragBegin {
+                id,
+                start: (start_x, start_y),
+            });
         });
         let s = sender.clone();
         drag.connect_drag_update(move |_, offset_x, offset_y| {
-            s.input(AppMsg::PaneDragUpdate { id, offset: (offset_x, offset_y) });
+            s.input(AppMsg::PaneDragUpdate {
+                id,
+                offset: (offset_x, offset_y),
+            });
         });
         let s = sender.clone();
         drag.connect_drag_end(move |_, offset_x, offset_y| {
-            s.input(AppMsg::PaneDragEnd { id, offset: (offset_x, offset_y) });
+            s.input(AppMsg::PaneDragEnd {
+                id,
+                offset: (offset_x, offset_y),
+            });
         });
         grip.add_controller(drag);
     }
@@ -2418,7 +2587,14 @@ fn make_pane(
         let sender = sender.clone();
         let on_event: Rc<dyn Fn(BookmarkEvent)> =
             Rc::new(move |event| sender.input(AppMsg::BookmarkEvent { id, event }));
-        bookmarks::attach_bookmarks_scroller(&bookmarks_scroll, &items, side, &bookmark_drag, &bookmark_nav, on_event);
+        bookmarks::attach_bookmarks_scroller(
+            &bookmarks_scroll,
+            &items,
+            side,
+            &bookmark_drag,
+            &bookmark_nav,
+            on_event,
+        );
     }
 
     let body = gtk::Stack::new();
@@ -2476,6 +2652,7 @@ fn make_pane(
         widget: overlay,
         grip,
         shortcuts,
+        split: Cell::new(0.5),
     }
 }
 
@@ -2521,6 +2698,25 @@ fn pane_widget(pane: &Pane) -> gtk::Widget {
 /// Called on every split/close/workspace change so widget references are always
 /// fresh.
 fn fill_pane_container(container: &gtk::Box, panes: &[Pane], active: &str) {
+    // Capture each pane's current divider fraction before the structure is
+    // discarded. The widget tree is rebuilt on every workspace switch (and
+    // split/close), so without this the user's dragged divider positions are
+    // lost and each `GtkPaned` re-centers at 50/50.
+    for pane in panes {
+        if let Some(parent) = pane.widget.parent()
+            && let Ok(paned) = parent.downcast::<gtk::Paned>()
+            && paned
+                .start_child()
+                .is_some_and(|c| c == pane.widget.clone().upcast::<gtk::Widget>())
+        {
+            let alloc = paned.height();
+            if alloc > 0 {
+                let fraction = paned.position() as f64 / alloc as f64;
+                pane.split.set(fraction.clamp(0.0, 1.0));
+            }
+        }
+    }
+
     // Detach every pane box from its old parent *first*, using each parent's
     // removal API. A raw `unparent()` alone is not enough: a Paned keeps stale
     // child slots that re-unparent the widget when the old chain is finally
@@ -2534,7 +2730,10 @@ fn fill_pane_container(container: &gtk::Box, panes: &[Pane], active: &str) {
         container.remove(&child);
     }
 
-    let visible: Vec<&Pane> = panes.iter().filter(|pane| pane.workspace == active).collect();
+    let visible: Vec<&Pane> = panes
+        .iter()
+        .filter(|pane| pane.workspace == active)
+        .collect();
     match visible.as_slice() {
         [] => {}
         [single] => {
@@ -2562,18 +2761,20 @@ fn fill_pane_container(container: &gtk::Box, panes: &[Pane], active: &str) {
                 split.set_resize_end_child(true);
                 split.set_start_child(Some(&left_w));
                 split.set_end_child(Some(&right));
-                // Default to 50/50 split: set position after a short delay once
-                // GTK has allocated space and computed max_position.
+                // Restore this pane's saved divider fraction (50/50 for a
+                // freshly split pane) once GTK has allocated space.
                 {
+                    let fraction = pane.split.get();
                     let split2 = split.clone();
                     relm4::gtk::glib::timeout_add_local_once(
                         std::time::Duration::from_millis(PANED_CENTER_DELAY_MS),
                         move || {
                             // max_position is INT_MAX until the widget is allocated;
-                            // once it has a real allocation, use half the actual height.
+                            // once it has a real allocation, use the saved fraction
+                            // of the actual height.
                             let alloc = split2.height();
                             if alloc > 0 {
-                                split2.set_position(alloc / 2);
+                                split2.set_position((alloc as f64 * fraction) as i32);
                             }
                         },
                     );
@@ -2689,11 +2890,17 @@ fn attach_resize_keys(window: &gtk::Window, side: PanelSide, sender: relm4::Send
         }
         match key {
             gdk::Key::minus | gdk::Key::underscore | gdk::Key::KP_Subtract => {
-                let _ = sender.send(AppMsg::ResizeBy { side, delta: -WIDTH_STEP });
+                let _ = sender.send(AppMsg::ResizeBy {
+                    side,
+                    delta: -WIDTH_STEP,
+                });
                 glib::Propagation::Stop
             }
             gdk::Key::equal | gdk::Key::plus | gdk::Key::KP_Add => {
-                let _ = sender.send(AppMsg::ResizeBy { side, delta: WIDTH_STEP });
+                let _ = sender.send(AppMsg::ResizeBy {
+                    side,
+                    delta: WIDTH_STEP,
+                });
                 glib::Propagation::Stop
             }
             _ => glib::Propagation::Proceed,
@@ -2901,7 +3108,10 @@ fn default_root(startup: &StartupRoot) -> Option<PathBuf> {
         return None;
     }
     let last = SessionState::load().last_root.filter(|p| p.is_dir());
-    startup.resolve(last).filter(|p| p.is_dir()).or_else(home_dir)
+    startup
+        .resolve(last)
+        .filter(|p| p.is_dir())
+        .or_else(home_dir)
 }
 
 /// Translate an index `path` into the tree that remains after the entry at
@@ -2946,7 +3156,11 @@ mod visibility_tests {
     const L: PanelSide = PanelSide::Left;
     const R: PanelSide = PanelSide::Right;
 
-    fn plan(intent: VisibilityIntent, existing: &[PanelSide], shown: &[PanelSide]) -> VisibilityPlan {
+    fn plan(
+        intent: VisibilityIntent,
+        existing: &[PanelSide],
+        shown: &[PanelSide],
+    ) -> VisibilityPlan {
         resolve_visibility(intent, existing, shown)
     }
 

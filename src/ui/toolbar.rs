@@ -212,8 +212,11 @@ impl SimpleComponent for Toolbar {
                 self.completion.suppress.set(false);
             }
             ToolbarMsg::SetBookmarks(on) => {
-                let items =
-                    if on { &self.bookmarks_items } else { &self.pane_items };
+                let items = if on {
+                    &self.bookmarks_items
+                } else {
+                    &self.pane_items
+                };
                 let popover = build_pane_popover(items, &sender);
                 self.menu_button.set_popover(Some(&popover));
             }
@@ -250,7 +253,15 @@ fn attach_completion(
             let found = suggestions(&entry.text());
             *items.borrow_mut() = found;
             selected.set(0);
-            rebuild_list(&list, &items.borrow(), 0, &entry_for_rows, &dropdown, &suppress, &sender);
+            rebuild_list(
+                &list,
+                &items.borrow(),
+                0,
+                &entry_for_rows,
+                &dropdown,
+                &suppress,
+                &sender,
+            );
             if items.borrow().is_empty() {
                 dropdown.set_visible(false);
             } else {
@@ -420,7 +431,11 @@ fn suggestions(text: &str) -> Vec<PathBuf> {
         Some((head, name)) => (format!("{head}/"), name.to_string()),
         None => (String::new(), expanded),
     };
-    let dir = if parent.is_empty() { PathBuf::from(".") } else { PathBuf::from(&parent) };
+    let dir = if parent.is_empty() {
+        PathBuf::from(".")
+    } else {
+        PathBuf::from(&parent)
+    };
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Vec::new();
     };
@@ -435,7 +450,10 @@ fn suggestions(text: &str) -> Vec<PathBuf> {
         .collect();
     names.sort();
     names.truncate(MAX_SUGGESTIONS);
-    names.into_iter().map(|name| PathBuf::from(format!("{parent}{name}"))).collect()
+    names
+        .into_iter()
+        .map(|name| PathBuf::from(format!("{parent}{name}")))
+        .collect()
 }
 
 /// Build the hamburger popover from a configured menu (the pane menu or the
@@ -590,11 +608,7 @@ impl PaneShortcuts {
     }
 
     /// The menu item whose shortcut matches this key event, if any.
-    pub fn action_for(
-        &self,
-        key: gdk::Key,
-        state: gdk::ModifierType,
-    ) -> Option<ContextAction> {
+    pub fn action_for(&self, key: gdk::Key, state: gdk::ModifierType) -> Option<ContextAction> {
         let state = accel_mods(state);
         self.bindings
             .iter()

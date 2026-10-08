@@ -148,9 +148,7 @@ fn kind_for_content_type(ctype: &str) -> Option<PreviewKind> {
         return cfg!(feature = "audio").then_some(PreviewKind::Audio);
     }
     // Ogg is a container that is usually audio (Vorbis); give it the player.
-    if cfg!(feature = "audio")
-        && matches!(ctype, "application/ogg" | "application/x-ogg")
-    {
+    if cfg!(feature = "audio") && matches!(ctype, "application/ogg" | "application/x-ogg") {
         return Some(PreviewKind::Audio);
     }
     if is_archive(ctype) {
@@ -172,7 +170,10 @@ fn kind_for_content_type(ctype: &str) -> Option<PreviewKind> {
 fn is_csv(ctype: &str) -> bool {
     matches!(
         ctype,
-        "text/csv" | "text/tab-separated-values" | "application/csv" | "text/x-csv"
+        "text/csv"
+            | "text/tab-separated-values"
+            | "application/csv"
+            | "text/x-csv"
             | "text/x-comma-separated-values"
     )
 }
@@ -180,7 +181,10 @@ fn is_csv(ctype: &str) -> bool {
 /// The concrete structured format a content type names, if any.
 fn structured_kind(ctype: &str) -> Option<PreviewKind> {
     match ctype {
-        "application/json" | "text/json" | "application/x-json" | "application/ld+json"
+        "application/json"
+        | "text/json"
+        | "application/x-json"
+        | "application/ld+json"
         | "application/x-ndjson" => Some(PreviewKind::Json),
         "application/toml" | "text/toml" | "text/x-toml" | "application/x-toml" => {
             Some(PreviewKind::Toml)
@@ -272,8 +276,18 @@ fn extension_kind(path: &Path) -> Option<PreviewKind> {
     if cfg!(feature = "audio")
         && matches!(
             ext.as_str(),
-            "mp3" | "m4a" | "m4b" | "aac" | "flac" | "wav" | "opus" | "oga" | "wma" | "aif"
-                | "aiff" | "alac"
+            "mp3"
+                | "m4a"
+                | "m4b"
+                | "aac"
+                | "flac"
+                | "wav"
+                | "opus"
+                | "oga"
+                | "wma"
+                | "aif"
+                | "aiff"
+                | "alac"
         )
     {
         return Some(PreviewKind::Audio);
@@ -291,8 +305,8 @@ fn extension_kind(path: &Path) -> Option<PreviewKind> {
         "json" => PreviewKind::Json,
         "toml" => PreviewKind::Toml,
         "yaml" | "yml" => PreviewKind::Yaml,
-        "txt" | "md" | "markdown" | "log" | "rs" | "go" | "c" | "h" | "cpp" | "hpp" | "py" | "js"
-        | "ts" | "sh" | "ini" | "conf" | "cfg" | "xml" | "html" | "css" | "svg" => {
+        "txt" | "md" | "markdown" | "log" | "rs" | "go" | "c" | "h" | "cpp" | "hpp" | "py"
+        | "js" | "ts" | "sh" | "ini" | "conf" | "cfg" | "xml" | "html" | "css" | "svg" => {
             PreviewKind::Text
         }
         _ => return None,
@@ -327,7 +341,11 @@ pub fn load_document(path: &Path, kind: PreviewKind) -> Option<DocumentData> {
     match kind {
         PreviewKind::Text => {
             let text = read_text(path, PREVIEW_BYTES)?;
-            Some(DocumentData::Lines(lines_from(&text, PREVIEW_LINES, language)))
+            Some(DocumentData::Lines(lines_from(
+                &text,
+                PREVIEW_LINES,
+                language,
+            )))
         }
         PreviewKind::Json | PreviewKind::Toml | PreviewKind::Yaml => {
             let text = read_text(path, PREVIEW_BYTES)?;
@@ -441,7 +459,11 @@ fn lines_from(text: &str, max_lines: usize, language: Language) -> DocumentLines
     // `all` is not exhausted if the file continued past the cap.
     let more = all.next().is_some();
     let syntax = highlight::highlight(language, &lines.join("\n"));
-    DocumentLines { lines, more, syntax }
+    DocumentLines {
+        lines,
+        more,
+        syntax,
+    }
 }
 
 /// Cap a line so a minified file can't produce an unbounded label.
@@ -459,21 +481,29 @@ fn truncate_line(line: &str) -> String {
 /// already names the line and column, so it is shown as-is.
 fn parse_status(text: &str, kind: PreviewKind) -> ParseStatus {
     match kind {
-        PreviewKind::Json => {
-            status_of(serde_json::from_str::<serde_json::Value>(text).err(), "valid JSON")
-        }
+        PreviewKind::Json => status_of(
+            serde_json::from_str::<serde_json::Value>(text).err(),
+            "valid JSON",
+        ),
         PreviewKind::Toml => status_of(toml::from_str::<toml::Value>(text).err(), "valid TOML"),
-        PreviewKind::Yaml => {
-            status_of(serde_norway::from_str::<serde_norway::Value>(text).err(), "valid YAML")
-        }
-        _ => ParseStatus { ok: true, detail: String::new() },
+        PreviewKind::Yaml => status_of(
+            serde_norway::from_str::<serde_norway::Value>(text).err(),
+            "valid YAML",
+        ),
+        _ => ParseStatus {
+            ok: true,
+            detail: String::new(),
+        },
     }
 }
 
 /// Turn an optional parse error into a status line.
 fn status_of(error: Option<impl std::fmt::Display>, valid: &str) -> ParseStatus {
     match error {
-        None => ParseStatus { ok: true, detail: valid.to_owned() },
+        None => ParseStatus {
+            ok: true,
+            detail: valid.to_owned(),
+        },
         Some(err) => ParseStatus {
             ok: false,
             detail: first_line(&err.to_string()).to_owned(),
@@ -697,7 +727,9 @@ mod tests {
     #[test]
     fn detection_prefers_content_over_extension() {
         let dir = tempdir().unwrap();
-        let png: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d, b'I', b'H', b'D', b'R'];
+        let png: &[u8] = &[
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0x0d, b'I', b'H', b'D', b'R',
+        ];
         // Text masquerading as an image must not be treated as one.
         let fake = write(dir.path(), "fake.png", b"hello, this is plain text\n");
         assert_eq!(detect(&fake), Some(PreviewKind::Text));
@@ -883,7 +915,9 @@ mod tests {
         header.set_size(2);
         header.set_mode(0o644);
         header.set_cksum();
-        builder.append_data(&mut header, "hello.txt", &b"hi"[..]).unwrap();
+        builder
+            .append_data(&mut header, "hello.txt", &b"hi"[..])
+            .unwrap();
         builder.finish().unwrap();
         let ArchiveData::Listed(listing) = list_archive(&tar_path) else {
             panic!("expected a tar listing");
@@ -899,7 +933,9 @@ mod tests {
         header.set_size(2);
         header.set_mode(0o644);
         header.set_cksum();
-        builder.append_data(&mut header, "hello.txt", &b"hi"[..]).unwrap();
+        builder
+            .append_data(&mut header, "hello.txt", &b"hi"[..])
+            .unwrap();
         builder.into_inner().unwrap().finish().unwrap();
         let ArchiveData::Listed(listing) = list_archive(&tgz_path) else {
             panic!("expected a tar.gz listing");
@@ -916,4 +952,3 @@ mod tests {
         };
     }
 }
-

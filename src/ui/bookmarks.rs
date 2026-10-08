@@ -23,7 +23,9 @@ use crate::config::{
     Bookmark, BuiltinAction, ContextAction, ContextMenu, PanelSide, ShortcutTarget,
     expand_bookmark_path,
 };
-use crate::ui::tree::{accel_display, begin_row_drag, is_path_safe, menu_label, past_drag_threshold};
+use crate::ui::tree::{
+    accel_display, begin_row_drag, is_path_safe, menu_label, past_drag_threshold,
+};
 
 /// Where a dragged bookmark was dropped.
 #[derive(Debug, Clone)]
@@ -133,7 +135,11 @@ impl BookmarkNav {
             .and_then(|c| self.nodes.borrow().get(c).map(|n| n.index_path.clone()));
         *self.nodes.borrow_mut() = nodes;
         let len = self.len();
-        self.cursor.set(cursor_after_rebuild(prev.as_deref(), &self.nodes.borrow(), len));
+        self.cursor.set(cursor_after_rebuild(
+            prev.as_deref(),
+            &self.nodes.borrow(),
+            len,
+        ));
     }
 
     /// Reflect the cursor in the `.bookmark-row-selected` class.
@@ -274,7 +280,11 @@ fn cursor_after_move(cursor: Option<usize>, delta: i32, len: usize) -> Option<us
 
 /// The cursor after a rebuild: stay on the entry with the same index path, or
 /// fall back to the first row when it is gone.
-fn cursor_after_rebuild(path: Option<&[usize]>, nodes: &[BookmarkNode], len: usize) -> Option<usize> {
+fn cursor_after_rebuild(
+    path: Option<&[usize]>,
+    nodes: &[BookmarkNode],
+    len: usize,
+) -> Option<usize> {
     if len == 0 {
         return None;
     }
@@ -301,7 +311,10 @@ pub enum BookmarkEvent {
     NewBookmarkFolder,
     /// Run an inherited (directory) context action against `path` without
     /// opening it.
-    Action { path: PathBuf, target: ShortcutTarget },
+    Action {
+        path: PathBuf,
+        target: ShortcutTarget,
+    },
     /// Move the entry at `from` to `to` (drag and drop).
     Move { from: Vec<usize>, to: MoveTarget },
 }
@@ -348,7 +361,11 @@ pub fn fill_bookmarks(
         nav.focus_start();
     }
     if list.first_child().is_none() {
-        let text = if filtering { "No matching bookmarks" } else { "No bookmarks — use Add Bookmark" };
+        let text = if filtering {
+            "No matching bookmarks"
+        } else {
+            "No bookmarks — use Add Bookmark"
+        };
         let empty = gtk::Label::new(Some(text));
         empty.add_css_class("bookmarks-empty");
         empty.set_xalign(0.0);
@@ -439,7 +456,10 @@ pub fn attach_bookmarks_scroller(
             let Some(from) = drag.dragging.borrow().clone() else {
                 return false;
             };
-            on_event(BookmarkEvent::Move { from, to: MoveTarget::Root });
+            on_event(BookmarkEvent::Move {
+                from,
+                to: MoveTarget::Root,
+            });
             true
         });
         anchor.add_controller(drop);
@@ -458,7 +478,9 @@ pub fn attach_bookmarks_scroller(
                         .downcast_ref::<gdk::ButtonEvent>()
                         .map(|b| b.button())
                         .unwrap_or(0);
-                    if button == 1 && let Some(pos) = event.position() {
+                    if button == 1
+                        && let Some(pos) = event.position()
+                    {
                         *d.start.borrow_mut() = Some(pos);
                     }
                 }
@@ -559,7 +581,13 @@ fn walk_nodes(
         let folder = entry.is_folder();
         match query {
             None => {
-                out.push(node_of(entry, index_path.clone(), depth, folder, entry.expanded));
+                out.push(node_of(
+                    entry,
+                    index_path.clone(),
+                    depth,
+                    folder,
+                    entry.expanded,
+                ));
                 if folder && entry.expanded {
                     walk_nodes(&entry.items, &index_path, depth + 1, None, out);
                 }
@@ -600,7 +628,13 @@ fn walk_all(entries: &[Bookmark], prefix: &[usize], depth: usize, out: &mut Vec<
     }
 }
 
-fn node_of(entry: &Bookmark, index_path: Vec<usize>, depth: usize, folder: bool, open: bool) -> BookmarkNode {
+fn node_of(
+    entry: &Bookmark,
+    index_path: Vec<usize>,
+    depth: usize,
+    folder: bool,
+    open: bool,
+) -> BookmarkNode {
     BookmarkNode {
         index_path,
         name: entry.name.clone(),
@@ -680,7 +714,14 @@ fn bookmark_row(
         popover.set_has_arrow(true);
         let menu_box = gtk::Box::new(gtk::Orientation::Vertical, 0);
         menu_box.add_css_class("bookmark-menu");
-        append_bookmark_items(&menu_box, &actions, path.as_deref(), index_path, menu.side, on_event.clone());
+        append_bookmark_items(
+            &menu_box,
+            &actions,
+            path.as_deref(),
+            index_path,
+            menu.side,
+            on_event.clone(),
+        );
         popover.set_child(Some(&menu_box));
 
         popover.set_parent(&row);
@@ -752,7 +793,12 @@ fn bookmark_row(
 /// sense on a bare path, followed by the `[bookmarks] context` extras.
 fn build_bookmark_actions(path: Option<&Path>, menu: &BookmarkMenuConfig) -> Vec<ContextAction> {
     let mut actions: Vec<ContextAction> = match path {
-        Some(path) => menu.context.actions_for(path).into_iter().filter(action_allowed).collect(),
+        Some(path) => menu
+            .context
+            .actions_for(path)
+            .into_iter()
+            .filter(action_allowed)
+            .collect(),
         None => Vec::new(),
     };
     actions.extend(menu.extras.iter().filter(|a| action_allowed(a)).cloned());
@@ -813,7 +859,8 @@ fn append_bookmark_items(
         // A submenu row opens a nested popover.
         if let ContextAction::Submenu(sub) = action {
             let button = submenu_row_button(&sub.label);
-            let popover = build_bookmark_submenu(&sub.items, path, index_path, side, on_event.clone());
+            let popover =
+                build_bookmark_submenu(&sub.items, path, index_path, side, on_event.clone());
             let child = popover.clone();
             let anchor = button.clone();
             button.connect_clicked(move |_| {
@@ -839,7 +886,11 @@ fn append_bookmark_items(
 
         let row_box = gtk::Box::new(gtk::Orientation::Horizontal, 12);
         row_box.add_css_class("tree-menu-item");
-        let label = gtk::Label::new(Some(&menu_label(action, path.unwrap_or(Path::new("")), side)));
+        let label = gtk::Label::new(Some(&menu_label(
+            action,
+            path.unwrap_or(Path::new("")),
+            side,
+        )));
         label.set_xalign(0.0);
         label.set_hexpand(true);
         let button = gtk::Button::new();
@@ -880,9 +931,7 @@ fn bookmark_event(
         ShortcutTarget::Builtin(BuiltinAction::DeleteBookmark) => {
             Some(BookmarkEvent::Delete(index_path.to_vec()))
         }
-        ShortcutTarget::Builtin(BuiltinAction::NewBookmark) => {
-            Some(BookmarkEvent::NewBookmark)
-        }
+        ShortcutTarget::Builtin(BuiltinAction::NewBookmark) => Some(BookmarkEvent::NewBookmark),
         ShortcutTarget::Builtin(BuiltinAction::NewBookmarkFolder) => {
             Some(BookmarkEvent::NewBookmarkFolder)
         }
@@ -1050,7 +1099,11 @@ pub fn show_bookmark_dialog(
                 return;
             }
             let path = expand_bookmark_path(Path::new(&raw));
-            let name = if typed.is_empty() { Bookmark::default_name(&path) } else { typed };
+            let name = if typed.is_empty() {
+                Bookmark::default_name(&path)
+            } else {
+                typed
+            };
             on_save(name, Some(path));
             window.close();
         })
@@ -1091,7 +1144,9 @@ pub fn show_bookmark_dialog(
 
 #[cfg(test)]
 mod tests {
-    use super::{bookmark_matches, cursor_after_move, cursor_after_rebuild, visible_nodes, BookmarkNode};
+    use super::{
+        BookmarkNode, bookmark_matches, cursor_after_move, cursor_after_rebuild, visible_nodes,
+    };
     use crate::config::Bookmark;
     use std::path::PathBuf;
 
@@ -1128,16 +1183,13 @@ mod tests {
         let nodes = visible_nodes(&list, None);
         // A collapsed folder contributes only itself; an expanded one lists its
         // child at the next depth.
-        let shape: Vec<(Vec<usize>, usize)> =
-            nodes.iter().map(|n| (n.index_path.clone(), n.depth)).collect();
+        let shape: Vec<(Vec<usize>, usize)> = nodes
+            .iter()
+            .map(|n| (n.index_path.clone(), n.depth))
+            .collect();
         assert_eq!(
             shape,
-            vec![
-                (vec![0], 0),
-                (vec![1], 0),
-                (vec![2], 0),
-                (vec![2, 0], 1),
-            ]
+            vec![(vec![0], 0), (vec![1], 0), (vec![2], 0), (vec![2, 0], 1),]
         );
         assert!(nodes[1].folder && !nodes[1].open);
         assert!(!nodes[3].folder && nodes[3].depth == 1);
@@ -1195,9 +1247,15 @@ mod tests {
             depth: 0,
         };
         let nodes = vec![node(&[0]), node(&[1]), node(&[1, 0])];
-        assert_eq!(cursor_after_rebuild(Some(&[1, 0]), &nodes, nodes.len()), Some(2));
+        assert_eq!(
+            cursor_after_rebuild(Some(&[1, 0]), &nodes, nodes.len()),
+            Some(2)
+        );
         // A vanished entry falls back to the first row.
-        assert_eq!(cursor_after_rebuild(Some(&[9]), &nodes, nodes.len()), Some(0));
+        assert_eq!(
+            cursor_after_rebuild(Some(&[9]), &nodes, nodes.len()),
+            Some(0)
+        );
         assert_eq!(cursor_after_rebuild(None, &nodes, nodes.len()), None);
         assert_eq!(cursor_after_rebuild(Some(&[0]), &[], 0), None);
     }

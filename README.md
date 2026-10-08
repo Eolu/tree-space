@@ -73,16 +73,24 @@ tree-space is Wayland-only and needs a compositor that implements
 compositors). On a compositor that does not provide it (GNOME/Mutter,
 KDE/KWin) the panel still runs, but as a floating window rather than a dock.
 
-### Arch / Omarchy (AUR)
+### Arch / Omarchy
+
+The PKGBUILDs live in `packaging/aur/`. They are not on the AUR yet, so build
+the package locally:
 
 ```bash
-yay -S tree-space       # builds from source
-yay -S tree-space-bin   # prebuilt binary
+git clone https://github.com/Eolu/tree-space
+cd tree-space/packaging/aur/tree-space
+makepkg -si
 ```
 
-The package installs `/usr/bin/tree-space`, the desktop entry and the icon. It
-does **not** change your default file manager; see
+The package installs `/usr/bin/tree-space` (the `/usr/bin/ts` name belongs to
+`moreutils`), the desktop entry and the icon. It does **not** change your
+default file manager; see
 [Making it your default file manager](#making-it-your-default-file-manager).
+
+> Once the packages are accepted on the AUR, `yay -S tree-space` (release) and
+> `yay -S tree-space-git` (latest `master`) will work instead.
 
 ### cargo install
 
@@ -721,7 +729,7 @@ Directories may also be passed via `TREE_SPACE_DIRS` as a colon-separated list.
 
 ### Making it your default file manager
 
-The AUR package installs the application entry and icon but leaves your
+The Arch package installs the application entry and icon but leaves your
 defaults alone. To route folders and `file://` links to tree-space for your
 user:
 

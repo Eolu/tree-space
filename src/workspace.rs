@@ -82,10 +82,15 @@ impl Hyprland {
     /// form first and fall back when the compositor reports an error.
     pub fn dispatch_workspace(&self, name: &str) {
         let classic = self.command(&format!("dispatch workspace {name}"));
-        if classic.as_deref().is_some_and(|response| response.trim() == "ok") {
+        if classic
+            .as_deref()
+            .is_some_and(|response| response.trim() == "ok")
+        {
             return;
         }
-        let _ = self.command(&format!("dispatch hl.dsp.focus({{ workspace = \"{name}\" }})"));
+        let _ = self.command(&format!(
+            "dispatch hl.dsp.focus({{ workspace = \"{name}\" }})"
+        ));
     }
 
     /// Spawn a thread that calls `on_change` with the newly focused workspace's
@@ -94,14 +99,17 @@ impl Hyprland {
     pub fn spawn_watcher(&self, on_change: impl Fn(String) + Send + 'static) {
         let path = self.event.clone();
         std::thread::spawn(move || {
-            let Ok(stream) = UnixStream::connect(&path) else { return };
+            let Ok(stream) = UnixStream::connect(&path) else {
+                return;
+            };
             for line in BufReader::new(stream).lines() {
                 let Ok(line) = line else { break };
                 // `workspace>>NAME` on a workspace switch, and
                 // `focusedmon>>MON,NAME` when focus moves between monitors.
-                let workspace = line
-                    .strip_prefix("workspace>>")
-                    .or_else(|| line.strip_prefix("focusedmon>>").and_then(|rest| rest.split_once(',').map(|(_, ws)| ws)));
+                let workspace = line.strip_prefix("workspace>>").or_else(|| {
+                    line.strip_prefix("focusedmon>>")
+                        .and_then(|rest| rest.split_once(',').map(|(_, ws)| ws))
+                });
                 if let Some(name) = workspace {
                     on_change(name.to_owned());
                 }

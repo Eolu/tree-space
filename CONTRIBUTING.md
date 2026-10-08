@@ -33,8 +33,7 @@ can be tested without GTK.
 ## Releases
 
 Releases are cut from the public repository
-[`Eolu/tree-space`](https://github.com/Eolu/tree-space) (this repo is mirrored
-there). Packaging lives in `packaging/`; see `packaging/aur`.
+[`Eolu/tree-space`](https://github.com/Eolu/tree-space). Packaging lives in `packaging/`; see `packaging/aur`.
 
 ## Reporting bugs
 

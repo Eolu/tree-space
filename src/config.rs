@@ -74,8 +74,8 @@ pub fn default_structure() -> &'static str {
 fn builtin() -> &'static Config {
     static ONCE: OnceLock<Config> = OnceLock::new();
     ONCE.get_or_init(|| {
-        let raw: ShippedRaw = toml::from_str(DEFAULT_CONFIG)
-            .expect("default-config.toml must be valid TOML");
+        let raw: ShippedRaw =
+            toml::from_str(DEFAULT_CONFIG).expect("default-config.toml must be valid TOML");
         Config {
             panel: raw.panel.unwrap_or_default(),
             theme: raw.theme.unwrap_or_default(),
@@ -120,7 +120,10 @@ struct ShippedRaw {
 fn xdg_config_home(xdg: Option<&str>, home: Option<&str>) -> PathBuf {
     match xdg.filter(|s| !s.is_empty()) {
         Some(dir) => PathBuf::from(dir),
-        None => home.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/")).join(".config"),
+        None => home
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/"))
+            .join(".config"),
     }
 }
 
@@ -128,7 +131,10 @@ fn xdg_config_home(xdg: Option<&str>, home: Option<&str>) -> PathBuf {
 fn xdg_state_home(xdg: Option<&str>, home: Option<&str>) -> PathBuf {
     match xdg.filter(|s| !s.is_empty()) {
         Some(dir) => PathBuf::from(dir),
-        None => home.map(PathBuf::from).unwrap_or_else(|| PathBuf::from("/")).join(".local/state"),
+        None => home
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("/"))
+            .join(".local/state"),
     }
 }
 
@@ -176,7 +182,11 @@ pub fn bookmark_file_path(configured: &Path) -> PathBuf {
 
 /// Resolve a `[bookmarks] file` against `base` (the config file's directory).
 fn resolve_bookmarks_path(base: &Path, configured: &Path) -> PathBuf {
-    if configured.is_absolute() { configured.to_path_buf() } else { base.join(configured) }
+    if configured.is_absolute() {
+        configured.to_path_buf()
+    } else {
+        base.join(configured)
+    }
 }
 
 /// Expand a leading `~` in a bookmark path (a no-op for ordinary paths). Stored
@@ -275,7 +285,10 @@ pub struct ThemeConfig {
 
 impl Default for ThemeConfig {
     fn default() -> Self {
-        Self { mode: ThemeMode::Custom, system: SystemTheme::Omarchy }
+        Self {
+            mode: ThemeMode::Custom,
+            system: SystemTheme::Omarchy,
+        }
     }
 }
 
@@ -560,13 +573,11 @@ impl ContextMatch {
                     return Ok(ContextMatch::Ext(ext.to_owned()));
                 }
                 if let Some(pattern) = value.strip_prefix("regex:") {
-                    return Regex::new(pattern)
-                        .map(ContextMatch::Regex)
-                        .map_err(|err| {
-                            format!(
-                                "invalid regex {pattern:?} in context menu matcher {value:?}: {err}"
-                            )
-                        });
+                    return Regex::new(pattern).map(ContextMatch::Regex).map_err(|err| {
+                        format!(
+                            "invalid regex {pattern:?} in context menu matcher {value:?}: {err}"
+                        )
+                    });
                 }
                 Err(format!("unknown context menu matcher {value:?}"))
             }
@@ -601,7 +612,8 @@ impl ContextMatch {
                     return false;
                 };
                 let name = name.to_string_lossy().to_lowercase();
-                name.trim_start_matches('.').ends_with(&format!(".{}", ext.trim().to_lowercase()))
+                name.trim_start_matches('.')
+                    .ends_with(&format!(".{}", ext.trim().to_lowercase()))
             }
             ContextMatch::Regex(re) => re.is_match(&path.to_string_lossy()),
         }
@@ -1033,7 +1045,11 @@ pub struct Submenu {
 impl Submenu {
     /// Wrap `items` in a submenu with the given `label`.
     pub fn new(label: impl Into<String>, items: Vec<ContextAction>) -> Self {
-        Self { label: label.into(), items, hidden: false }
+        Self {
+            label: label.into(),
+            items,
+            hidden: false,
+        }
     }
 }
 
@@ -1091,9 +1107,10 @@ impl ContextAction {
     pub fn label(&self) -> String {
         match self {
             ContextAction::Builtin(action) => action.as_str().to_owned(),
-            ContextAction::Entry(entry) => {
-                entry.label.clone().unwrap_or_else(|| entry.action.as_str().to_owned())
-            }
+            ContextAction::Entry(entry) => entry
+                .label
+                .clone()
+                .unwrap_or_else(|| entry.action.as_str().to_owned()),
             ContextAction::Command(cmd) => cmd.label.clone().unwrap_or_else(|| cmd.command.clone()),
             ContextAction::Submenu(sub) => sub.label.clone(),
         }
@@ -1128,9 +1145,7 @@ impl ContextAction {
     /// written in table form, otherwise the builtin's default shortcut.
     pub fn shortcut(&self) -> Option<String> {
         match self {
-            ContextAction::Builtin(action) => action
-                .default_shortcut()
-                .map(str::to_owned),
+            ContextAction::Builtin(action) => action.default_shortcut().map(str::to_owned),
             ContextAction::Entry(entry) => entry
                 .shortcut
                 .clone()
@@ -1181,12 +1196,20 @@ pub struct ContextRule {
 impl ContextRule {
     /// A plain matching rule.
     pub fn rule(matches: Vec<ContextMatch>, items: Vec<ContextAction>) -> Self {
-        ContextRule { matches, items, include: None }
+        ContextRule {
+            matches,
+            items,
+            include: None,
+        }
     }
 
     /// An include placeholder.
     pub fn include(path: PathBuf) -> Self {
-        ContextRule { matches: Vec::new(), items: Vec::new(), include: Some(path) }
+        ContextRule {
+            matches: Vec::new(),
+            items: Vec::new(),
+            include: Some(path),
+        }
     }
 }
 
@@ -1213,7 +1236,11 @@ impl ContextMenu {
     /// rule of the shipped default (so `default-config.toml` also decides the
     /// fallback); an empty menu when neither is present.
     pub fn fallback_actions(path: &Path) -> Vec<ContextAction> {
-        let wanted = if path.is_dir() { ContextMatch::Dir } else { ContextMatch::Fallback };
+        let wanted = if path.is_dir() {
+            ContextMatch::Dir
+        } else {
+            ContextMatch::Fallback
+        };
         builtin()
             .context_menu
             .rules
@@ -1399,7 +1426,12 @@ impl Bookmark {
 
     /// A leaf bookmark pointing at `path`.
     pub fn leaf(name: String, path: PathBuf) -> Self {
-        Bookmark { name, path: Some(path), items: Vec::new(), expanded: false }
+        Bookmark {
+            name,
+            path: Some(path),
+            items: Vec::new(),
+            expanded: false,
+        }
     }
 
     /// Whether this entry is a folder. Anything without a path is a folder
@@ -1429,7 +1461,10 @@ impl Bookmark {
 
     /// The entry at an index path (each element indexes into the next level),
     /// mutably.
-    pub fn get_mut<'a>(entries: &'a mut [Bookmark], index_path: &[usize]) -> Option<&'a mut Bookmark> {
+    pub fn get_mut<'a>(
+        entries: &'a mut [Bookmark],
+        index_path: &[usize],
+    ) -> Option<&'a mut Bookmark> {
         let (head, rest) = index_path.split_first()?;
         let entry = entries.get_mut(*head)?;
         if rest.is_empty() {
@@ -1530,7 +1565,10 @@ impl Config {
             && !path.exists()
             && let Err(problem) = Self::ensure_default_file(path)
         {
-            return LoadResult { config: result.config, problem: Some(problem) };
+            return LoadResult {
+                config: result.config,
+                problem: Some(problem),
+            };
         }
         result
     }
@@ -1545,7 +1583,10 @@ impl Config {
     /// simply uses defaults).
     fn ensure_default_file(path: &Path) -> Result<(), LoadProblem> {
         let Some(parent) = path.parent() else {
-            return Err(LoadProblem::Io(path.to_path_buf(), std::io::ErrorKind::NotFound));
+            return Err(LoadProblem::Io(
+                path.to_path_buf(),
+                std::io::ErrorKind::NotFound,
+            ));
         };
         if !parent.exists()
             && let Err(err) = std::fs::create_dir_all(parent)
@@ -1586,10 +1627,7 @@ impl Config {
 
     /// Validate and normalize a parsed config.
     fn normalize(mut self) -> Self {
-        self.panel.width = self
-            .panel
-            .width
-            .clamp(PANEL_MIN_WIDTH, PANEL_MAX_WIDTH);
+        self.panel.width = self.panel.width.clamp(PANEL_MIN_WIDTH, PANEL_MAX_WIDTH);
         self.panel.margin = self.panel.margin.clamp(0, 200);
         self.tree.font_size = self.tree.font_size.clamp(6, 40);
         self.tree.icon_size = self.tree.icon_size.clamp(12, 128);
@@ -1692,7 +1730,10 @@ fn ensure_default_stylesheet(path: &Path) -> Result<(), LoadProblem> {
         return Ok(());
     }
     let Some(parent) = path.parent() else {
-        return Err(LoadProblem::Io(path.to_path_buf(), std::io::ErrorKind::NotFound));
+        return Err(LoadProblem::Io(
+            path.to_path_buf(),
+            std::io::ErrorKind::NotFound,
+        ));
     };
     if !parent.exists()
         && let Err(err) = std::fs::create_dir_all(parent)
@@ -1751,10 +1792,16 @@ pub fn load_bookmarks_from_path(path: &Path) -> (Vec<Bookmark>, Option<LoadProbl
     match std::fs::read_to_string(path) {
         Ok(text) => match toml::from_str::<BookmarksFile>(&text) {
             Ok(file) => (file.bookmarks, None),
-            Err(err) => (default_bookmarks(), Some(LoadProblem::Parse(path.to_path_buf(), err))),
+            Err(err) => (
+                default_bookmarks(),
+                Some(LoadProblem::Parse(path.to_path_buf(), err)),
+            ),
         },
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => (default_bookmarks(), None),
-        Err(err) => (default_bookmarks(), Some(LoadProblem::Io(path.to_path_buf(), err.kind()))),
+        Err(err) => (
+            default_bookmarks(),
+            Some(LoadProblem::Io(path.to_path_buf(), err.kind())),
+        ),
     }
 }
 
@@ -1855,7 +1902,10 @@ pub fn ensure_bookmarks_at(path: &Path, list: &[Bookmark]) -> Result<(), LoadPro
         return Ok(());
     }
     let Some(parent) = path.parent() else {
-        return Err(LoadProblem::Io(path.to_path_buf(), std::io::ErrorKind::NotFound));
+        return Err(LoadProblem::Io(
+            path.to_path_buf(),
+            std::io::ErrorKind::NotFound,
+        ));
     };
     if !parent.as_os_str().is_empty()
         && !parent.exists()
@@ -1870,7 +1920,6 @@ pub fn ensure_bookmarks_at(path: &Path, list: &[Bookmark]) -> Result<(), LoadPro
     }
     save_bookmarks_to_path(path, list)
 }
-
 
 /// The shape of a drop-in file pulled in by an include rule: the same
 /// `[[context_menu.rules]]` table as the main config, nothing else.
@@ -2002,9 +2051,8 @@ impl SessionState {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let body = toml::to_string(state).map_err(|e| {
-            std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
-        })?;
+        let body = toml::to_string(state)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         let tmp = path.with_extension("toml.tmp");
         std::fs::write(&tmp, body)?;
         std::fs::rename(&tmp, path)
@@ -2065,11 +2113,9 @@ mod tests {
         // matches the file on disk (so an un-rebuilt stale include is caught).
         assert_eq!(parse(DEFAULT_CONFIG), Config::default());
 
-        let written = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/default-config.toml"
-        ))
-        .unwrap();
+        let written =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/default-config.toml"))
+                .unwrap();
         assert_eq!(DEFAULT_CONFIG, written);
     }
 
@@ -2139,7 +2185,10 @@ icon_size = 20
         assert_eq!(partial.tree.font_size, 21);
         assert_eq!(partial.tree.icon_size, shipped.tree.icon_size);
         assert_eq!(partial.tree.sort_key, shipped.tree.sort_key);
-        assert_eq!(partial.tree.confirm_drop_move, shipped.tree.confirm_drop_move);
+        assert_eq!(
+            partial.tree.confirm_drop_move,
+            shipped.tree.confirm_drop_move
+        );
         // Drop-to-move is immediate by default; confirmation is opt-in.
         assert!(!shipped.tree.confirm_drop_move);
     }
@@ -2199,7 +2248,10 @@ icon_size = 20
         let result = Config::load_and_ensure(&path);
         assert_eq!(result.config.panel.width, 500);
         assert!(result.problem.is_none());
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "[panel]\nwidth = 500\n");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "[panel]\nwidth = 500\n"
+        );
     }
 
     #[test]
@@ -2219,7 +2271,10 @@ icon_size = 20
             PathBuf::from("/home/u/.local/state")
         );
         // Empty XDG values are ignored per the spec.
-        assert_eq!(xdg_config_home(Some(""), Some("/h")), PathBuf::from("/h/.config"));
+        assert_eq!(
+            xdg_config_home(Some(""), Some("/h")),
+            PathBuf::from("/h/.config")
+        );
     }
 
     #[test]
@@ -2248,7 +2303,10 @@ icon_size = 20
         let dir = tempfile::tempdir().unwrap();
         let broken = dir.path().join("broken.toml");
         std::fs::write(&broken, "not [ valid").unwrap();
-        assert_eq!(SessionState::load_from_path(&broken), SessionState::default());
+        assert_eq!(
+            SessionState::load_from_path(&broken),
+            SessionState::default()
+        );
         assert_eq!(
             SessionState::load_from_path(&dir.path().join("missing.toml")),
             SessionState::default()
@@ -2288,10 +2346,22 @@ icon_size = 20
             "Move to Trash",
             "Delete Permanently",
         ] {
-            assert!(dir_labels.contains(&classic.to_owned()), "missing {classic}: {dir_labels:?}");
+            assert!(
+                dir_labels.contains(&classic.to_owned()),
+                "missing {classic}: {dir_labels:?}"
+            );
         }
         // ...plus the file-manager parity additions.
-        for parity in ["In opposite panel", "With...", "Cut", "Copy", "Paste", "Create Link", "Rename", "Properties"] {
+        for parity in [
+            "In opposite panel",
+            "With...",
+            "Cut",
+            "Copy",
+            "Paste",
+            "Create Link",
+            "Rename",
+            "Properties",
+        ] {
             assert!(
                 dir_labels.contains(&parity.to_owned()),
                 "missing {parity}: {dir_labels:?}"
@@ -2301,7 +2371,10 @@ icon_size = 20
         let file_labels = all_labels(&menu.actions_for(&file));
         // Directory-only items are dropped for files.
         for dropped in ["In split view", "In opposite panel"] {
-            assert!(!file_labels.contains(&dropped.to_owned()), "{dropped} present: {file_labels:?}");
+            assert!(
+                !file_labels.contains(&dropped.to_owned()),
+                "{dropped} present: {file_labels:?}"
+            );
         }
         // The file "Open" submenu offers both the default app and "With...".
         assert!(file_labels.contains(&"With Default".to_owned()));
@@ -2337,10 +2410,19 @@ icon_size = 20
         assert_eq!(BuiltinAction::Cut.default_shortcut(), Some("Ctrl+x"));
         assert_eq!(BuiltinAction::Copy.default_shortcut(), Some("Ctrl+c"));
         assert_eq!(BuiltinAction::Rename.default_shortcut(), Some("F2"));
-        assert_eq!(BuiltinAction::CreateLink.default_shortcut(), Some("Ctrl+Shift+m"));
+        assert_eq!(
+            BuiltinAction::CreateLink.default_shortcut(),
+            Some("Ctrl+Shift+m")
+        );
         assert_eq!(BuiltinAction::Trash.default_shortcut(), Some("Delete"));
-        assert_eq!(BuiltinAction::DeletePermanently.default_shortcut(), Some("Shift+Delete"));
-        assert_eq!(BuiltinAction::ViewThumbnail.default_shortcut(), Some("Ctrl+t"));
+        assert_eq!(
+            BuiltinAction::DeletePermanently.default_shortcut(),
+            Some("Shift+Delete")
+        );
+        assert_eq!(
+            BuiltinAction::ViewThumbnail.default_shortcut(),
+            Some("Ctrl+t")
+        );
         assert_eq!(BuiltinAction::Open.default_shortcut(), None);
         assert_eq!(BuiltinAction::Separator.default_shortcut(), None);
     }
@@ -2379,14 +2461,23 @@ icon_size = 20
         assert_eq!(
             shortcuts,
             vec![
-                ("F2".to_owned(), ShortcutTarget::Builtin(BuiltinAction::Rename)),
-                ("Ctrl+Shift+e".to_owned(), ShortcutTarget::Command(CommandAction {
-                    command: "code {path}".into(),
-                    label: None,
-                    shortcut: Some("Ctrl+Shift+e".into()),
-                    hidden: false,
-                })),
-                ("Delete".to_owned(), ShortcutTarget::Builtin(BuiltinAction::Trash)),
+                (
+                    "F2".to_owned(),
+                    ShortcutTarget::Builtin(BuiltinAction::Rename)
+                ),
+                (
+                    "Ctrl+Shift+e".to_owned(),
+                    ShortcutTarget::Command(CommandAction {
+                        command: "code {path}".into(),
+                        label: None,
+                        shortcut: Some("Ctrl+Shift+e".into()),
+                        hidden: false,
+                    })
+                ),
+                (
+                    "Delete".to_owned(),
+                    ShortcutTarget::Builtin(BuiltinAction::Trash)
+                ),
             ]
         );
     }
@@ -2440,7 +2531,10 @@ items = [
             BuiltinAction::Collapse,
             BuiltinAction::ClosePane,
         ] {
-            assert!(action.is_pane_action(), "{action:?} should be a pane action");
+            assert!(
+                action.is_pane_action(),
+                "{action:?} should be a pane action"
+            );
         }
         for action in [
             BuiltinAction::Open,
@@ -2456,8 +2550,14 @@ items = [
     #[test]
     fn separator_matches_both_spellings() {
         assert_eq!(BuiltinAction::parse("---"), Some(BuiltinAction::Separator));
-        assert_eq!(BuiltinAction::parse("separator"), Some(BuiltinAction::Separator));
-        assert_eq!(BuiltinAction::parse("SEPARATOR"), Some(BuiltinAction::Separator));
+        assert_eq!(
+            BuiltinAction::parse("separator"),
+            Some(BuiltinAction::Separator)
+        );
+        assert_eq!(
+            BuiltinAction::parse("SEPARATOR"),
+            Some(BuiltinAction::Separator)
+        );
         assert_eq!(BuiltinAction::Separator.as_str(), "---");
     }
 
@@ -2468,11 +2568,20 @@ items = [
         assert_eq!(BuiltinAction::OpenFolder.as_str(), "Open Folder...");
         assert_eq!(BuiltinAction::Filter.as_str(), "Filter...");
         // The typographic ellipsis is still accepted as a synonym.
-        assert_eq!(BuiltinAction::parse("Open With…"), Some(BuiltinAction::OpenWith));
-        assert_eq!(BuiltinAction::parse("Open Folder…"), Some(BuiltinAction::OpenFolder));
+        assert_eq!(
+            BuiltinAction::parse("Open With…"),
+            Some(BuiltinAction::OpenWith)
+        );
+        assert_eq!(
+            BuiltinAction::parse("Open Folder…"),
+            Some(BuiltinAction::OpenFolder)
+        );
         assert_eq!(BuiltinAction::parse("Filter…"), Some(BuiltinAction::Filter));
         // And the ASCII form parses too.
-        assert_eq!(BuiltinAction::parse("open folder..."), Some(BuiltinAction::OpenFolder));
+        assert_eq!(
+            BuiltinAction::parse("open folder..."),
+            Some(BuiltinAction::OpenFolder)
+        );
     }
 
     #[test]
@@ -2520,11 +2629,18 @@ items = [
 
     #[test]
     fn navigation_builtins_round_trip_and_are_pane_actions() {
-        for action in [BuiltinAction::Up, BuiltinAction::Back, BuiltinAction::Forward] {
+        for action in [
+            BuiltinAction::Up,
+            BuiltinAction::Back,
+            BuiltinAction::Forward,
+        ] {
             let s = action.as_str();
             assert_eq!(BuiltinAction::parse(s), Some(action), "{s} should parse");
             assert!(action.is_pane_action(), "{s} should be a pane action");
-            assert!(action.default_shortcut().is_some(), "{s} needs a default key");
+            assert!(
+                action.default_shortcut().is_some(),
+                "{s} needs a default key"
+            );
         }
         assert_eq!(BuiltinAction::Up.default_shortcut(), Some("Alt+Up"));
         assert_eq!(BuiltinAction::Back.default_shortcut(), Some("Alt+Left"));
@@ -2575,7 +2691,8 @@ items = [
         struct One {
             item: ContextAction,
         }
-        let visible: One = toml::from_str(r#"item = { action = "Cut", shortcut = "Ctrl+x" }"#).unwrap();
+        let visible: One =
+            toml::from_str(r#"item = { action = "Cut", shortcut = "Ctrl+x" }"#).unwrap();
         assert!(!visible.item.is_hidden());
         // A plain-string builtin can never be hidden.
         let plain: One = toml::from_str(r#"item = "Cut""#).unwrap();
@@ -2671,14 +2788,29 @@ items = [
 
     #[test]
     fn bookmark_builtins_parse_and_classify() {
-        assert_eq!(BuiltinAction::parse("Add Bookmark"), Some(BuiltinAction::AddBookmark));
+        assert_eq!(
+            BuiltinAction::parse("Add Bookmark"),
+            Some(BuiltinAction::AddBookmark)
+        );
         assert!(BuiltinAction::AddBookmark.is_directory_only());
         assert!(BuiltinAction::AddBookmark.is_single_row_only());
-        assert_eq!(BuiltinAction::parse("Bookmarks"), Some(BuiltinAction::ToggleBookmarks));
+        assert_eq!(
+            BuiltinAction::parse("Bookmarks"),
+            Some(BuiltinAction::ToggleBookmarks)
+        );
         assert!(BuiltinAction::ToggleBookmarks.is_pane_action());
-        assert_eq!(BuiltinAction::parse("Edit Bookmark"), Some(BuiltinAction::EditBookmark));
-        assert_eq!(BuiltinAction::parse("Delete Bookmark"), Some(BuiltinAction::DeleteBookmark));
-        assert_eq!(BuiltinAction::parse("New Bookmark"), Some(BuiltinAction::NewBookmark));
+        assert_eq!(
+            BuiltinAction::parse("Edit Bookmark"),
+            Some(BuiltinAction::EditBookmark)
+        );
+        assert_eq!(
+            BuiltinAction::parse("Delete Bookmark"),
+            Some(BuiltinAction::DeleteBookmark)
+        );
+        assert_eq!(
+            BuiltinAction::parse("New Bookmark"),
+            Some(BuiltinAction::NewBookmark)
+        );
         assert_eq!(
             BuiltinAction::parse("New Bookmark Folder"),
             Some(BuiltinAction::NewBookmarkFolder)
@@ -2697,13 +2829,8 @@ items = [
         assert!(!shipped.context.is_empty());
         assert!(!shipped.blank.is_empty());
         // The shipped context extras are the bookmark-only actions.
-        assert!(
-            shipped
-                .context
-                .iter()
-                .any(|a| a.shortcut().is_none()
-                    && matches!(a, ContextAction::Builtin(BuiltinAction::EditBookmark)))
-        );
+        assert!(shipped.context.iter().any(|a| a.shortcut().is_none()
+            && matches!(a, ContextAction::Builtin(BuiltinAction::EditBookmark))));
         // The blank menu offers the "new" bookmark actions.
         assert!(
             shipped
@@ -2754,7 +2881,10 @@ items = [
                 Bookmark {
                     name: "Nested".to_owned(),
                     path: None,
-                    items: vec![Bookmark::leaf("Deep".to_owned(), PathBuf::from("/srv/deep"))],
+                    items: vec![Bookmark::leaf(
+                        "Deep".to_owned(),
+                        PathBuf::from("/srv/deep"),
+                    )],
                     expanded: true,
                 },
             ],
@@ -2818,7 +2948,10 @@ items = [
             Bookmark {
                 name: "Work".to_owned(),
                 path: None,
-                items: vec![Bookmark::leaf("Repo".to_owned(), PathBuf::from("/srv/repo"))],
+                items: vec![Bookmark::leaf(
+                    "Repo".to_owned(),
+                    PathBuf::from("/srv/repo"),
+                )],
                 expanded: true,
             },
         ];
@@ -2857,7 +2990,10 @@ items = [
 
     #[test]
     fn bookmark_name_defaults_to_the_directory_name() {
-        assert_eq!(Bookmark::default_name(Path::new("/home/eolu/notes")), "notes");
+        assert_eq!(
+            Bookmark::default_name(Path::new("/home/eolu/notes")),
+            "notes"
+        );
         assert_eq!(Bookmark::default_name(Path::new("/")), "/");
     }
 
@@ -2866,7 +3002,10 @@ items = [
         // SAFETY: single-threaded test setup; HOME is read-only here.
         unsafe { std::env::set_var("HOME", "/home/tester") };
         let root = StartupRoot::Path("~/notes".to_owned());
-        assert_eq!(root.resolve(None), Some(PathBuf::from("/home/tester/notes")));
+        assert_eq!(
+            root.resolve(None),
+            Some(PathBuf::from("/home/tester/notes"))
+        );
         assert_eq!(expand_tilde("~"), Some(PathBuf::from("/home/tester")));
         assert_eq!(expand_tilde("/abs/path"), Some(PathBuf::from("/abs/path")));
         assert_eq!(expand_tilde(""), None);
@@ -2886,14 +3025,20 @@ items = [
         let system = parse("[theme]\nmode = \"system\"\n");
         assert_eq!(system.theme.mode, ThemeMode::System);
         assert_eq!(system.theme.system, SystemTheme::Omarchy);
-        assert_eq!(parse("[theme]\nsystem = \"omarchy\"\n").theme.mode, ThemeMode::Custom);
+        assert_eq!(
+            parse("[theme]\nsystem = \"omarchy\"\n").theme.mode,
+            ThemeMode::Custom
+        );
     }
 
     #[test]
     fn startup_parses_from_toml() {
         assert_eq!(parse("startup = \"home\"\n").startup, StartupRoot::Home);
         assert_eq!(parse("startup = \"last\"\n").startup, StartupRoot::Last);
-        assert_eq!(parse("startup = \"bookmarks\"\n").startup, StartupRoot::Bookmarks);
+        assert_eq!(
+            parse("startup = \"bookmarks\"\n").startup,
+            StartupRoot::Bookmarks
+        );
         assert_eq!(
             parse("startup = { path = \"/srv\" }\n").startup,
             StartupRoot::Path("/srv".to_owned())
@@ -2907,9 +3052,15 @@ items = [
                 .is_some()
         );
         // Round-trips through serialization.
-        let cfg = Config { startup: StartupRoot::Path("/srv".to_owned()), ..Config::default() };
+        let cfg = Config {
+            startup: StartupRoot::Path("/srv".to_owned()),
+            ..Config::default()
+        };
         let text = toml::to_string(&cfg).unwrap();
-        assert_eq!(toml::from_str::<Config>(&text).unwrap().startup, cfg.startup);
+        assert_eq!(
+            toml::from_str::<Config>(&text).unwrap().startup,
+            cfg.startup
+        );
     }
 
     #[test]
@@ -3021,7 +3172,8 @@ items = [
     }
 
     #[test]
-    fn include_rule_splices_files_in_place_and_name_sorted() {        let dir = tempfile::tempdir().unwrap();
+    fn include_rule_splices_files_in_place_and_name_sorted() {
+        let dir = tempfile::tempdir().unwrap();
         let rules_dir = dir.path().join("rules.d");
         std::fs::create_dir_all(&rules_dir).unwrap();
         // Two drop-ins, deliberately named so name-sort decides their order.
@@ -3082,7 +3234,10 @@ items = ["Move to Trash"]
         // A missing include directory is not an error.
         assert!(result.problem.is_none(), "{:?}", result.problem);
         assert_eq!(result.config.context_menu.rules.len(), 1);
-        assert_eq!(result.config.context_menu.rules[0].matches, vec![ContextMatch::Fallback]);
+        assert_eq!(
+            result.config.context_menu.rules[0].matches,
+            vec![ContextMatch::Fallback]
+        );
     }
 
     #[test]
@@ -3090,22 +3245,29 @@ items = ["Move to Trash"]
         let dir = tempfile::tempdir().unwrap();
         let rules_dir = dir.path().join("rules.d");
         std::fs::create_dir_all(&rules_dir).unwrap();
-        std::fs::write(rules_dir.join("10-good.toml"), "[[context_menu.rules]]\nmatches = [\"dir\"]\nitems = [\"Open\"]\n").unwrap();
+        std::fs::write(
+            rules_dir.join("10-good.toml"),
+            "[[context_menu.rules]]\nmatches = [\"dir\"]\nitems = [\"Open\"]\n",
+        )
+        .unwrap();
         std::fs::write(rules_dir.join("20-bad.toml"), "this is not = valid toml [").unwrap();
 
         let main = dir.path().join("config.toml");
-        std::fs::write(
-            &main,
-            "[[context_menu.rules]]\ninclude = \"rules.d\"\n",
-        )
-        .unwrap();
+        std::fs::write(&main, "[[context_menu.rules]]\ninclude = \"rules.d\"\n").unwrap();
 
         let result = Config::load_from_path(&main);
         // The bad file is reported...
-        assert!(matches!(result.problem, Some(LoadProblem::Parse(..))), "{:?}", result.problem);
+        assert!(
+            matches!(result.problem, Some(LoadProblem::Parse(..))),
+            "{:?}",
+            result.problem
+        );
         // ...but the good file's rule still made it in.
         assert_eq!(result.config.context_menu.rules.len(), 1);
-        assert_eq!(result.config.context_menu.rules[0].matches, vec![ContextMatch::Dir]);
+        assert_eq!(
+            result.config.context_menu.rules[0].matches,
+            vec![ContextMatch::Dir]
+        );
     }
 
     #[test]
@@ -3114,7 +3276,11 @@ items = ["Move to Trash"]
         let outer = dir.path().join("outer.d");
         let inner = outer.join("inner.d");
         std::fs::create_dir_all(&inner).unwrap();
-        std::fs::write(inner.join("nested.toml"), "[[context_menu.rules]]\nmatches = [\"dir\"]\nitems = [\"Open\"]\n").unwrap();
+        std::fs::write(
+            inner.join("nested.toml"),
+            "[[context_menu.rules]]\nmatches = [\"dir\"]\nitems = [\"Open\"]\n",
+        )
+        .unwrap();
         std::fs::write(
             outer.join("mid.toml"),
             "[[context_menu.rules]]\ninclude = \"inner.d\"\n",
@@ -3127,7 +3293,10 @@ items = ["Move to Trash"]
         let result = Config::load_from_path(&main);
         assert!(result.problem.is_none(), "{:?}", result.problem);
         assert_eq!(result.config.context_menu.rules.len(), 1);
-        assert_eq!(result.config.context_menu.rules[0].matches, vec![ContextMatch::Dir]);
+        assert_eq!(
+            result.config.context_menu.rules[0].matches,
+            vec![ContextMatch::Dir]
+        );
     }
 
     #[test]
@@ -3155,7 +3324,10 @@ items = ["Move to Trash"]
     #[test]
     fn multi_matcher_parses_and_never_matches_a_single_path() {
         assert_eq!(ContextMatch::parse("multi").unwrap(), ContextMatch::Multi);
-        assert_eq!(ContextMatch::parse("multi-select").unwrap(), ContextMatch::Multi);
+        assert_eq!(
+            ContextMatch::parse("multi-select").unwrap(),
+            ContextMatch::Multi
+        );
         assert_eq!(ContextMatch::Multi.as_str(), "multi");
         // A selection-level matcher is never true for one path.
         let dir = tempfile::tempdir().unwrap();
@@ -3174,7 +3346,10 @@ items = ["Move to Trash"]
         let dir = tempfile::tempdir().unwrap();
 
         // One selected path: the per-path rule applies.
-        assert_eq!(menu.actions_for_selection(dir.path(), 1), builtin_items![Open]);
+        assert_eq!(
+            menu.actions_for_selection(dir.path(), 1),
+            builtin_items![Open]
+        );
         // Two or more: the multi rule applies instead.
         assert_eq!(
             menu.actions_for_selection(dir.path(), 2),
@@ -3225,7 +3400,10 @@ items = ["Move to Trash"]
     fn empty_rule_list_falls_back_to_classic_menu() {
         let menu = ContextMenu { rules: Vec::new() };
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(menu.actions_for(dir.path()), ContextMenu::fallback_actions(dir.path()));
+        assert_eq!(
+            menu.actions_for(dir.path()),
+            ContextMenu::fallback_actions(dir.path())
+        );
     }
 
     #[test]
@@ -3253,9 +3431,15 @@ items = ["Open", { command = "rm {path}", label = "Discard lock" }]
         let first = &config.context_menu.rules[0];
         assert_eq!(
             first.matches,
-            vec![ContextMatch::Ext("rs".to_owned()), ContextMatch::Ext("toml".to_owned())]
+            vec![
+                ContextMatch::Ext("rs".to_owned()),
+                ContextMatch::Ext("toml".to_owned())
+            ]
         );
-        assert!(matches!(first.items[0], ContextAction::Builtin(BuiltinAction::Open)));
+        assert!(matches!(
+            first.items[0],
+            ContextAction::Builtin(BuiltinAction::Open)
+        ));
         assert!(matches!(
             &first.items[1],
             ContextAction::Command(cmd) if cmd.command == "cargo fmt" && cmd.label.as_deref() == Some("Fmt")
@@ -3330,7 +3514,10 @@ items = ["Open", { command = "rm {path}", label = "Discard lock" }]
             workspace: Some("2".into()),
             hidden: false,
         });
-        assert_eq!(named.workspace_move(), Some(WorkspaceMove::Named("2".into())));
+        assert_eq!(
+            named.workspace_move(),
+            Some(WorkspaceMove::Named("2".into()))
+        );
         // Without a target there is nothing to move to.
         let missing = ContextAction::Entry(BuiltinEntry {
             action: BuiltinAction::MoveToWorkspace,
@@ -3341,7 +3528,10 @@ items = ["Open", { command = "rm {path}", label = "Discard lock" }]
         });
         assert_eq!(missing.workspace_move(), None);
         // Ordinary actions are never workspace moves.
-        assert_eq!(ContextAction::Builtin(BuiltinAction::Copy).workspace_move(), None);
+        assert_eq!(
+            ContextAction::Builtin(BuiltinAction::Copy).workspace_move(),
+            None
+        );
     }
 
     #[test]

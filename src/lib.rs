@@ -20,15 +20,15 @@
 //! Keeping the model free of GTK imports means the interesting logic can be
 //! tested headlessly with `cargo test`.
 
+pub mod audio;
+pub mod cmd;
 pub mod config;
 pub mod entry;
-pub mod theme;
-pub mod highlight;
-pub mod fs;
-pub mod cmd;
 pub mod freedesktop;
+pub mod fs;
+pub mod highlight;
 pub mod ipc;
-pub mod workspace;
-pub mod audio;
 pub mod preview;
+pub mod theme;
 pub mod ui;
+pub mod workspace;

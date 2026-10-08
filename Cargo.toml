@@ -1,6 +1,6 @@
 [package]
 name = "tree-space"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 # edition 2024 requires Rust 1.85; slice::as_chunks (src/preview.rs) needs 1.88.
 rust-version = "1.88"

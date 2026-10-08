@@ -23,8 +23,8 @@ mod backend {
 
     use gstreamer as gst;
     use gstreamer::prelude::*;
-    use relm4::gtk::{gio, glib};
     use relm4::gtk::gio::prelude::FileExt;
+    use relm4::gtk::{gio, glib};
 
     static INIT: Once = Once::new();
 
@@ -101,7 +101,11 @@ mod backend {
         }
 
         pub fn set_playing(&self, playing: bool) {
-            let state = if playing { gst::State::Playing } else { gst::State::Paused };
+            let state = if playing {
+                gst::State::Playing
+            } else {
+                gst::State::Paused
+            };
             let _ = self.pipeline.set_state(state);
         }
 

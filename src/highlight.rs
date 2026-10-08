@@ -211,7 +211,11 @@ fn scan_code(chars: &[char], syntax: &Syntax) -> Vec<Span> {
         // line comments
         if syntax.line_comments.iter().any(|p| matches_at(chars, i, p)) {
             let end = line_end(chars, i);
-            spans.push(Span { start: i, end, class: TokenClass::Comment });
+            spans.push(Span {
+                start: i,
+                end,
+                class: TokenClass::Comment,
+            });
             i = end;
             continue;
         }
@@ -225,13 +229,21 @@ fn scan_code(chars: &[char], syntax: &Syntax) -> Vec<Span> {
                 i += 1;
             }
             i = (i + char_len(close)).min(chars.len());
-            spans.push(Span { start, end: i, class: TokenClass::Comment });
+            spans.push(Span {
+                start,
+                end: i,
+                class: TokenClass::Comment,
+            });
             continue;
         }
         // Rust raw / byte strings
         if syntax.rust_strings {
             if let Some((start, end)) = rust_string_span(chars, i) {
-                spans.push(Span { start, end, class: TokenClass::String });
+                spans.push(Span {
+                    start,
+                    end,
+                    class: TokenClass::String,
+                });
                 i = end;
                 continue;
             }
@@ -241,7 +253,11 @@ fn scan_code(chars: &[char], syntax: &Syntax) -> Vec<Span> {
                 && chars.get(i + 2) != Some(&'\'')
             {
                 let end = ident_end(chars, i + 1);
-                spans.push(Span { start: i, end, class: TokenClass::Type });
+                spans.push(Span {
+                    start: i,
+                    end,
+                    class: TokenClass::Type,
+                });
                 i = end;
                 continue;
             }
@@ -250,42 +266,70 @@ fn scan_code(chars: &[char], syntax: &Syntax) -> Vec<Span> {
         if syntax.python_strings
             && let Some((start, end)) = python_string_span(chars, i)
         {
-            spans.push(Span { start, end, class: TokenClass::String });
+            spans.push(Span {
+                start,
+                end,
+                class: TokenClass::String,
+            });
             i = end;
             continue;
         }
         // plain strings
         if syntax.quotes.contains(&c) {
             let end = string_end(chars, i, c);
-            spans.push(Span { start: i, end, class: TokenClass::String });
+            spans.push(Span {
+                start: i,
+                end,
+                class: TokenClass::String,
+            });
             i = end;
             continue;
         }
         // Rust attributes
         if syntax.hash_bracket && c == '#' && chars.get(i + 1) == Some(&'[') {
             let end = bracketed_end(chars, i + 1);
-            spans.push(Span { start: i, end, class: TokenClass::Preprocessor });
+            spans.push(Span {
+                start: i,
+                end,
+                class: TokenClass::Preprocessor,
+            });
             i = end;
             continue;
         }
         // C preprocessor
         if syntax.hash_line && c == '#' && only_space_before(chars, i) {
             let end = line_end(chars, i);
-            spans.push(Span { start: i, end, class: TokenClass::Preprocessor });
+            spans.push(Span {
+                start: i,
+                end,
+                class: TokenClass::Preprocessor,
+            });
             i = end;
             continue;
         }
         // decorators / attributes at line start
         if syntax.at_line && c == '@' && only_space_before(chars, i) {
             let end = ident_end(chars, i + 1);
-            spans.push(Span { start: i, end, class: TokenClass::Preprocessor });
+            spans.push(Span {
+                start: i,
+                end,
+                class: TokenClass::Preprocessor,
+            });
             i = end;
             continue;
         }
         // numbers
-        if c.is_ascii_digit() && !chars.get(i.wrapping_sub(1)).is_some_and(|p| is_ident_char(*p)) {
+        if c.is_ascii_digit()
+            && !chars
+                .get(i.wrapping_sub(1))
+                .is_some_and(|p| is_ident_char(*p))
+        {
             let end = number_end(chars, i);
-            spans.push(Span { start: i, end, class: TokenClass::Number });
+            spans.push(Span {
+                start: i,
+                end,
+                class: TokenClass::Number,
+            });
             i = end;
             continue;
         }
@@ -305,7 +349,11 @@ fn scan_code(chars: &[char], syntax: &Syntax) -> Vec<Span> {
                 None
             };
             if let Some(class) = class {
-                spans.push(Span { start: i, end, class });
+                spans.push(Span {
+                    start: i,
+                    end,
+                    class,
+                });
             }
             i = end;
             continue;
@@ -352,7 +400,10 @@ fn rust_string_span(chars: &[char], i: usize) -> Option<(usize, usize)> {
 fn python_string_span(chars: &[char], i: usize) -> Option<(usize, usize)> {
     // Optional prefix: r, b, f, u (in any combination), then a quote.
     let mut j = i;
-    while chars.get(j).is_some_and(|c| matches!(c, 'r' | 'b' | 'f' | 'u' | 'R' | 'B' | 'F' | 'U')) {
+    while chars
+        .get(j)
+        .is_some_and(|c| matches!(c, 'r' | 'b' | 'f' | 'u' | 'R' | 'B' | 'F' | 'U'))
+    {
         j += 1;
     }
     let quote = *chars.get(j)?;
@@ -454,15 +505,22 @@ fn scan_json(chars: &[char]) -> Vec<Span> {
             } else {
                 TokenClass::String
             };
-            spans.push(Span { start: i, end, class });
+            spans.push(Span {
+                start: i,
+                end,
+                class,
+            });
             i = end;
             continue;
         }
-        if c.is_ascii_digit()
-            || (c == '-' && chars.get(i + 1).is_some_and(|d| d.is_ascii_digit()))
+        if c.is_ascii_digit() || (c == '-' && chars.get(i + 1).is_some_and(|d| d.is_ascii_digit()))
         {
             let end = number_end(chars, i + usize::from(c == '-'));
-            spans.push(Span { start: i, end, class: TokenClass::Number });
+            spans.push(Span {
+                start: i,
+                end,
+                class: TokenClass::Number,
+            });
             i = end;
             continue;
         }
@@ -470,7 +528,11 @@ fn scan_json(chars: &[char]) -> Vec<Span> {
             let end = ident_end(chars, i);
             let word: String = chars[i..end].iter().collect();
             if matches!(word.as_str(), "true" | "false" | "null") {
-                spans.push(Span { start: i, end, class: TokenClass::Constant });
+                spans.push(Span {
+                    start: i,
+                    end,
+                    class: TokenClass::Constant,
+                });
             }
             i = end;
             continue;
@@ -488,7 +550,11 @@ fn scan_key_value(chars: &[char]) -> Vec<Span> {
         let c = chars[i];
         if c == '#' || c == ';' {
             let end = line_end(chars, i);
-            spans.push(Span { start: i, end, class: TokenClass::Comment });
+            spans.push(Span {
+                start: i,
+                end,
+                class: TokenClass::Comment,
+            });
             i = end;
             continue;
         }
@@ -498,7 +564,11 @@ fn scan_key_value(chars: &[char]) -> Vec<Span> {
                 .position(|&c| c == ']')
                 .map(|p| i + p + 1)
                 .unwrap_or(chars.len());
-            spans.push(Span { start: i, end, class: TokenClass::Tag });
+            spans.push(Span {
+                start: i,
+                end,
+                class: TokenClass::Tag,
+            });
             i = end;
             continue;
         }
@@ -510,7 +580,11 @@ fn scan_key_value(chars: &[char]) -> Vec<Span> {
             } else {
                 TokenClass::String
             };
-            spans.push(Span { start: i, end, class });
+            spans.push(Span {
+                start: i,
+                end,
+                class,
+            });
             i = end;
             continue;
         }
@@ -518,11 +592,19 @@ fn scan_key_value(chars: &[char]) -> Vec<Span> {
             let end = ident_end(chars, i);
             let after = skip_space(chars, end);
             if chars.get(after) == Some(&'=') && key_position(chars, i) {
-                spans.push(Span { start: i, end, class: TokenClass::Attribute });
+                spans.push(Span {
+                    start: i,
+                    end,
+                    class: TokenClass::Attribute,
+                });
             } else {
                 let word: String = chars[i..end].iter().collect();
                 if matches!(word.as_str(), "true" | "false") {
-                    spans.push(Span { start: i, end, class: TokenClass::Constant });
+                    spans.push(Span {
+                        start: i,
+                        end,
+                        class: TokenClass::Constant,
+                    });
                 }
             }
             i = end;
@@ -530,7 +612,11 @@ fn scan_key_value(chars: &[char]) -> Vec<Span> {
         }
         if c.is_ascii_digit() {
             let end = number_end(chars, i);
-            spans.push(Span { start: i, end, class: TokenClass::Number });
+            spans.push(Span {
+                start: i,
+                end,
+                class: TokenClass::Number,
+            });
             i = end;
             continue;
         }
@@ -547,13 +633,21 @@ fn scan_yaml(chars: &[char]) -> Vec<Span> {
         let c = chars[i];
         if c == '#' {
             let end = line_end(chars, i);
-            spans.push(Span { start: i, end, class: TokenClass::Comment });
+            spans.push(Span {
+                start: i,
+                end,
+                class: TokenClass::Comment,
+            });
             i = end;
             continue;
         }
         if c == '"' || c == '\'' {
             let end = string_end(chars, i, c);
-            spans.push(Span { start: i, end, class: TokenClass::String });
+            spans.push(Span {
+                start: i,
+                end,
+                class: TokenClass::String,
+            });
             i = end;
             continue;
         }
@@ -561,14 +655,22 @@ fn scan_yaml(chars: &[char]) -> Vec<Span> {
             let end = ident_end(chars, i);
             let after = skip_space(chars, end);
             if chars.get(after) == Some(&':') {
-                spans.push(Span { start: i, end, class: TokenClass::Attribute });
+                spans.push(Span {
+                    start: i,
+                    end,
+                    class: TokenClass::Attribute,
+                });
             }
             i = end;
             continue;
         }
         if c.is_ascii_digit() {
             let end = number_end(chars, i);
-            spans.push(Span { start: i, end, class: TokenClass::Number });
+            spans.push(Span {
+                start: i,
+                end,
+                class: TokenClass::Number,
+            });
             i = end;
             continue;
         }
@@ -609,7 +711,11 @@ fn scan_markup(chars: &[char]) -> Vec<Span> {
                 i += 1;
             }
             i = (i + 3).min(chars.len());
-            spans.push(Span { start, end: i, class: TokenClass::Comment });
+            spans.push(Span {
+                start,
+                end: i,
+                class: TokenClass::Comment,
+            });
             continue;
         }
         if chars[i] == '<' {
@@ -620,7 +726,11 @@ fn scan_markup(chars: &[char]) -> Vec<Span> {
             && let Some(end) = chars[i..].iter().position(|&c| c == ';').map(|p| i + p + 1)
             && end - i <= 12
         {
-            spans.push(Span { start: i, end, class: TokenClass::Constant });
+            spans.push(Span {
+                start: i,
+                end,
+                class: TokenClass::Constant,
+            });
             i = end;
             continue;
         }
@@ -644,7 +754,11 @@ fn scan_tag(chars: &[char], open: usize, spans: &mut Vec<Span>) -> usize {
             k += 1;
         }
         k = (k + 1).min(chars.len());
-        spans.push(Span { start: open, end: k, class: TokenClass::Preprocessor });
+        spans.push(Span {
+            start: open,
+            end: k,
+            class: TokenClass::Preprocessor,
+        });
         return k;
     }
     let name_start = i;
@@ -652,7 +766,11 @@ fn scan_tag(chars: &[char], open: usize, spans: &mut Vec<Span>) -> usize {
         i += 1;
     }
     if i > name_start {
-        spans.push(Span { start: name_start, end: i, class: TokenClass::Tag });
+        spans.push(Span {
+            start: name_start,
+            end: i,
+            class: TokenClass::Tag,
+        });
     }
     while i < chars.len() && chars[i] != '>' {
         if matches_at(chars, i, "/>") {
@@ -664,7 +782,11 @@ fn scan_tag(chars: &[char], open: usize, spans: &mut Vec<Span>) -> usize {
         }
         if chars[i] == '"' || chars[i] == '\'' {
             let end = string_end(chars, i, chars[i]);
-            spans.push(Span { start: i, end, class: TokenClass::String });
+            spans.push(Span {
+                start: i,
+                end,
+                class: TokenClass::String,
+            });
             i = end;
             continue;
         }
@@ -673,7 +795,11 @@ fn scan_tag(chars: &[char], open: usize, spans: &mut Vec<Span>) -> usize {
             i += 1;
         }
         if i > attr_start {
-            spans.push(Span { start: attr_start, end: i, class: TokenClass::Attribute });
+            spans.push(Span {
+                start: attr_start,
+                end: i,
+                class: TokenClass::Attribute,
+            });
         } else {
             i += 1;
         }
@@ -702,12 +828,20 @@ fn scan_css(chars: &[char]) -> Vec<Span> {
                 i += 1;
             }
             i = (i + 2).min(chars.len());
-            spans.push(Span { start, end: i, class: TokenClass::Comment });
+            spans.push(Span {
+                start,
+                end: i,
+                class: TokenClass::Comment,
+            });
             continue;
         }
         if c == '"' || c == '\'' {
             let end = string_end(chars, i, c);
-            spans.push(Span { start: i, end, class: TokenClass::String });
+            spans.push(Span {
+                start: i,
+                end,
+                class: TokenClass::String,
+            });
             i = end;
             continue;
         }
@@ -723,7 +857,11 @@ fn scan_css(chars: &[char]) -> Vec<Span> {
         }
         if c == '@' {
             let end = ident_end(chars, i + 1);
-            spans.push(Span { start: i, end, class: TokenClass::Keyword });
+            spans.push(Span {
+                start: i,
+                end,
+                class: TokenClass::Keyword,
+            });
             i = end;
             continue;
         }
@@ -732,7 +870,11 @@ fn scan_css(chars: &[char]) -> Vec<Span> {
             while end < chars.len() && chars[end].is_ascii_hexdigit() {
                 end += 1;
             }
-            spans.push(Span { start: i, end, class: TokenClass::Number });
+            spans.push(Span {
+                start: i,
+                end,
+                class: TokenClass::Number,
+            });
             i = end;
             continue;
         }
@@ -747,7 +889,11 @@ fn scan_css(chars: &[char]) -> Vec<Span> {
                     i += 1;
                 }
                 if i > start {
-                    spans.push(Span { start, end: i, class: TokenClass::Tag });
+                    spans.push(Span {
+                        start,
+                        end: i,
+                        class: TokenClass::Tag,
+                    });
                 }
                 continue;
             }
@@ -755,7 +901,11 @@ fn scan_css(chars: &[char]) -> Vec<Span> {
             let end = ident_end(chars, i);
             let after = skip_space(chars, end);
             if chars.get(after) == Some(&':') {
-                spans.push(Span { start: i, end, class: TokenClass::Attribute });
+                spans.push(Span {
+                    start: i,
+                    end,
+                    class: TokenClass::Attribute,
+                });
             }
             i = end;
             continue;
@@ -777,13 +927,21 @@ fn scan_markdown(chars: &[char]) -> Vec<Span> {
         let end = line_end(chars, line_start);
         let line = &chars[line_start..end];
         if is_fence(line) {
-            spans.push(Span { start: line_start, end, class: TokenClass::Keyword });
+            spans.push(Span {
+                start: line_start,
+                end,
+                class: TokenClass::Keyword,
+            });
             in_fence = !in_fence;
             line_start = end + 1;
             continue;
         }
         if in_fence {
-            spans.push(Span { start: line_start, end, class: TokenClass::String });
+            spans.push(Span {
+                start: line_start,
+                end,
+                class: TokenClass::String,
+            });
             line_start = end + 1;
             continue;
         }
@@ -792,12 +950,20 @@ fn scan_markdown(chars: &[char]) -> Vec<Span> {
         if indent <= 3 {
             let hashes = line[indent..].iter().take_while(|c| **c == '#').count();
             if (1..=6).contains(&hashes) && line.get(indent + hashes).is_none_or(|c| *c == ' ') {
-                spans.push(Span { start: line_start, end, class: TokenClass::Heading });
+                spans.push(Span {
+                    start: line_start,
+                    end,
+                    class: TokenClass::Heading,
+                });
                 line_start = end + 1;
                 continue;
             }
             if line.get(indent) == Some(&'>') {
-                spans.push(Span { start: line_start, end, class: TokenClass::Comment });
+                spans.push(Span {
+                    start: line_start,
+                    end,
+                    class: TokenClass::Comment,
+                });
                 line_start = end + 1;
                 continue;
             }
@@ -818,7 +984,11 @@ fn scan_markdown_inline(chars: &[char], start: usize, end: usize, spans: &mut Ve
         if chars[i] == '`'
             && let Some(close) = (i + 1..end).find(|&k| chars[k] == '`')
         {
-            spans.push(Span { start: i, end: close + 1, class: TokenClass::String });
+            spans.push(Span {
+                start: i,
+                end: close + 1,
+                class: TokenClass::String,
+            });
             i = close + 1;
             continue;
         }
@@ -827,7 +997,11 @@ fn scan_markdown_inline(chars: &[char], start: usize, end: usize, spans: &mut Ve
             && chars.get(close + 1) == Some(&'(')
             && let Some(paren) = (close + 2..end).find(|&k| chars[k] == ')')
         {
-            spans.push(Span { start: i, end: paren + 1, class: TokenClass::Link });
+            spans.push(Span {
+                start: i,
+                end: paren + 1,
+                class: TokenClass::Link,
+            });
             i = paren + 1;
             continue;
         }
@@ -909,10 +1083,42 @@ const RUST: Syntax = Syntax {
     block_comment: Some(("/*", "*/")),
     quotes: &['"'],
     keywords: &[
-        "as", "async", "await", "break", "const", "continue", "crate", "dyn", "else", "enum",
-        "extern", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut",
-        "pub", "ref", "return", "static", "struct", "super", "trait", "type", "unsafe", "use",
-        "where", "while", "yield", "macro_rules",
+        "as",
+        "async",
+        "await",
+        "break",
+        "const",
+        "continue",
+        "crate",
+        "dyn",
+        "else",
+        "enum",
+        "extern",
+        "fn",
+        "for",
+        "if",
+        "impl",
+        "in",
+        "let",
+        "loop",
+        "match",
+        "mod",
+        "move",
+        "mut",
+        "pub",
+        "ref",
+        "return",
+        "static",
+        "struct",
+        "super",
+        "trait",
+        "type",
+        "unsafe",
+        "use",
+        "where",
+        "while",
+        "yield",
+        "macro_rules",
     ],
     types: &[
         "bool", "char", "f32", "f64", "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16",
@@ -932,17 +1138,80 @@ const C_LIKE: Syntax = Syntax {
     block_comment: Some(("/*", "*/")),
     quotes: &['"', '\''],
     keywords: &[
-        "auto", "break", "case", "const", "continue", "default", "do", "else", "enum", "extern",
-        "for", "goto", "if", "inline", "register", "restrict", "return", "sizeof", "static",
-        "struct", "switch", "typedef", "union", "volatile", "while", "class", "namespace",
-        "template", "typename", "using", "public", "private", "protected", "virtual", "override",
-        "new", "delete", "this", "operator", "friend", "constexpr", "try", "catch", "throw",
-        "noexcept", "nullptr", "true", "false",
+        "auto",
+        "break",
+        "case",
+        "const",
+        "continue",
+        "default",
+        "do",
+        "else",
+        "enum",
+        "extern",
+        "for",
+        "goto",
+        "if",
+        "inline",
+        "register",
+        "restrict",
+        "return",
+        "sizeof",
+        "static",
+        "struct",
+        "switch",
+        "typedef",
+        "union",
+        "volatile",
+        "while",
+        "class",
+        "namespace",
+        "template",
+        "typename",
+        "using",
+        "public",
+        "private",
+        "protected",
+        "virtual",
+        "override",
+        "new",
+        "delete",
+        "this",
+        "operator",
+        "friend",
+        "constexpr",
+        "try",
+        "catch",
+        "throw",
+        "noexcept",
+        "nullptr",
+        "true",
+        "false",
     ],
     types: &[
-        "void", "bool", "char", "short", "int", "long", "float", "double", "signed", "unsigned",
-        "size_t", "ssize_t", "int8_t", "int16_t", "int32_t", "int64_t", "uint8_t", "uint16_t",
-        "uint32_t", "uint64_t", "intptr_t", "uintptr_t", "wchar_t", "auto",
+        "void",
+        "bool",
+        "char",
+        "short",
+        "int",
+        "long",
+        "float",
+        "double",
+        "signed",
+        "unsigned",
+        "size_t",
+        "ssize_t",
+        "int8_t",
+        "int16_t",
+        "int32_t",
+        "int64_t",
+        "uint8_t",
+        "uint16_t",
+        "uint32_t",
+        "uint64_t",
+        "intptr_t",
+        "uintptr_t",
+        "wchar_t",
+        "auto",
     ],
     constants: &["NULL", "nullptr", "true", "false"],
     hash_line: true,
@@ -957,13 +1226,58 @@ const JAVASCRIPT: Syntax = Syntax {
     block_comment: Some(("/*", "*/")),
     quotes: &['"', '\'', '`'],
     keywords: &[
-        "break", "case", "catch", "class", "const", "continue", "debugger", "default", "delete",
-        "do", "else", "export", "extends", "finally", "for", "function", "if", "import", "in",
-        "instanceof", "let", "new", "return", "super", "switch", "this", "throw", "try",
-        "typeof", "var", "void", "while", "with", "yield", "async", "await", "of", "static",
-        "get", "set", "as", "from",
+        "break",
+        "case",
+        "catch",
+        "class",
+        "const",
+        "continue",
+        "debugger",
+        "default",
+        "delete",
+        "do",
+        "else",
+        "export",
+        "extends",
+        "finally",
+        "for",
+        "function",
+        "if",
+        "import",
+        "in",
+        "instanceof",
+        "let",
+        "new",
+        "return",
+        "super",
+        "switch",
+        "this",
+        "throw",
+        "try",
+        "typeof",
+        "var",
+        "void",
+        "while",
+        "with",
+        "yield",
+        "async",
+        "await",
+        "of",
+        "static",
+        "get",
+        "set",
+        "as",
+        "from",
     ],
-    types: &["number", "string", "boolean", "object", "symbol", "bigint", "undefined"],
+    types: &[
+        "number",
+        "string",
+        "boolean",
+        "object",
+        "symbol",
+        "bigint",
+        "undefined",
+    ],
     constants: &["true", "false", "null", "undefined", "NaN", "Infinity"],
     hash_line: false,
     hash_bracket: false,
@@ -974,13 +1288,65 @@ const JAVASCRIPT: Syntax = Syntax {
 
 const TYPESCRIPT: Syntax = Syntax {
     keywords: &[
-        "break", "case", "catch", "class", "const", "continue", "debugger", "default", "delete",
-        "do", "else", "export", "extends", "finally", "for", "function", "if", "import", "in",
-        "instanceof", "let", "new", "return", "super", "switch", "this", "throw", "try",
-        "typeof", "var", "void", "while", "with", "yield", "async", "await", "of", "static",
-        "get", "set", "as", "from", "interface", "type", "enum", "namespace", "declare",
-        "abstract", "implements", "private", "public", "protected", "readonly", "keyof", "infer",
-        "is", "asserts", "satisfies", "override",
+        "break",
+        "case",
+        "catch",
+        "class",
+        "const",
+        "continue",
+        "debugger",
+        "default",
+        "delete",
+        "do",
+        "else",
+        "export",
+        "extends",
+        "finally",
+        "for",
+        "function",
+        "if",
+        "import",
+        "in",
+        "instanceof",
+        "let",
+        "new",
+        "return",
+        "super",
+        "switch",
+        "this",
+        "throw",
+        "try",
+        "typeof",
+        "var",
+        "void",
+        "while",
+        "with",
+        "yield",
+        "async",
+        "await",
+        "of",
+        "static",
+        "get",
+        "set",
+        "as",
+        "from",
+        "interface",
+        "type",
+        "enum",
+        "namespace",
+        "declare",
+        "abstract",
+        "implements",
+        "private",
+        "public",
+        "protected",
+        "readonly",
+        "keyof",
+        "infer",
+        "is",
+        "asserts",
+        "satisfies",
+        "override",
     ],
     ..JAVASCRIPT
 };
@@ -995,7 +1361,9 @@ const PYTHON: Syntax = Syntax {
         "lambda", "nonlocal", "not", "or", "pass", "raise", "return", "try", "while", "with",
         "yield", "match", "case",
     ],
-    types: &["int", "float", "str", "bool", "list", "dict", "set", "tuple", "bytes", "object"],
+    types: &[
+        "int", "float", "str", "bool", "list", "dict", "set", "tuple", "bytes", "object",
+    ],
     constants: &["True", "False", "None", "self", "cls"],
     hash_line: false,
     hash_bracket: false,
@@ -1013,7 +1381,9 @@ const SHELL: Syntax = Syntax {
         "in", "function", "select", "time", "coproc", "local", "export", "readonly", "declare",
         "unset", "shift", "return", "continue", "break", "source", "alias",
     ],
-    types: &["echo", "cd", "pwd", "printf", "read", "set", "test", "trap", "eval", "exec"],
+    types: &[
+        "echo", "cd", "pwd", "printf", "read", "set", "test", "trap", "eval", "exec",
+    ],
     constants: &["true", "false"],
     hash_line: false,
     hash_bracket: false,
@@ -1027,14 +1397,54 @@ const GO: Syntax = Syntax {
     block_comment: Some(("/*", "*/")),
     quotes: &['"', '\'', '`'],
     keywords: &[
-        "break", "case", "chan", "const", "continue", "default", "defer", "else", "fallthrough",
-        "for", "func", "go", "goto", "if", "import", "interface", "map", "package", "range",
-        "return", "select", "struct", "switch", "type", "var",
+        "break",
+        "case",
+        "chan",
+        "const",
+        "continue",
+        "default",
+        "defer",
+        "else",
+        "fallthrough",
+        "for",
+        "func",
+        "go",
+        "goto",
+        "if",
+        "import",
+        "interface",
+        "map",
+        "package",
+        "range",
+        "return",
+        "select",
+        "struct",
+        "switch",
+        "type",
+        "var",
     ],
     types: &[
-        "bool", "string", "int", "int8", "int16", "int32", "int64", "uint", "uint8", "uint16",
-        "uint32", "uint64", "uintptr", "byte", "rune", "float32", "float64", "complex64",
-        "complex128", "error", "any",
+        "bool",
+        "string",
+        "int",
+        "int8",
+        "int16",
+        "int32",
+        "int64",
+        "uint",
+        "uint8",
+        "uint16",
+        "uint32",
+        "uint64",
+        "uintptr",
+        "byte",
+        "rune",
+        "float32",
+        "float64",
+        "complex64",
+        "complex128",
+        "error",
+        "any",
     ],
     constants: &["true", "false", "nil", "iota"],
     hash_line: false,

@@ -77,18 +77,22 @@ fn register_object(connection: &gio::DBusConnection) {
     };
     let _ = connection
         .register_object(OBJECT_PATH, &interface)
-        .method_call(|_conn, _sender, _path, _iface, _method, params, invocation| {
-            // Every method has the signature `(as, s)`; the startup-id is only
-            // used for focus/activation stealing, which a docked panel has no
-            // need for, so all three are treated as a reveal.
-            let uris: Vec<String> =
-                params.get::<(Vec<String>, String)>().map(|(uris, _)| uris).unwrap_or_default();
-            let command = command_for_uris(&uris);
-            if !command.reveal.is_empty() {
-                let _ = ipc::deliver(&command);
-            }
-            invocation.return_value(None);
-        })
+        .method_call(
+            |_conn, _sender, _path, _iface, _method, params, invocation| {
+                // Every method has the signature `(as, s)`; the startup-id is only
+                // used for focus/activation stealing, which a docked panel has no
+                // need for, so all three are treated as a reveal.
+                let uris: Vec<String> = params
+                    .get::<(Vec<String>, String)>()
+                    .map(|(uris, _)| uris)
+                    .unwrap_or_default();
+                let command = command_for_uris(&uris);
+                if !command.reveal.is_empty() {
+                    let _ = ipc::deliver(&command);
+                }
+                invocation.return_value(None);
+            },
+        )
         .build();
 }
 
@@ -126,8 +130,7 @@ mod tests {
 
     #[test]
     fn multiple_uris_all_reveal() {
-        let uris =
-            vec!["file:///tmp/a".to_owned(), "file:///tmp/b%20c".to_owned()];
+        let uris = vec!["file:///tmp/a".to_owned(), "file:///tmp/b%20c".to_owned()];
         assert_eq!(
             command_for_uris(&uris).reveal,
             vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b c")]

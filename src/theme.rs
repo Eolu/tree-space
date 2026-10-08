@@ -125,7 +125,11 @@ pub fn syntax_palette(theme: &ThemeConfig) -> highlight::Palette {
 fn palette_from(colors: &Colors) -> highlight::Palette {
     let fallback = highlight::Palette::dark();
     let pick = |value: &str, default: &str| {
-        if value.is_empty() { default.to_owned() } else { value.to_owned() }
+        if value.is_empty() {
+            default.to_owned()
+        } else {
+            value.to_owned()
+        }
     };
     highlight::Palette {
         keyword: pick(&colors.accent, &fallback.keyword),
@@ -158,7 +162,11 @@ pub fn load_omarchy_theme_from(dir: &Path) -> Option<OmarchyTheme> {
     let name = std::fs::read_to_string(dir.join("theme.name"))
         .map(|name| name.trim().to_owned())
         .unwrap_or_default();
-    Some(OmarchyTheme { name, colors, font_family: omarchy_font_family() })
+    Some(OmarchyTheme {
+        name,
+        colors,
+        font_family: omarchy_font_family(),
+    })
 }
 
 /// Render a full stylesheet from an Omarchy theme: the theme's palette, then the

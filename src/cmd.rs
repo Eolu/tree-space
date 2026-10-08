@@ -175,7 +175,14 @@ impl Command {
                 }
             }
         }
-        Command { side, roots, reveal, hidden, width, key }
+        Command {
+            side,
+            roots,
+            reveal,
+            hidden,
+            width,
+            key,
+        }
     }
 
     /// Encode into the IPC wire format (a single line, NUL-separated tokens).
@@ -232,7 +239,14 @@ impl Command {
                 _ => return None,
             }
         }
-        Some(Command { side, roots, reveal, hidden, width, key })
+        Some(Command {
+            side,
+            roots,
+            reveal,
+            hidden,
+            width,
+            key,
+        })
     }
 
     /// Does this command carry no directories and ask for the normal toggle
@@ -299,7 +313,10 @@ mod tests {
     fn directories_become_roots_and_flags_are_skipped() {
         let cmd = parse_str(&["--side", "left", "/etc", "--bogus", "/usr"]);
         assert_eq!(cmd.side, Some(PanelSide::Left));
-        assert_eq!(cmd.roots, vec![PathBuf::from("/etc"), PathBuf::from("/usr")]);
+        assert_eq!(
+            cmd.roots,
+            vec![PathBuf::from("/etc"), PathBuf::from("/usr")]
+        );
     }
 
     #[test]
@@ -317,12 +334,20 @@ mod tests {
         // path so dedup and the toolbar agree on one spelling.
         let cmd = parse_str(&["."]);
         assert_eq!(cmd.roots.len(), 1, "`.` should resolve to an existing dir");
-        assert!(cmd.roots[0].is_absolute(), "{:?} should be absolute", cmd.roots[0]);
+        assert!(
+            cmd.roots[0].is_absolute(),
+            "{:?} should be absolute",
+            cmd.roots[0]
+        );
 
         // A relative *reveal* is likewise absolutized (parent of "." is the
         // parent directory, and the target is the absolute cwd).
         let cmd = parse_str(&["--select", "."]);
-        assert!(cmd.reveal[0].is_absolute(), "{:?} should be absolute", cmd.reveal[0]);
+        assert!(
+            cmd.reveal[0].is_absolute(),
+            "{:?} should be absolute",
+            cmd.reveal[0]
+        );
     }
 
     #[test]
@@ -331,7 +356,10 @@ mod tests {
             parse_str(&["--select", "/tmp/f.txt"]).reveal,
             vec![PathBuf::from("/tmp/f.txt")]
         );
-        assert_eq!(parse_str(&["--select=/tmp/f.txt"]).reveal, vec![PathBuf::from("/tmp/f.txt")]);
+        assert_eq!(
+            parse_str(&["--select=/tmp/f.txt"]).reveal,
+            vec![PathBuf::from("/tmp/f.txt")]
+        );
         let two = parse_str(&["--select", "/a", "--select", "/b"]);
         assert_eq!(two.reveal, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
         // A lone `--select` with no value is ignored.
@@ -407,10 +435,19 @@ mod tests {
 
     #[test]
     fn key_flag_parses_and_is_never_a_toggle() {
-        assert_eq!(parse_str(&["--key", "Ctrl+c"]).key, Some("Ctrl+c".to_owned()));
+        assert_eq!(
+            parse_str(&["--key", "Ctrl+c"]).key,
+            Some("Ctrl+c".to_owned())
+        );
         assert_eq!(parse_str(&["--key=F2"]).key, Some("F2".to_owned()));
-        assert_eq!(parse_str(&["-k", "Alt+Left"]).key, Some("Alt+Left".to_owned()));
-        assert_eq!(parse_str(&["--key", "  Ctrl+t  "]).key, Some("Ctrl+t".to_owned()));
+        assert_eq!(
+            parse_str(&["-k", "Alt+Left"]).key,
+            Some("Alt+Left".to_owned())
+        );
+        assert_eq!(
+            parse_str(&["--key", "  Ctrl+t  "]).key,
+            Some("Ctrl+t".to_owned())
+        );
         // A lone `--key` with no value is ignored.
         assert!(parse_str(&["--key"]).key.is_none());
         assert!(!parse_str(&["--key", "Ctrl+c"]).is_toggle());
@@ -418,14 +455,20 @@ mod tests {
 
     #[test]
     fn encode_decode_key() {
-        let cmd = Command { key: Some("Ctrl+Shift+m".to_owned()), ..Command::default() };
+        let cmd = Command {
+            key: Some("Ctrl+Shift+m".to_owned()),
+            ..Command::default()
+        };
         assert_eq!(cmd.encode(), "key=Ctrl+Shift+m");
         assert_eq!(Command::decode(&cmd.encode()), Some(cmd));
     }
 
     #[test]
     fn encode_decode_hidden() {
-        let cmd = Command { hidden: true, ..Command::default() };
+        let cmd = Command {
+            hidden: true,
+            ..Command::default()
+        };
         assert_eq!(Command::decode(&cmd.encode()), Some(cmd.clone()));
         assert_eq!(Command::decode("hidden=1"), Some(cmd));
     }
@@ -458,10 +501,16 @@ mod tests {
 
     #[test]
     fn width_flag_parses_absolute_and_relative() {
-        assert_eq!(parse_str(&["--width", "420"]).width, Some(WidthArg::To(420)));
+        assert_eq!(
+            parse_str(&["--width", "420"]).width,
+            Some(WidthArg::To(420))
+        );
         assert_eq!(parse_str(&["--width=420"]).width, Some(WidthArg::To(420)));
         assert_eq!(parse_str(&["-w", "+40"]).width, Some(WidthArg::By(40)));
-        assert_eq!(parse_str(&["--width", "-40"]).width, Some(WidthArg::By(-40)));
+        assert_eq!(
+            parse_str(&["--width", "-40"]).width,
+            Some(WidthArg::By(-40))
+        );
         assert_eq!(parse_str(&["--width=garbage"]).width, None);
         assert!(parse_str(&["--width", "420"]).width.is_some());
         // A width change is never a plain toggle.
@@ -470,15 +519,24 @@ mod tests {
 
     #[test]
     fn encode_decode_width() {
-        let grow = Command { width: Some(WidthArg::By(40)), ..Command::default() };
+        let grow = Command {
+            width: Some(WidthArg::By(40)),
+            ..Command::default()
+        };
         assert_eq!(grow.encode(), "width=+40");
         assert_eq!(Command::decode(&grow.encode()), Some(grow));
 
-        let shrink = Command { width: Some(WidthArg::By(-40)), ..Command::default() };
+        let shrink = Command {
+            width: Some(WidthArg::By(-40)),
+            ..Command::default()
+        };
         assert_eq!(shrink.encode(), "width=-40");
         assert_eq!(Command::decode(&shrink.encode()), Some(shrink));
 
-        let exact = Command { width: Some(WidthArg::To(420)), ..Command::default() };
+        let exact = Command {
+            width: Some(WidthArg::To(420)),
+            ..Command::default()
+        };
         assert_eq!(exact.encode(), "width=420");
         assert_eq!(Command::decode(&exact.encode()), Some(exact));
 

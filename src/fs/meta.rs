@@ -189,12 +189,20 @@ impl FileMeta {
 pub fn read_meta(path: &Path) -> io::Result<FileMeta> {
     let link_meta = fs::symlink_metadata(path)?;
     let is_symlink = link_meta.file_type().is_symlink();
-    let link_target = if is_symlink { fs::read_link(path).ok() } else { None };
+    let link_target = if is_symlink {
+        fs::read_link(path).ok()
+    } else {
+        None
+    };
 
     // Permissions/type/times come from the target when the link resolves, so
     // editing them behaves like editing the file; a broken link falls back to
     // the link's own metadata.
-    let followed = if is_symlink { fs::metadata(path).ok() } else { None };
+    let followed = if is_symlink {
+        fs::metadata(path).ok()
+    } else {
+        None
+    };
     let meta = followed.as_ref().unwrap_or(&link_meta);
 
     let mode = meta.mode();
@@ -203,8 +211,10 @@ pub fn read_meta(path: &Path) -> io::Result<FileMeta> {
     let owner_name = user_name(uid);
     let group_name = group_name(gid);
     let mime_type = content_type_for(path);
-    let type_description =
-        mime_type.as_deref().map(gio::content_type_get_description).map(|s| s.to_string());
+    let type_description = mime_type
+        .as_deref()
+        .map(gio::content_type_get_description)
+        .map(|s| s.to_string());
 
     let name = path
         .file_name()
@@ -558,7 +568,8 @@ mod tests {
 
     #[test]
     fn id_name_lookup_reads_the_third_field() {
-        let passwd = "root:x:0:0:root:/root:/bin/bash\n# comment\nalice:x:1000:1000::/home/alice:/bin/sh\n";
+        let passwd =
+            "root:x:0:0:root:/root:/bin/bash\n# comment\nalice:x:1000:1000::/home/alice:/bin/sh\n";
         assert_eq!(parse_id_name(passwd, 0).as_deref(), Some("root"));
         assert_eq!(parse_id_name(passwd, 1000).as_deref(), Some("alice"));
         assert_eq!(parse_id_name(passwd, 9999), None);
@@ -584,7 +595,10 @@ mod tests {
             }
             entries
         };
-        assert_eq!(entries, vec![(10, "wheel".to_string()), (100, "users".to_string())]);
+        assert_eq!(
+            entries,
+            vec![(10, "wheel".to_string()), (100, "users".to_string())]
+        );
     }
 
     #[test]
@@ -661,7 +675,10 @@ mod tests {
         assert_eq!(meta.permissions.group, Access::Read);
         assert_eq!(meta.permissions.other, Access::None);
         assert_eq!(meta.uid, fs::metadata(&file).unwrap().uid());
-        assert_eq!(meta.owner, user_name(meta.uid).unwrap_or_else(|| meta.uid.to_string()));
+        assert_eq!(
+            meta.owner,
+            user_name(meta.uid).unwrap_or_else(|| meta.uid.to_string())
+        );
     }
 
     #[test]

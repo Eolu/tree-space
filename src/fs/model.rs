@@ -53,7 +53,9 @@ impl DirSource for StdDirSource {
             let is_dir = if file_type.is_dir() {
                 true
             } else if is_symlink {
-                fs::metadata(entry.path()).map(|m| m.is_dir()).unwrap_or(false)
+                fs::metadata(entry.path())
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false)
             } else {
                 false
             };
@@ -210,10 +212,19 @@ pub struct DirNode {
 /// [`super::watcher`] from raw notify events and by file operations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
-    Created { path: PathBuf },
-    Removed { path: PathBuf },
-    Renamed { from: PathBuf, to: PathBuf },
-    Modified { path: PathBuf },
+    Created {
+        path: PathBuf,
+    },
+    Removed {
+        path: PathBuf,
+    },
+    Renamed {
+        from: PathBuf,
+        to: PathBuf,
+    },
+    Modified {
+        path: PathBuf,
+    },
     /// The backing store is in an unknown state; drop every cache.
     Rescan,
 }
@@ -547,8 +558,7 @@ impl TreeModel {
         }
         let filtering = !self.filter.is_empty();
         for entry in &node.entries {
-            let name_matches =
-                filtering && entry.name.to_lowercase().contains(&self.filter);
+            let name_matches = filtering && entry.name.to_lowercase().contains(&self.filter);
             // Directories are kept when their own name matches or any loaded
             // descendant does (so the path to the match stays visible).
             let kept = if filtering {
@@ -635,7 +645,11 @@ mod tests {
 
         /// Like [`Self::dir`], but each child carries a `(size, mtime_secs)`
         /// pair so size/date sorting can be exercised.
-        fn dir_sized(&mut self, path: impl AsRef<Path>, children: Vec<(&str, bool, bool, u64, u64)>) {
+        fn dir_sized(
+            &mut self,
+            path: impl AsRef<Path>,
+            children: Vec<(&str, bool, bool, u64, u64)>,
+        ) {
             let path = path.as_ref();
             let entries = children
                 .into_iter()
@@ -655,7 +669,10 @@ mod tests {
     impl DirSource for MemFs {
         fn list_dir(&self, path: &Path) -> io::Result<Vec<EntryInfo>> {
             self.dirs.get(path).cloned().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, format!("no such dir: {}", path.display()))
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("no such dir: {}", path.display()),
+                )
             })
         }
     }
@@ -704,7 +721,14 @@ mod tests {
     #[test]
     fn expand_is_lazy_and_shows_sorted_children() {
         let mut fs = MemFs::default();
-        fs.dir("/r", vec![("z.txt", false, false), ("a", true, false), ("b.txt", false, false)]);
+        fs.dir(
+            "/r",
+            vec![
+                ("z.txt", false, false),
+                ("a", true, false),
+                ("b.txt", false, false),
+            ],
+        );
         let mut model = TreeModel::new("/r".into(), SortOptions::default(), false);
 
         model.expand(Path::new("/r"), &fs).unwrap();
@@ -766,7 +790,10 @@ mod tests {
         let mut model = TreeModel::new("/r".into(), SortOptions::default(), false);
         model.expand(Path::new("/r"), &fs).unwrap();
         // Root excluded; dirs first, then case-insensitive alphabetical.
-        assert_eq!(row_names(&model.visible_rows()), vec!["GAMMA", "Alpha", "alpha", "beta"]);
+        assert_eq!(
+            row_names(&model.visible_rows()),
+            vec!["GAMMA", "Alpha", "alpha", "beta"]
+        );
     }
 
     #[test]
@@ -775,7 +802,10 @@ mod tests {
         fs.dir("/r", vec![("b", true, false), ("a", false, false)]);
         let mut model = TreeModel::new(
             "/r".into(),
-            SortOptions { dirs_first: false, ..SortOptions::default() },
+            SortOptions {
+                dirs_first: false,
+                ..SortOptions::default()
+            },
             false,
         );
         model.expand(Path::new("/r"), &fs).unwrap();
@@ -794,10 +824,16 @@ mod tests {
                 ("mid.txt", false, false, 100, 0),
             ],
         );
-        let asc = SortOptions { key: SortKey::Size, ..SortOptions::default() };
+        let asc = SortOptions {
+            key: SortKey::Size,
+            ..SortOptions::default()
+        };
         let mut model = TreeModel::new("/r".into(), asc, false);
         model.expand(Path::new("/r"), &fs).unwrap();
-        assert_eq!(row_names(&model.visible_rows()), vec!["small.txt", "mid.txt", "big.txt"]);
+        assert_eq!(
+            row_names(&model.visible_rows()),
+            vec!["small.txt", "mid.txt", "big.txt"]
+        );
 
         let desc = SortOptions {
             key: SortKey::Size,
@@ -806,7 +842,10 @@ mod tests {
         };
         let mut model = TreeModel::new("/r".into(), desc, false);
         model.expand(Path::new("/r"), &fs).unwrap();
-        assert_eq!(row_names(&model.visible_rows()), vec!["big.txt", "mid.txt", "small.txt"]);
+        assert_eq!(
+            row_names(&model.visible_rows()),
+            vec!["big.txt", "mid.txt", "small.txt"]
+        );
     }
 
     #[test]
@@ -820,10 +859,16 @@ mod tests {
                 ("mid.txt", false, false, 1, 200),
             ],
         );
-        let opts = SortOptions { key: SortKey::Modified, ..SortOptions::default() };
+        let opts = SortOptions {
+            key: SortKey::Modified,
+            ..SortOptions::default()
+        };
         let mut model = TreeModel::new("/r".into(), opts, false);
         model.expand(Path::new("/r"), &fs).unwrap();
-        assert_eq!(row_names(&model.visible_rows()), vec!["old.txt", "mid.txt", "new.txt"]);
+        assert_eq!(
+            row_names(&model.visible_rows()),
+            vec!["old.txt", "mid.txt", "new.txt"]
+        );
     }
 
     #[test]
@@ -838,17 +883,26 @@ mod tests {
                 ("d.md", false, false),
             ],
         );
-        let opts = SortOptions { key: SortKey::Type, ..SortOptions::default() };
+        let opts = SortOptions {
+            key: SortKey::Type,
+            ..SortOptions::default()
+        };
         let mut model = TreeModel::new("/r".into(), opts, false);
         model.expand(Path::new("/r"), &fs).unwrap();
         // Extension groups: md, rs, txt; alphabetical within txt.
-        assert_eq!(row_names(&model.visible_rows()), vec!["d.md", "b.rs", "a.txt", "c.txt"]);
+        assert_eq!(
+            row_names(&model.visible_rows()),
+            vec!["d.md", "b.rs", "a.txt", "c.txt"]
+        );
     }
 
     #[test]
     fn reload_all_applies_hidden_toggle() {
         let mut fs = MemFs::default();
-        fs.dir("/r", vec![(".hidden", false, false), ("shown", false, false)]);
+        fs.dir(
+            "/r",
+            vec![(".hidden", false, false), ("shown", false, false)],
+        );
         let mut model = TreeModel::new("/r".into(), SortOptions::default(), false);
         model.expand(Path::new("/r"), &fs).unwrap();
         assert_eq!(row_names(&model.visible_rows()), vec!["shown"]);
@@ -861,7 +915,14 @@ mod tests {
     #[test]
     fn hidden_entries_are_skipped_unless_enabled() {
         let mut fs = MemFs::default();
-        fs.dir("/r", vec![(".git", true, false), (".env", false, false), ("src", true, false)]);
+        fs.dir(
+            "/r",
+            vec![
+                (".git", true, false),
+                (".env", false, false),
+                ("src", true, false),
+            ],
+        );
 
         let mut hidden = TreeModel::new("/r".into(), SortOptions::default(), false);
         hidden.expand(Path::new("/r"), &fs).unwrap();
@@ -871,7 +932,10 @@ mod tests {
         let mut visible = TreeModel::new("/r".into(), SortOptions::default(), true);
         visible.expand(Path::new("/r"), &fs).unwrap();
         // Root excluded; dirs first: .git and src before the file .env.
-        assert_eq!(row_names(&visible.visible_rows()), vec![".git", "src", ".env"]);
+        assert_eq!(
+            row_names(&visible.visible_rows()),
+            vec![".git", "src", ".env"]
+        );
     }
 
     #[test]
@@ -885,7 +949,10 @@ mod tests {
                 ("src", true, false),
             ],
         );
-        fs.dir("/r/src", vec![("main.rs", false, false), ("test.rs", false, false)]);
+        fs.dir(
+            "/r/src",
+            vec![("main.rs", false, false), ("test.rs", false, false)],
+        );
 
         let mut model = TreeModel::new("/r".into(), SortOptions::default(), false);
         model.expand(Path::new("/r"), &fs).unwrap();
@@ -923,7 +990,12 @@ mod tests {
         assert!(model.visible_rows().iter().all(|r| r.name != "new.txt"));
 
         fs.dir("/r", vec![("new.txt", false, false)]);
-        model.apply(&Change::Created { path: "/r/new.txt".into() }, &fs);
+        model.apply(
+            &Change::Created {
+                path: "/r/new.txt".into(),
+            },
+            &fs,
+        );
         assert!(row_names(&model.visible_rows()).contains(&"new.txt".to_owned()));
     }
 
@@ -935,8 +1007,16 @@ mod tests {
         let mut model = TreeModel::new("/r".into(), SortOptions::default(), false);
         model.expand(Path::new("/r"), &fs).unwrap();
         // "deep" never expanded => not loaded, event is dropped.
-        fs.dir("/r/deep", vec![("a.txt", false, false), ("b.txt", false, false)]);
-        model.apply(&Change::Created { path: "/r/deep/b.txt".into() }, &fs);
+        fs.dir(
+            "/r/deep",
+            vec![("a.txt", false, false), ("b.txt", false, false)],
+        );
+        model.apply(
+            &Change::Created {
+                path: "/r/deep/b.txt".into(),
+            },
+            &fs,
+        );
         let names = row_names(&model.visible_rows());
         assert!(!names.contains(&"b.txt".to_owned()));
     }
@@ -953,21 +1033,38 @@ mod tests {
         assert_eq!(row_names(&model.visible_rows()), vec!["a", "x", "keep.txt"]);
 
         fs.dir("/r", vec![("keep.txt", false, false)]);
-        model.apply(&Change::Removed { path: "/r/a".into() }, &fs);
+        model.apply(
+            &Change::Removed {
+                path: "/r/a".into(),
+            },
+            &fs,
+        );
         assert_eq!(row_names(&model.visible_rows()), vec!["keep.txt"]);
-        assert!(!model.dirs.contains_key(Path::new("/r/a")), "subtree cache must be dropped");
+        assert!(
+            !model.dirs.contains_key(Path::new("/r/a")),
+            "subtree cache must be dropped"
+        );
     }
 
     #[test]
     fn renamed_event_moves_entries() {
         let mut fs = MemFs::default();
-        fs.dir("/r", vec![("old.txt", false, false), ("other", true, false)]);
+        fs.dir(
+            "/r",
+            vec![("old.txt", false, false), ("other", true, false)],
+        );
         let mut model = TreeModel::new("/r".into(), SortOptions::default(), false);
         model.expand(Path::new("/r"), &fs).unwrap();
 
-        fs.dir("/r", vec![("other", true, false), ("new.txt", false, false)]);
+        fs.dir(
+            "/r",
+            vec![("other", true, false), ("new.txt", false, false)],
+        );
         model.apply(
-            &Change::Renamed { from: "/r/old.txt".into(), to: "/r/new.txt".into() },
+            &Change::Renamed {
+                from: "/r/old.txt".into(),
+                to: "/r/new.txt".into(),
+            },
             &fs,
         );
         let names = row_names(&model.visible_rows());

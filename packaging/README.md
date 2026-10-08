@@ -50,8 +50,9 @@ cp packaging/aur/tree-space/PKGBUILD \
 cd tree-space && git add . && git commit -m 'tree-space X.Y.Z' && git push
 ```
 
-Repeat for `tree-space-git`. Install with `yay -S tree-space` (or
-`tree-space-git`).
+Repeat for `tree-space-git`. Once accepted, install with `yay -S tree-space`
+(or `tree-space-git`). Until then, build either package locally with
+`makepkg -si` from its directory.
 
 A `tree-space-bin` package is not provided yet: it needs prebuilt release
 artifacts, which require a GitHub release/CI workflow that is not set up.

@@ -45,9 +45,9 @@
 
 use std::path::PathBuf;
 
+use relm4::gtk;
 use relm4::gtk::gio;
 use relm4::gtk::prelude::{ApplicationExtManual, FileExt};
-use relm4::gtk;
 use relm4::prelude::*;
 
 use crate::cmd::Command;
