@@ -4,9 +4,9 @@
 //! Hyprland exposes two Unix sockets under `$XDG_RUNTIME_DIR/hypr/<signature>/`:
 //! `.socket.sock` (commands, the same protocol `hyprctl` speaks) and
 //! `.socket2.sock` (a one-way event stream). tree-space uses the command socket
-//! to read the active workspace, to list workspaces, and to `dispatch workspace`
-//! when moving itself, and subscribes to the event socket to learn when the
-//! active workspace changes so it can hide or show itself.
+//! to read the active workspace and to list workspaces, and subscribes to the
+//! event socket to learn when the active workspace changes so it can hide or
+//! show itself.
 //!
 //! None of this exists outside a Hyprland session; [`Hyprland::connect`] then
 //! returns `None` and callers fall back to "always visible".
@@ -72,25 +72,6 @@ impl Hyprland {
             .collect();
         named.sort_by_key(|(id, _)| *id);
         named.into_iter().map(|(_, name)| name).collect()
-    }
-
-    /// Ask the compositor to switch to `name`.
-    ///
-    /// The portable form is `dispatch workspace <name>`, but a Lua-configured
-    /// Hyprland (Omarchy) routes `dispatch` through `hl.dispatch` and rejects
-    /// it; there the `hl.dsp.focus` dispatcher is required. Try the portable
-    /// form first and fall back when the compositor reports an error.
-    pub fn dispatch_workspace(&self, name: &str) {
-        let classic = self.command(&format!("dispatch workspace {name}"));
-        if classic
-            .as_deref()
-            .is_some_and(|response| response.trim() == "ok")
-        {
-            return;
-        }
-        let _ = self.command(&format!(
-            "dispatch hl.dsp.focus({{ workspace = \"{name}\" }})"
-        ));
     }
 
     /// Spawn a thread that calls `on_change` with the newly focused workspace's

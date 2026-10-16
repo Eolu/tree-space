@@ -4,11 +4,13 @@
 //! Architecture notes:
 //!
 //! * Rendering is *stateless*: [`TreeMsg`] mutates the model and `update_view`
-//!   rebuilds the whole [`gtk::ListBox`] from [`TreeModel::visible_rows`].
-//!   A tree this size does not need widget recycling, and a full rebuild keeps
-//!   row state trivially consistent.
-//! * Selection lives as paths in the model, not in `ListBox` selection, so it
-//!   survives rebuilds as the tree expands and collapses.
+//!   republishes it to a virtualised [`gtk::ListView`]. The list builds widgets
+//!   only for the rows on screen (via a recycled row factory), so a directory
+//!   with tens of thousands of entries costs a few dozen rows of memory rather
+//!   than one widget tree per entry.
+//! * Selection lives as paths in the model, not in the list's selection model,
+//!   so it survives as the tree expands and collapses; the factory reads the
+//!   cursor and selection from a shared [`RowMirror`].
 //! * Keyboard input is captured *in the capture phase* on the scrolled window,
 //!   so arrows work before the user clicks a row. While an inline rename entry
 //!   is focused the capture defers entirely to that entry.
@@ -23,8 +25,8 @@ use std::time::{Duration, SystemTime};
 
 use crate::audio::AudioPlayer;
 use crate::config::{
-    BuiltinAction, ContextAction, ContextMenu, PanelConfig, PanelSide, ShortcutTarget, TreeConfig,
-    action_command,
+    BuiltinAction, ContextAction, ContextMenu, PANEL_MIN_WIDTH, PanelConfig, PanelSide,
+    ShortcutTarget, TreeConfig, action_command,
 };
 use crate::fs::meta::format_size;
 use crate::fs::model::{Change, SortKey, StdDirSource, TreeModel, VisibleRow};
@@ -61,6 +63,10 @@ struct TypeAhead {
 const TYPEAHEAD_TIMEOUT: Duration = Duration::from_millis(700);
 /// Guard against runaway prefixes from a stuck key.
 const TYPEAHEAD_MAX: usize = 32;
+
+/// Two presses on the same row within this window count as a double-click,
+/// which opens a file (directories toggle on every press instead).
+const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(400);
 
 impl TypeAhead {
     /// Feed `ch`, returning the prefix to search for (empty when the key is not
@@ -469,7 +475,7 @@ pub enum TreeMsg {
 
     RenameCommit,
     /// The rename entry with the given generation lost keyboard focus. Commits
-    /// only if that entry is still the current one (see `Tree::rename_gen`).
+    /// only if that entry is still the current one (see `RowMirror::rename_gen`).
     RenameFocusLost(u64),
     RenameCancel,
 
@@ -524,6 +530,10 @@ pub enum TreeMsg {
     Suspend,
     /// Drop every thumbnail and stop all media playback ahead of app exit.
     Shutdown,
+    /// Attach (or drop) inline previews for whichever rows are now on screen.
+    /// Sent after a model change and whenever the list scrolls, since a
+    /// virtualised list only keeps widgets for the visible rows.
+    SyncPreviews,
     /// Do nothing. Produced for actions that are dispatched elsewhere (the
     /// bookmark-only builtins never run against a tree row).
     Noop,
@@ -550,6 +560,89 @@ pub enum TreeOutput {
     AddBookmark(PathBuf),
 }
 
+/// State the row factory reads while (re)binding recycled rows.
+///
+/// `GtkListView` keeps widgets only for the rows currently on screen, so the
+/// factory — which runs during layout, outside the component update — cannot
+/// borrow `Tree`. `Tree` mirrors the handful of pieces the factory needs here on
+/// every change, and shares the map of built preview widgets so a row that is
+/// merely re-bound (the list republished, a redraw) keeps its inline player
+/// instead of restarting it.
+struct RowMirror {
+    icon_size: Cell<i32>,
+    /// Path under the keyboard cursor, if any.
+    cursor_path: RefCell<Option<PathBuf>>,
+    selected: RefCell<Vec<PathBuf>>,
+    renaming: RefCell<Option<PathBuf>>,
+    /// Built inline preview widgets, keyed by path. A preview survives a rebind
+    /// (so its media is not restarted) but is dropped — along with its media —
+    /// once its row scrolls off screen.
+    previews: RefCell<HashMap<PathBuf, gtk::Widget>>,
+    /// The live rows on screen, keyed by path, so the preview pass, focus, the
+    /// context menu and the recycled row's gestures can find a row's widget.
+    realized: RefCell<HashMap<PathBuf, RealizedRow>>,
+    /// The live inline rename entry, so a commit can read its text.
+    rename_entry: RefCell<Option<gtk::Entry>>,
+    /// Identity of the current rename entry, bumped on every (re)build so a
+    /// focus-leave from an entry a rebind already replaced is ignored.
+    rename_gen: Cell<u64>,
+}
+
+/// A row that currently has a widget: its container and the data it shows.
+struct RealizedRow {
+    container: gtk::Box,
+    row: VisibleRow,
+}
+
+impl RowMirror {
+    fn new(icon_size: i32) -> Self {
+        Self {
+            icon_size: Cell::new(icon_size),
+            cursor_path: RefCell::new(None),
+            selected: RefCell::new(Vec::new()),
+            renaming: RefCell::new(None),
+            previews: RefCell::new(HashMap::new()),
+            realized: RefCell::new(HashMap::new()),
+            rename_entry: RefCell::new(None),
+            rename_gen: Cell::new(0),
+        }
+    }
+}
+
+/// The row a widget under the pointer belongs to: walk up to the row container
+/// (which carries the `tree-row` class) and look it up in the realised set,
+/// returning the container too so callers can focus it. Used by the recycled
+/// row's gestures, which cannot capture a path (the widget they are attached to
+/// is reused for other rows) — `GtkListItem` is not a widget, so there is no
+/// back-pointer to walk up to.
+fn realized_row_for_widget(
+    mirror: &RowMirror,
+    widget: &gtk::Widget,
+) -> Option<(gtk::Box, VisibleRow)> {
+    let mut current = Some(widget.clone());
+    while let Some(widget) = current {
+        if widget.has_css_class("tree-row")
+            && let Ok(container) = widget.clone().downcast::<gtk::Box>()
+            && let Some(entry) = mirror
+                .realized
+                .borrow()
+                .values()
+                .find(|entry| entry.container == container)
+        {
+            return Some((entry.container.clone(), entry.row.clone()));
+        }
+        current = widget.parent();
+    }
+    None
+}
+
+/// The [`VisibleRow`] a list item currently shows.
+fn item_row(list_item: &gtk::ListItem) -> Option<VisibleRow> {
+    let object = list_item.item()?;
+    let boxed = object.downcast::<glib::BoxedAnyObject>().ok()?;
+    Some(boxed.borrow::<VisibleRow>().clone())
+}
+
 /// Rendered state of the tree component.
 pub struct Tree {
     tree: Option<TreeModel>,
@@ -558,6 +651,19 @@ pub struct Tree {
     parent: gtk::Window,
     menu: ContextMenu,
     side: PanelSide,
+    /// State shared with the (recycled) row factory; see [`RowMirror`].
+    mirror: Rc<RowMirror>,
+    /// The list's model. Refilled from `rows` whenever they change; the view
+    /// only binds widgets for the rows on screen.
+    store: gio::ListStore,
+    /// The scroll container, kept for anchoring context-menu popovers.
+    scrolled: gtk::ScrolledWindow,
+    /// Set by [`Self::refresh_rows`]: the model contents changed and must be
+    /// re-published to `store` on the next widget pass.
+    rows_dirty: bool,
+    /// Set when a row's *content* changed without the row set changing (a rename
+    /// entry shown or hidden): re-bind the rows on screen.
+    rebind: bool,
 
     /// Paths the user turned "View Thumbnail" on: a file previews only itself,
     /// a directory previews every previewable file beneath it. Non-persistent —
@@ -616,7 +722,6 @@ pub struct Tree {
     last_press: Option<(PathBuf, std::time::Instant)>,
 
     renaming: Option<PathBuf>,
-    rename_entry: Option<gtk::Entry>,
     clipboard: Option<Clipboard>,
 
     pending: Vec<Change>,
@@ -639,10 +744,6 @@ pub struct Tree {
 
     /// Shared with the key-capture closure so it can defer to the rename entry.
     renaming_state: Rc<Cell<bool>>,
-    /// Identity of the rename entry currently rendered. Bumped every time one is
-    /// (re)built, so a focus-leave from an entry that a background rebuild has
-    /// already replaced is ignored instead of committing the wrong entry.
-    rename_gen: u64,
 
     /// Set by a message that only changed the selection/cursor (no structural
     /// change). `update_with_view` then updates the `tree-row-selected` class on
@@ -699,13 +800,17 @@ impl Component for Tree {
         scrolled = gtk::ScrolledWindow {
             set_vexpand: true,
             set_hexpand: true,
-            set_min_content_width: 160,
+            set_min_content_width: PANEL_MIN_WIDTH as i32,
             add_css_class: "tree-scroll",
 
+            // A virtualised list: `GtkListView` materialises widgets only for
+            // the rows on screen, so a directory with tens of thousands of
+            // entries costs a few dozen rows of memory instead of one widget
+            // tree per entry. The model and factory are wired up in `init`.
             #[name = "list"]
-            gtk::ListBox {
-                set_selection_mode: gtk::SelectionMode::None,
-                set_activate_on_single_click: false,
+            gtk::ListView {
+                set_show_separators: false,
+                set_single_click_activate: false,
             }
         }
     }
@@ -717,6 +822,12 @@ impl Component for Tree {
     ) -> ComponentParts<Self> {
         let renaming_state = Rc::new(Cell::new(false));
         let keys = compile_shortcuts(&init.menu);
+        let mirror = Rc::new(RowMirror::new(init.config.icon_size as i32));
+        let drag_payload = Rc::new(RefCell::new(Vec::new()));
+        let drag_active = Rc::new(Cell::new(false));
+        let drag_landed_internal = Rc::new(Cell::new(false));
+        let drag_origin = Rc::new(RefCell::new(None));
+        let drag_button_down = Rc::new(Cell::new(false));
         let widgets = view_output!();
 
         let controller = gtk::EventControllerKey::new();
@@ -743,6 +854,244 @@ impl Component for Tree {
             )
         });
         widgets.scrolled.add_controller(controller);
+
+        // --- list model + row factory -------------------------------------
+        // `GtkListView` recycles row widgets: `setup` builds a skeleton and its
+        // controllers once, `bind` fills it for whichever row it now shows, and
+        // `unbind` detaches (but keeps) any inline preview. Gestures look their
+        // row up in the realised set rather than capturing a path, so a recycled
+        // row always acts on what it currently displays.
+        let store = gio::ListStore::new::<glib::BoxedAnyObject>();
+        let selection = gtk::NoSelection::new(Some(store.clone()));
+        let factory = gtk::SignalListItemFactory::new();
+
+        factory.connect_setup({
+            let sender = sender.clone();
+            let mirror = mirror.clone();
+            let drag_active = drag_active.clone();
+            let drag_landed = drag_landed_internal.clone();
+            move |_, object| {
+                let list_item = object
+                    .downcast_ref::<gtk::ListItem>()
+                    .expect("list factory objects are GtkListItems");
+                let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+                container.add_css_class("tree-row");
+                container.set_focusable(true);
+                container.set_can_focus(true);
+                list_item.set_child(Some(&container));
+                // The list's own selection/activation must not touch our rows.
+                list_item.set_activatable(false);
+                list_item.set_selectable(false);
+
+                // Drop target: a directory row takes the drop itself; a file
+                // row forwards to the tree root, matching the old behaviour
+                // where file rows had no target of their own.
+                let drop = gtk::DropTarget::new(
+                    gdk::FileList::static_type(),
+                    gdk::DragAction::MOVE | gdk::DragAction::COPY,
+                );
+                {
+                    let sender = sender.clone();
+                    let mirror = mirror.clone();
+                    let drag_active = drag_active.clone();
+                    let drag_landed = drag_landed.clone();
+                    drop.connect_drop(move |target, value, _x, _y| {
+                        let Ok(list) = value.get::<gdk::FileList>() else {
+                            return false;
+                        };
+                        let sources: Vec<PathBuf> =
+                            list.files().iter().filter_map(gio::File::path).collect();
+                        if sources.is_empty() {
+                            return false;
+                        }
+                        let copy = target
+                            .current_event_state()
+                            .contains(gdk::ModifierType::CONTROL_MASK);
+                        let row = target
+                            .widget()
+                            .and_then(|widget| realized_row_for_widget(&mirror, &widget))
+                            .map(|(_, row)| row);
+                        match row {
+                            Some(row) if row.is_dir => {
+                                if drag_active.get() {
+                                    drag_landed.set(true);
+                                }
+                                sender.input(TreeMsg::DropInto {
+                                    target: row.path,
+                                    sources,
+                                    copy,
+                                });
+                            }
+                            _ => sender.input(TreeMsg::DropIntoRoot { sources, copy }),
+                        }
+                        true
+                    });
+                }
+                container.add_controller(drop);
+            }
+        });
+
+        factory.connect_bind({
+            let mirror = mirror.clone();
+            let sender = sender.clone();
+            let renaming_state = renaming_state.clone();
+            move |_, object| {
+                let list_item = object
+                    .downcast_ref::<gtk::ListItem>()
+                    .expect("list factory objects are GtkListItems");
+                let Some(container) = list_item
+                    .child()
+                    .and_then(|c| c.downcast::<gtk::Box>().ok())
+                else {
+                    return;
+                };
+                let Some(row) = item_row(list_item) else {
+                    return;
+                };
+                bind_row(&container, &row, &mirror, &sender, &renaming_state);
+            }
+        });
+
+        factory.connect_unbind({
+            let mirror = mirror.clone();
+            let renaming_state = renaming_state.clone();
+            move |_, object| {
+                let list_item = object
+                    .downcast_ref::<gtk::ListItem>()
+                    .expect("list factory objects are GtkListItems");
+                let Some(container) = list_item
+                    .child()
+                    .and_then(|c| c.downcast::<gtk::Box>().ok())
+                else {
+                    return;
+                };
+                let Some(row) = item_row(list_item) else {
+                    return;
+                };
+                // Only drop the entry when this widget is still the one
+                // registered for the path. A model change can unbind an old
+                // widget *after* a new one has already bound the same path, and
+                // removing by path alone would clobber the live row (which made
+                // a click on that row stop working).
+                let still_current = mirror
+                    .realized
+                    .borrow()
+                    .get(&row.path)
+                    .is_some_and(|entry| entry.container == container);
+                if still_current {
+                    mirror.realized.borrow_mut().remove(&row.path);
+                }
+                if mirror.renaming.borrow().as_deref() == Some(row.path.as_path()) {
+                    *mirror.rename_entry.borrow_mut() = None;
+                    renaming_state.set(false);
+                }
+                // Detach children; a preview widget survives in
+                // `mirror.previews`, so its media keeps playing.
+                while let Some(child) = container.first_child() {
+                    container.remove(&child);
+                }
+            }
+        });
+
+        widgets.list.set_factory(Some(&factory));
+        widgets.list.set_model(Some(&selection));
+
+        // Row clicks are handled on the list itself, in the *capture* phase, so
+        // the list's own selection/activation handling can never swallow a click
+        // before ours sees it — in particular the second click on an
+        // already-selected directory, which the list would otherwise take as an
+        // activation and drop. The row under the pointer is resolved from the
+        // picked widget, so a recycled row still acts on what it shows.
+        let list_click = gtk::GestureClick::new();
+        list_click.set_button(0);
+        list_click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        {
+            let sender = sender.clone();
+            let mirror = mirror.clone();
+            list_click.connect_pressed(move |gesture, _n_press, x, y| {
+                let Some(list) = gesture.widget() else {
+                    return;
+                };
+                let Some(widget) = list.pick(x, y, gtk::PickFlags::DEFAULT) else {
+                    return;
+                };
+                // Clicks on an inline player's controls, or on the selectable
+                // text preview, belong to that widget.
+                if in_inline_media(&widget) {
+                    if let Some(view) = inline_text_view(&widget) {
+                        glib::idle_add_local_once(move || {
+                            view.grab_focus();
+                        });
+                    }
+                    return;
+                }
+                let Some((container, row)) = realized_row_for_widget(&mirror, &widget) else {
+                    return;
+                };
+                container.grab_focus();
+                let button = gesture.current_button();
+                let state = gesture.current_event_state();
+                if button == 3 {
+                    if state.contains(gdk::ModifierType::SUPER_MASK) {
+                        gesture.set_state(gtk::EventSequenceState::Denied);
+                        return;
+                    }
+                    sender.input(TreeMsg::Menu(row.path));
+                    return;
+                }
+                if button != 1 {
+                    return;
+                }
+                let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
+                let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
+                sender.input(TreeMsg::RowPress {
+                    path: row.path,
+                    is_dir: row.is_dir,
+                    ctrl,
+                    shift,
+                });
+            });
+        }
+        {
+            let sender = sender.clone();
+            let mirror = mirror.clone();
+            list_click.connect_released(move |gesture, _n_press, x, y| {
+                if gesture.current_button() != 1 {
+                    return;
+                }
+                let Some(list) = gesture.widget() else {
+                    return;
+                };
+                let Some(widget) = list.pick(x, y, gtk::PickFlags::DEFAULT) else {
+                    return;
+                };
+                if let Some(view) = inline_text_view(&widget) {
+                    glib::idle_add_local_once(move || {
+                        view.grab_focus();
+                    });
+                    return;
+                }
+                let Some((_, row)) = realized_row_for_widget(&mirror, &widget) else {
+                    return;
+                };
+                sender.input(TreeMsg::RowRelease { path: row.path });
+            });
+        }
+        widgets.list.add_controller(list_click);
+
+        // Keep inline previews attached to whichever rows are on screen.
+        {
+            let preview_sender = sender.clone();
+            widgets
+                .scrolled
+                .vadjustment()
+                .connect_value_changed(move |_| {
+                    // `send`, not `input`: the widget can outlive the component
+                    // (a pane removed while its surface is still mapped), and
+                    // `input` panics on a shut-down runtime.
+                    let _ = preview_sender.input_sender().send(TreeMsg::SyncPreviews);
+                });
+        }
 
         // Drops that land on empty space below the rows (or bubble up from a
         // non-directory row, which has no drop target of its own) resolve to
@@ -816,6 +1165,11 @@ impl Component for Tree {
             parent: init.parent,
             menu: init.menu,
             side: init.side,
+            mirror,
+            scrolled: widgets.scrolled.clone(),
+            store: store.clone(),
+            rows_dirty: false,
+            rebind: false,
             thumbnails: HashSet::new(),
             preview_kinds: HashMap::new(),
             documents: HashMap::new(),
@@ -836,7 +1190,6 @@ impl Component for Tree {
             anchor: None,
             last_press: None,
             renaming: None,
-            rename_entry: None,
             clipboard: None,
             pending: Vec::new(),
             flush_source: None,
@@ -846,17 +1199,16 @@ impl Component for Tree {
             menu_target: None,
             menu_point: None,
             renaming_state,
-            rename_gen: 0,
             selection_dirty: false,
             typeahead: TypeAhead::default(),
             scroll_to: None,
             focus_pending: false,
-            drag_payload: Rc::new(RefCell::new(Vec::new())),
-            drag_active: Rc::new(Cell::new(false)),
+            drag_payload,
+            drag_active,
             pending_click: None,
-            drag_landed_internal: Rc::new(Cell::new(false)),
-            drag_origin: Rc::new(RefCell::new(None)),
-            drag_button_down: Rc::new(Cell::new(false)),
+            drag_landed_internal,
+            drag_origin,
+            drag_button_down,
         };
 
         // Drag-out. GTK's `DragSource` never starts here (its gesture is not
@@ -990,63 +1342,59 @@ impl Component for Tree {
         root: &Self::Root,
     ) {
         let _ = root;
-        // Focus is a pure widget-side request: grab it and stop, without
-        // touching the model or rebuilding the rows.
+        // Focus is a pure widget-side request: ask the view to focus the cursor
+        // row (or the first) and stop, without touching the model.
         if let TreeMsg::Focus = message {
-            // The rows are the focusable widgets (the list/scrolled are not),
-            // so focus the row at the keyboard cursor — falling back to the
-            // first row, then the list.
-            if widgets.list.row_at_index(0).is_none() {
+            if self.rows.is_empty() {
                 // A freshly-opened directory has not loaded yet; take focus once
-                // the first row is built (see the tail of this method).
+                // the first row exists (see the tail of this method).
                 self.focus_pending = true;
                 return;
             }
-            let index = self.cursor.unwrap_or(0) as i32;
-            if let Some(row) = widgets
-                .list
-                .row_at_index(index)
-                .or_else(|| widgets.list.row_at_index(0))
-            {
-                row.grab_focus();
-            } else if !widgets.list.grab_focus() {
-                widgets.scrolled.grab_focus();
-            }
+            focus_row(self, widgets);
             return;
         }
+        // `SyncPreviews` is the idle turn that attaches previews after layout;
+        // it must not schedule another one, or the loop would never idle.
+        let is_sync = matches!(message, TreeMsg::SyncPreviews);
         self.handle_message(message, sender.clone());
-        // A launch-time reveal asked for its row to be brought into view. Do it
-        // once the model was updated and before any early-return on the
-        // selection fast path, so it is never skipped.
-        if let Some(index) = self.scroll_to.take() {
-            scroll_row_into_view(widgets, index);
-        }
+        // Publish the state the row factory reads, before any widget pass can
+        // rebind a recycled row.
+        self.sync_mirror();
         // The model's expanded/loaded set changed; align the lazily-watched
         // set of directories with it (startup only ever watches the root, so
         // opening a tree is instant).
         self.reconcile_watches();
         if self.selection_dirty {
             // The selection/cursor moved but the rows themselves are unchanged:
-            // just restyle the affected rows instead of rebuilding every widget.
+            // just restyle the realised rows instead of republishing the model.
             self.selection_dirty = false;
-            if update_selection_classes(self, widgets) {
-                return;
+            // A reveal (launch `--select`) sets both the selection and a scroll
+            // target; honour the scroll before taking the fast path.
+            if let Some(index) = self.scroll_to.take() {
+                scroll_row_into_view(widgets, index);
             }
+            update_selection_classes(self);
+            return;
         }
         <Self as Component>::update_view(self, widgets, sender.clone());
-        rebuild(self, widgets, sender);
+        rebuild(self, widgets, sender.clone());
+        // Previews can only be attached once the rows have been laid out, so
+        // defer that to an idle turn. `send`, not `input`: the component can be
+        // shut down (a pane closed, the panel exiting) before the idle fires,
+        // and `input` panics on a dead runtime — inside the glib trampoline,
+        // which aborts the process.
+        if !is_sync {
+            let preview_sender = sender.clone();
+            glib::idle_add_local_once(move || {
+                let _ = preview_sender.input_sender().send(TreeMsg::SyncPreviews);
+            });
+        }
         // A focus request that arrived while the directory was still loading:
         // the first row now exists, so take the keyboard.
-        if self.focus_pending && widgets.list.row_at_index(0).is_some() {
+        if self.focus_pending {
             self.focus_pending = false;
-            let index = self.cursor.unwrap_or(0) as i32;
-            if let Some(row) = widgets
-                .list
-                .row_at_index(index)
-                .or_else(|| widgets.list.row_at_index(0))
-            {
-                row.grab_focus();
-            }
+            focus_row(self, widgets);
         }
     }
 }
@@ -1064,10 +1412,20 @@ impl Tree {
                     self.refresh_rows();
                 }
             }
-            TreeMsg::SetPanel(panel) => self.content_width = thumbnail_content_width(panel),
+            TreeMsg::SetPanel(panel) => {
+                let width = thumbnail_content_width(panel);
+                // Textures are decoded to the column width, so a resize makes
+                // them the wrong size: drop them and let the next render decode
+                // at the new width.
+                if width != self.content_width {
+                    self.thumb_cache.clear();
+                }
+                self.content_width = width;
+            }
             TreeMsg::SetSide(side) => self.side = side,
             TreeMsg::Suspend => self.suspend_media(),
             TreeMsg::Shutdown => self.shutdown(),
+            TreeMsg::SyncPreviews => self.sync_previews(&sender),
             TreeMsg::Noop => {}
 
             TreeMsg::MoveUp => self.cursor_delta(-1),
@@ -1095,6 +1453,10 @@ impl Tree {
                 if let Some(path) = self.cursor_path() {
                     self.renaming = Some(path);
                     self.renaming_state.set(true);
+                    self.rebind = true;
+                    // The entry is built by `bind_row`, which only runs for the
+                    // rows on screen: bring the row into view first.
+                    self.scroll_to = self.cursor;
                 }
             }
 
@@ -1226,6 +1588,8 @@ impl Tree {
                 self.select(&path);
                 self.renaming = Some(path);
                 self.renaming_state.set(true);
+                self.rebind = true;
+                self.scroll_to = self.cursor;
             }
             TreeMsg::Trash(path) => self.confirm_trash(vec![path], sender.clone()),
             TreeMsg::DeleteSelected => {
@@ -1451,14 +1815,15 @@ impl Tree {
             TreeMsg::RenameFocusLost(generation) => {
                 // Only the entry that is still current may commit; a leave from
                 // one a background rebuild replaced is stale.
-                if self.renaming.is_some() && generation == self.rename_gen {
+                if self.renaming.is_some() && generation == self.mirror.rename_gen.get() {
                     self.commit_rename(&sender);
                 }
             }
             TreeMsg::RenameCancel => {
                 self.renaming = None;
                 self.renaming_state.set(false);
-                self.rename_entry = None;
+                *self.mirror.rename_entry.borrow_mut() = None;
+                self.rebind = true;
             }
 
             TreeMsg::Copy => {
@@ -1700,65 +2065,147 @@ fn handle_key(
 // rendering
 // ---------------------------------------------------------------------------
 
-/// The rows are unchanged; only the selection/cursor moved. Restyle the
-/// existing `ListBoxRow`s in place (O(rows) class toggles, no widget
-/// construction). Returns `false` when the row set no longer matches the model
-/// (so the caller falls back to a full rebuild).
-fn update_selection_classes(tree: &mut Tree, widgets: &mut <Tree as Component>::Widgets) -> bool {
-    // If the row count drifted (a background change), rebuild instead.
-    let mut existing = 0;
-    let mut child = widgets.list.first_child();
-    while let Some(current) = child {
-        if current.is::<gtk::ListBoxRow>() {
-            existing += 1;
-        }
-        child = current.next_sibling();
-    }
-    if existing != tree.rows.len() {
-        return false;
-    }
-    for (index, row) in tree.rows.iter().enumerate() {
-        let Some(list_row) = widgets.list.row_at_index(index as i32) else {
-            return false;
-        };
-        let selected = tree.cursor == Some(index) || tree.selected.contains(&row.path);
+/// The rows are unchanged; only the selection/cursor moved. Restyle the rows
+/// that are on screen, in place, without republishing the model.
+fn update_selection_classes(tree: &Tree) {
+    let cursor_path = tree.cursor_path();
+    for (path, entry) in tree.mirror.realized.borrow().iter() {
+        let selected = cursor_path.as_deref() == Some(path.as_path())
+            || tree.selected.iter().any(|selected| selected == path);
         if selected {
-            list_row.add_css_class("tree-row-selected");
+            entry.container.add_css_class("tree-row-selected");
         } else {
-            list_row.remove_css_class("tree-row-selected");
+            entry.container.remove_css_class("tree-row-selected");
         }
     }
-    true
 }
 
-/// Scroll `widgets.scrolled` so row `index` is visible. Uses the row's
-/// allocation relative to the list and nudges the vertical adjustment only when
-/// the row lies outside the current viewport (so a visible reveal does not
-/// jerk the scroll position).
+/// Focus the tree's cursor row (falling back to the first row, then the list).
+/// `scroll_to` with `FOCUS` realises and focuses the item, which matters because
+/// a virtualised list may not have a widget for the cursor row yet.
+fn focus_row(tree: &Tree, widgets: &<Tree as Component>::Widgets) {
+    if tree.rows.is_empty() {
+        if !widgets.list.grab_focus() {
+            widgets.scrolled.grab_focus();
+        }
+        return;
+    }
+    let index = tree.cursor.unwrap_or(0).min(tree.rows.len() - 1);
+    widgets
+        .list
+        .scroll_to(index as u32, gtk::ListScrollFlags::FOCUS, None);
+}
+
+/// Scroll the list so row `index` is visible.
 fn scroll_row_into_view(widgets: &<Tree as Component>::Widgets, index: usize) {
-    let Some(row) = widgets.list.row_at_index(index as i32) else {
-        return;
-    };
-    // Suppose the row is allocated at `y` within the list; convert to the
-    // viewport and scroll only if it falls outside `[0, page_size)`.
-    let adj = widgets.scrolled.vadjustment();
-    let page = adj.page_size();
-    if page <= 0.0 {
-        return;
+    widgets
+        .list
+        .scroll_to(index as u32, gtk::ListScrollFlags::NONE, None);
+}
+
+/// Fill a recycled row `container` for `row` at `index`.
+///
+/// Called from the list factory's `bind`, once per row that scrolls into view,
+/// so it must set up everything the row needs and nothing it doesn't: the
+/// chrome (icon, label or rename entry), the selection/match styling, and any
+/// inline preview already built for the path.
+fn bind_row(
+    container: &gtk::Box,
+    row: &VisibleRow,
+    mirror: &RowMirror,
+    sender: &ComponentSender<Tree>,
+    renaming_state: &Rc<Cell<bool>>,
+) {
+    while let Some(child) = container.first_child() {
+        container.remove(&child);
     }
-    // Bounds of the row in the list's coordinate space, which is the space the
-    // scroll adjustment measures against.
-    let Some(bounds) = row.compute_bounds(&widgets.list) else {
-        return;
-    };
-    let y = bounds.y() as f64;
-    let height = bounds.height() as f64;
-    let top = adj.value();
-    if y < top {
-        adj.set_value(y);
-    } else if y + height > top + page {
-        adj.set_value((y + height - page).max(0.0));
+    container.remove_css_class("tree-row-selected");
+    container.remove_css_class("tree-row-match");
+
+    let row_indent = row.depth as i32 * 16 + 4;
+    let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    hbox.set_margin_start(row_indent);
+    hbox.set_hexpand(true);
+    container.append(&hbox);
+
+    let icon = gtk::Image::from_icon_name(icon_name(row));
+    icon.set_pixel_size(mirror.icon_size.get());
+    icon.set_valign(gtk::Align::Center);
+    hbox.append(&icon);
+
+    if mirror.renaming.borrow().as_ref() == Some(&row.path) {
+        // A fresh entry for the renaming row. The live instance is handed to the
+        // model so a later commit can read its text; the focus-leave is tagged
+        // with a generation so a leave from an entry a rebind already replaced
+        // is ignored instead of committing the wrong entry.
+        let entry = gtk::Entry::new();
+        entry.set_text(&row.name);
+        entry.set_hexpand(true);
+        entry.add_css_class("tree-rename-entry");
+        {
+            let s = sender.clone();
+            entry.connect_activate(move |_| s.input(TreeMsg::RenameCommit));
+        }
+        {
+            let generation = mirror.rename_gen.get().wrapping_add(1);
+            mirror.rename_gen.set(generation);
+            let focus = gtk::EventControllerFocus::new();
+            let s = sender.clone();
+            focus.connect_leave(move |_| s.input(TreeMsg::RenameFocusLost(generation)));
+            entry.add_controller(focus);
+        }
+        let esc = gtk::EventControllerKey::new();
+        let s = sender.clone();
+        esc.connect_key_pressed(move |_, key, _code, _state| {
+            if key == gdk::Key::Escape {
+                s.input(TreeMsg::RenameCancel);
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        entry.add_controller(esc);
+        hbox.append(&entry);
+        *mirror.rename_entry.borrow_mut() = Some(entry.clone());
+        renaming_state.set(true);
+        let select_end = rename_selection_end(&row.name, row.is_dir);
+        glib::idle_add_local_once(move || {
+            entry.grab_focus();
+            entry.select_region(0, select_end);
+        });
+    } else {
+        let label = gtk::Label::new(Some(&row.name));
+        label.set_xalign(0.0);
+        label.set_hexpand(true);
+        label.set_ellipsize(pango::EllipsizeMode::Middle);
+        label.set_tooltip_text(Some(&row.path.to_string_lossy()));
+        hbox.append(&label);
     }
+
+    let selected = mirror.cursor_path.borrow().as_deref() == Some(row.path.as_path())
+        || mirror
+            .selected
+            .borrow()
+            .iter()
+            .any(|path| path == &row.path);
+    if selected {
+        container.add_css_class("tree-row-selected");
+    }
+    if row.matches {
+        container.add_css_class("tree-row-match");
+    }
+
+    if let Some(preview) = mirror.previews.borrow().get(&row.path) {
+        container.append(preview);
+    }
+
+    mirror.realized.borrow_mut().insert(
+        row.path.clone(),
+        RealizedRow {
+            container: container.clone(),
+            row: row.clone(),
+        },
+    );
 }
 
 fn rebuild(
@@ -1766,309 +2213,65 @@ fn rebuild(
     widgets: &mut <Tree as Component>::Widgets,
     sender: ComponentSender<Tree>,
 ) {
-    let list = &widgets.list;
-
-    // The context-menu popover is parented to one of the rows below (see
-    // `build_menu`). `ListBox::remove_all` destroys every row unconditionally;
-    // if the popover were still attached to one, GTK would finalize a widget
-    // that still has a child, which corrupts widget state and reliably
-    // crashes the process a little later (surfaces as
-    // `gtk_accessible_get_accessible_role: assertion 'GTK_IS_ACCESSIBLE
-    // (self)' failed` and friends). Every rebuild — not just the ones
-    // triggered by opening a new menu or root — must detach it first.
-    if let Some(previous) = tree.popover.take() {
-        previous.unparent();
+    // Note: the context-menu popover is *not* detached here. It is parented to
+    // the scrolled window (see `open_menu`), not to a row, so a rebuild cannot
+    // destroy it out from under itself — and detaching on every pass closed the
+    // menu a frame after it opened, because a rebuild follows every message.
+    // `open_menu`/`open_menu_at` detach the previous popover before opening a
+    // new one; autohide closes it otherwise.
+    if tree.rows_dirty {
+        tree.rows_dirty = false;
+        tree.rebind = false;
+        // Republish the model. The view only (re)binds the rows on screen, so
+        // this allocates a lightweight object per entry but a widget for none of
+        // the rows that are off screen. Emptying the model clamps the scroll
+        // adjustment to the top, so remember and restore the offset (unless a
+        // reveal asked for a specific row).
+        let reveal = tree.scroll_to.is_some();
+        let adjustment = tree.scrolled.vadjustment();
+        let keep = adjustment.value();
+        tree.store.remove_all();
+        for row in &tree.rows {
+            tree.store.append(&glib::BoxedAnyObject::new(row.clone()));
+        }
+        if !reveal {
+            let adjustment = adjustment.clone();
+            glib::idle_add_local_once(move || adjustment.set_value(keep));
+        }
+    } else if tree.rebind {
+        tree.rebind = false;
+        // The row set is unchanged but a row's content changed (a rename entry
+        // shown or hidden): re-bind the rows on screen.
+        let realized: Vec<(PathBuf, gtk::Box)> = tree
+            .mirror
+            .realized
+            .borrow()
+            .iter()
+            .map(|(path, entry)| (path.clone(), entry.container.clone()))
+            .collect();
+        for (path, container) in realized {
+            if let Some(row) = tree.rows.iter().find(|row| row.path == path) {
+                bind_row(&container, row, &tree.mirror, &sender, &tree.renaming_state);
+            }
+        }
+    } else {
+        // The row set is unchanged (a selection or menu message): restyle the
+        // rows on screen instead of republishing the model.
+        update_selection_classes(tree);
     }
 
-    // Detach the list while it is rebuilt: with several thousand rows, each
-    // `append` into a list that is already inside a `ScrolledWindow` forces a
-    // re-measure, making the rebuild O(n²). Reattaching once at the end keeps
-    // insertion linear.
-    widgets.scrolled.set_child(None::<&gtk::Widget>);
-    list.remove_all();
-
-    if tree.tree.is_none() {
-        widgets.scrolled.set_child(Some(list));
-        return;
+    // A launch-time reveal: scroll its row into view once the model is current.
+    if let Some(index) = tree.scroll_to.take() {
+        scroll_row_into_view(widgets, index);
     }
 
-    // Swapping the rows out lets us mutate other `Tree` fields in the loop
-    // without a borrow conflict.
-    let rows = std::mem::take(&mut tree.rows);
-    let mut menu_row: Option<gtk::ListBoxRow> = None;
-    tree.rename_entry = None;
-    // The previous render's GIF pictures are about to be destroyed; drop them
-    // so the ticker can't paint into freed widgets (they're re-added below).
-    tree.gif_widgets.borrow_mut().clear();
-    // Likewise the previous render's audio players: `audio_tick` must never
-    // touch controls that this rebuild is about to free.
-    tree.audio_widgets.borrow_mut().clear();
-    // Stop media for rows that no longer render a preview, whatever the reason
-    // (collapsed, filtered out, preview turned off, view switched). A row that
-    // is still listed but whose thumbnail was closed must not keep its stream.
-    let visible: HashSet<PathBuf> = rows
-        .iter()
-        .filter(|row| tree.wants_preview(row))
-        .map(|row| row.path.clone())
-        .collect();
-    tree.retain_visible_media(&visible);
-
-    for (index, row) in rows.iter().enumerate() {
-        let list_row = gtk::ListBoxRow::new();
-        list_row.set_focusable(true);
-        list_row.set_can_focus(true);
-        list_row.add_css_class("tree-row");
-
-        let row_indent = row.depth as i32 * 16 + 4;
-        // A vertical container so an inline thumbnail can sit below the row.
-        let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
-        container.set_hexpand(true);
-        list_row.set_child(Some(&container));
-
-        let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-        hbox.set_margin_start(row_indent);
-        hbox.set_hexpand(true);
-        container.append(&hbox);
-
-        let icon = gtk::Image::from_icon_name(icon_name(row));
-        icon.set_pixel_size(tree.config.icon_size as i32);
-        icon.set_valign(gtk::Align::Center);
-        hbox.append(&icon);
-
-        if tree.renaming.as_ref() == Some(&row.path) {
-            // The entry is recreated on every rebuild (rows are rebuilt from
-            // scratch) and the live instance is handed back to the model so a
-            // later commit can read the text.
-            let entry = gtk::Entry::new();
-            entry.set_text(&row.name);
-            entry.set_hexpand(true);
-            entry.add_css_class("tree-rename-entry");
-            {
-                let s = sender.clone();
-                entry.connect_activate(move |_| s.input(TreeMsg::RenameCommit));
-            }
-            // Clicking anywhere outside the entry commits the name, matching
-            // the usual file-manager behaviour; Enter still works too. Escape
-            // (below) cancels and clears `renaming` first, so the focus-leave
-            // that follows is a no-op in `RenameCommit`. The leave is tagged
-            // with this entry's generation: a leave from an entry that a
-            // background rebuild (e.g. the watcher event caused by creating the
-            // file) has already replaced is ignored, so the rename is not
-            // closed prematurely.
-            {
-                tree.rename_gen = tree.rename_gen.wrapping_add(1);
-                let generation = tree.rename_gen;
-                let focus = gtk::EventControllerFocus::new();
-                let s = sender.clone();
-                focus.connect_leave(move |_| s.input(TreeMsg::RenameFocusLost(generation)));
-                entry.add_controller(focus);
-            }
-            let esc_controller = gtk::EventControllerKey::new();
-            let s = sender.clone();
-            esc_controller.connect_key_pressed(move |_, key, _code, _state| {
-                if key == gdk::Key::Escape {
-                    s.input(TreeMsg::RenameCancel);
-                    glib::Propagation::Stop
-                } else {
-                    glib::Propagation::Proceed
-                }
-            });
-            entry.add_controller(esc_controller);
-            hbox.append(&entry);
-            tree.rename_entry = Some(entry.clone());
-            // Rows are built while the list is detached from the scrolled
-            // window, so focusing the entry here — before it is realized —
-            // leaves its text unselected and the user cannot start typing.
-            // Grab focus and select the name once it is back in the tree.
-            let select_end = rename_selection_end(&row.name, row.is_dir);
-            glib::idle_add_local_once(move || {
-                entry.grab_focus();
-                entry.select_region(0, select_end);
-            });
-        } else {
-            let label = gtk::Label::new(Some(&row.name));
-            label.set_xalign(0.0);
-            label.set_hexpand(true);
-            label.set_ellipsize(pango::EllipsizeMode::Middle);
-            label.set_tooltip_text(Some(&row.path.to_string_lossy()));
-            hbox.append(&label);
-        }
-
-        if tree.cursor == Some(index) || tree.selected.contains(&row.path) {
-            list_row.add_css_class("tree-row-selected");
-        }
-
-        if row.matches {
-            list_row.add_css_class("tree-row-match");
-        }
-
-        if tree.menu_target.as_ref() == Some(&row.path) {
-            menu_row = Some(list_row.clone());
-        }
-
-        // Inline preview (a previewable file, or every one under a directory
-        // the user turned on). Sized to the column, never enlarged.
-        if tree.wants_preview(row) {
-            tree.append_preview(&row.path, row_indent, &container, &sender);
-        }
-
-        let path = row.path.clone();
-        let release_path = row.path.clone();
-        let is_dir = row.is_dir;
-        let click = gtk::GestureClick::new();
-        // `GtkGestureSingle::button` defaults to 1 (primary only); without
-        // this, right-clicks never reach `connect_pressed` at all and the
-        // context menu is unreachable.
-        click.set_button(0);
-        let s = sender.clone();
-        let focus_row = list_row.clone();
-        click.connect_pressed(move |gesture, _n_press, x, y| {
-            // Clicks on an inline player's controls, or on the selectable text
-            // preview, belong to that widget. Handling them here would select
-            // the row and rebuild it, destroying the widget before its click
-            // completes — so skip any click that lands inside one.
-            if let Some(widget) = focus_row.pick(x, y, gtk::PickFlags::DEFAULT)
-                && in_inline_media(&widget)
-            {
-                // A click on the selectable text preview must keep focus on the
-                // text view. The list box moves focus back to the tree once the
-                // event settles, so restore it on the next idle (after that has
-                // happened). Media controls do not need focus.
-                if let Some(view) = inline_text_view(&widget) {
-                    glib::idle_add_local_once(move || {
-                        view.grab_focus();
-                    });
-                }
-                return;
-            }
-            // Nothing else claims keyboard focus for us: without this, a
-            // click on a row that follows focus being anywhere else (the
-            // filter entry, another app entirely) leaves every keyboard
-            // shortcut firing into whatever was focused before, not the tree.
-            focus_row.grab_focus();
-            let button = gesture.current_button();
-            let state = gesture.current_event_state();
-            if button == 3 {
-                // Super+right is the panel-resize drag: release the sequence so
-                // the window's drag gesture can claim it instead of opening the
-                // row menu.
-                if state.contains(gdk::ModifierType::SUPER_MASK) {
-                    gesture.set_state(gtk::EventSequenceState::Denied);
-                    return;
-                }
-                s.input(TreeMsg::Menu(path.clone()));
-                return;
-            }
-            if button != 1 {
-                return;
-            }
-            let ctrl = state.contains(gdk::ModifierType::CONTROL_MASK);
-            let shift = state.contains(gdk::ModifierType::SHIFT_MASK);
-            // Directories toggle on the first press, so the action must be
-            // immediate; a following second press is swallowed in the handler.
-            s.input(TreeMsg::RowPress {
-                path: path.clone(),
-                is_dir,
-                ctrl,
-                shift,
-            });
-        });
-        {
-            // A release with no drag finishes a press whose selection collapse
-            // was deferred (see `RowPress`), so a multi-selection click still
-            // collapses once we know no drag is in flight.
-            let s = sender.clone();
-            let release_row = list_row.clone();
-            click.connect_released(move |gesture, _n_press, x, y| {
-                if gesture.current_button() != 1 {
-                    return;
-                }
-                // A click on the selectable text preview keeps focus there; the
-                // list box moves focus back to the tree on release, so reclaim
-                // it once that has settled.
-                if let Some(widget) = release_row.pick(x, y, gtk::PickFlags::DEFAULT)
-                    && let Some(view) = inline_text_view(&widget)
-                {
-                    glib::idle_add_local_once(move || {
-                        view.grab_focus();
-                    });
-                    return;
-                }
-                s.input(TreeMsg::RowRelease {
-                    path: release_path.clone(),
-                });
-            });
-        }
-        list_row.add_controller(click);
-
-        // Drag-out is driven by a single motion controller on the scrolled
-        // window (installed in `init`), not by per-row controllers: a press
-        // rebuilds the rows, which would destroy any controller attached to the
-        // pressed row before the drag could start. See `begin_row_drag`.
-
-        // Drop target: only directories accept drops (files within the tree
-        // are moved/copied into whichever directory row they land on).
-        // Drop target: only directories accept drops (files within the tree
-        // are moved/copied into whichever directory row they land on).
-        if row.is_dir {
-            let drop = gtk::DropTarget::new(
-                gdk::FileList::static_type(),
-                gdk::DragAction::MOVE | gdk::DragAction::COPY,
-            );
-            let s = sender.clone();
-            let target_dir = row.path.clone();
-            let active = tree.drag_active.clone();
-            let landed = tree.drag_landed_internal.clone();
-            drop.connect_drop(move |target, value, _x, _y| {
-                let Ok(list) = value.get::<gdk::FileList>() else {
-                    return false;
-                };
-                let sources: Vec<PathBuf> =
-                    list.files().iter().filter_map(gio::File::path).collect();
-                if sources.is_empty() {
-                    return false;
-                }
-                let copy = target
-                    .current_event_state()
-                    .contains(gdk::ModifierType::CONTROL_MASK);
-                // An in-tree drag landing here is handled by `drop_into`; mark
-                // it so `drag-end` does not also act on the source.
-                if active.get() {
-                    landed.set(true);
-                }
-                s.input(TreeMsg::DropInto {
-                    target: target_dir.clone(),
-                    sources,
-                    copy,
-                });
-                true
-            });
-            list_row.add_controller(drop);
-        }
-
-        list.append(&list_row);
-    }
-
-    tree.rows = rows;
-    widgets.scrolled.set_child(Some(list));
-
-    // The context menu must anchor to a row that is actually attached, so it
-    // is built after the loop instead of inside the menu handler. The open
-    // directory has no row of its own, so that menu anchors at the click point.
-    if let Some(row) = menu_row {
-        let target = tree
-            .menu_target
-            .take()
-            .expect("menu_row set implies a target");
-        let selection = tree.selected.clone();
-        tree.popover = Some(build_menu(
-            &row, &target, &tree.menu, &selection, tree.side, &sender,
-        ));
-        tree.menu_point = None;
-    } else if let (Some(target), Some(at)) = (tree.menu_target.take(), tree.menu_point.take()) {
+    // The context menu is built after the model pass, anchored at the click
+    // point (or the right-clicked row's top edge) in scrolled coordinates.
+    if let Some(target) = tree.menu_target.take() {
+        let at = tree.menu_point.take().unwrap_or((0.0, 0.0));
         let selection = tree.selected.clone();
         tree.popover = Some(build_menu_at(
-            &widgets.scrolled,
+            &tree.scrolled,
             at,
             &target,
             &tree.menu,
@@ -2077,7 +2280,6 @@ fn rebuild(
             &sender,
         ));
     }
-    tree.menu_target = None;
     tree.menu_point = None;
 }
 
@@ -2238,7 +2440,14 @@ fn append_menu_items(
         label_widget.set_hexpand(true);
         button.set_child(Some(&label_widget));
         let s = sender.clone();
-        button.connect_clicked(move |_| s.input(msg.clone()));
+        button.connect_clicked(move |button| {
+            // Acting on an item dismisses the menu — including a submenu the
+            // item sits in. Autohide only covers clicks *outside* the popover,
+            // so a click on a button inside it would otherwise leave the menu
+            // open.
+            close_enclosing_popovers(button.upcast_ref());
+            s.input(msg.clone());
+        });
         row_box.append(&button);
 
         if let Some(shortcut) = action.shortcut()
@@ -2297,40 +2506,80 @@ fn build_submenu_popover(
     popover
 }
 
-/// Show `menu_box` in a popover parented to `anchor`, optionally pointing at
-/// `point` (in `anchor`'s coordinate space) rather than the anchor's edge.
+/// Show `menu_box` in a popover parented to `anchor`, pointing at `point` (in
+/// `anchor`'s coordinate space).
 fn show_menu(
     anchor: &impl IsA<gtk::Widget>,
     menu_box: &gtk::Box,
-    point: Option<(f64, f64)>,
+    point: (f64, f64),
 ) -> gtk::Popover {
     let popover = gtk::Popover::new();
     popover.add_css_class("tree-menu-popover");
     popover.set_child(Some(menu_box));
     popover.set_autohide(true);
     popover.set_parent(anchor);
-    if let Some((x, y)) = point {
-        popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
-    }
+    let (x, y) = point;
+    popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
     popover.popup();
     popover
 }
 
-/// Build a context-menu popover anchored to `row` for `path`.
-fn build_menu(
-    row: &gtk::ListBoxRow,
-    path: &Path,
-    menu: &ContextMenu,
-    selection: &[PathBuf],
-    side: PanelSide,
-    sender: &ComponentSender<Tree>,
-) -> gtk::Popover {
-    let menu_box = build_menu_box(path, menu, selection, side, sender);
-    show_menu(row, &menu_box, None)
+/// Pop down every popover `widget` is inside. A menu item can sit in a nested
+/// submenu, which is itself parented into the row menu, so walk the whole
+/// chain rather than just the nearest popover.
+fn close_enclosing_popovers(widget: &gtk::Widget) {
+    let mut current = widget.parent();
+    while let Some(widget) = current {
+        if let Some(popover) = widget.downcast_ref::<gtk::Popover>() {
+            popover.popdown();
+        }
+        current = widget.parent();
+    }
+}
+
+/// A one- or many-path subject for a confirmation message: `“name”` for a
+/// single path, `{n} items` for several.
+fn paths_subject(paths: &[PathBuf]) -> String {
+    match paths {
+        [single] => {
+            let name = single
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| single.display().to_string());
+            format!("\u{201c}{name}\u{201d}")
+        }
+        many => format!("{} items", many.len()),
+    }
+}
+
+/// Show a two-button confirmation dialog, running `on_confirm` when the second
+/// (non-cancel) button is chosen.
+fn confirm_dialog(
+    parent: &gtk::Window,
+    message: &str,
+    detail: &str,
+    confirm_label: &str,
+    on_confirm: impl FnOnce() + 'static,
+) {
+    let dialog = gtk::AlertDialog::builder()
+        .modal(true)
+        .message(message)
+        .detail(detail)
+        .buttons(["Cancel", confirm_label])
+        .cancel_button(0)
+        .default_button(1)
+        .build();
+    dialog.choose(Some(parent), None::<&gio::Cancellable>, move |res| {
+        if matches!(res, Ok(1)) {
+            on_confirm();
+        }
+    });
 }
 
 /// Build a context-menu popover for `path` anchored at the click point `at`
-/// within `anchor` (used for the open directory, which has no row of its own).
+/// within `anchor`. Used for every menu: rows are recycled widgets, so the
+/// popover is anchored to the (stable) scrolled window at the row's top edge
+/// rather than parented to a row that may be rebound.
 fn build_menu_at(
     anchor: &impl IsA<gtk::Widget>,
     at: (f64, f64),
@@ -2341,7 +2590,7 @@ fn build_menu_at(
     sender: &ComponentSender<Tree>,
 ) -> gtk::Popover {
     let menu_box = build_menu_box(path, menu, selection, side, sender);
-    show_menu(anchor, &menu_box, Some(at))
+    show_menu(anchor, &menu_box, at)
 }
 
 /// The [`TreeMsg`] a builtin context-menu action resolves to for `path`, given
@@ -2501,6 +2750,9 @@ fn icon_name(row: &VisibleRow) -> &'static str {
 /// alive and yields the frame for a given wall-clock time.
 struct GifAnim {
     iter: gdk::gdk_pixbuf::PixbufAnimationIter,
+    /// Longest-side cap for each frame, so a large GIF is not re-decoded to a
+    /// full-resolution texture on every tick.
+    target: i32,
 }
 
 /// The live controls of one inline audio player. `audio_tick` reads `player`
@@ -2538,54 +2790,48 @@ fn needs_selection(action: BuiltinAction) -> bool {
 /// Whether `widget` is, or is inside, a tree row. Used to tell a click on a row
 /// from a click on the blank space below the rows.
 fn in_list_row(widget: &gtk::Widget) -> bool {
-    let mut current = Some(widget.clone());
-    while let Some(widget) = current {
-        if widget.downcast_ref::<gtk::ListBoxRow>().is_some() {
-            return true;
-        }
-        current = widget.parent();
-    }
-    false
+    // A `GtkListItem` is not a widget, so there is no ancestor to test for;
+    // the row container carries the `tree-row` class instead.
+    ancestor_matching(widget, |widget| widget.has_css_class("tree-row")).is_some()
 }
 
 /// Whether `widget` is, or is inside, an inline media widget (a video or the
 /// audio player's controls), so the row leaves such clicks to that widget.
 fn in_inline_media(widget: &gtk::Widget) -> bool {
-    let mut current = Some(widget.clone());
-    while let Some(widget) = current {
-        if widget.downcast_ref::<gtk::Video>().is_some()
+    ancestor_matching(widget, |widget| {
+        widget.downcast_ref::<gtk::Video>().is_some()
             || widget.has_css_class("tree-audio")
             || widget.has_css_class("tree-preview-scroll")
             || widget.has_css_class("tree-preview-text")
-        {
-            return true;
-        }
-        current = widget.parent();
-    }
-    false
+    })
+    .is_some()
 }
 
 /// Whether `widget` is the inline text preview (or its scroller), which owns
 /// pointer drags for text selection rather than starting a file drag.
 fn in_text_preview(widget: &gtk::Widget) -> bool {
-    let mut current = Some(widget.clone());
-    while let Some(widget) = current {
-        if widget.has_css_class("tree-preview-text") || widget.has_css_class("tree-preview-scroll")
-        {
-            return true;
-        }
-        current = widget.parent();
-    }
-    false
+    ancestor_matching(widget, |widget| {
+        widget.has_css_class("tree-preview-text") || widget.has_css_class("tree-preview-scroll")
+    })
+    .is_some()
 }
 
 /// The inline text preview under `widget`, if the widget is one or a descendant
 /// of one.
 fn inline_text_view(widget: &gtk::Widget) -> Option<gtk::TextView> {
+    ancestor_matching(widget, |widget| widget.has_css_class("tree-preview-text"))
+        .and_then(|widget| widget.downcast::<gtk::TextView>().ok())
+}
+
+/// `widget` or the nearest ancestor for which `pred` holds.
+fn ancestor_matching(
+    widget: &gtk::Widget,
+    pred: impl Fn(&gtk::Widget) -> bool,
+) -> Option<gtk::Widget> {
     let mut current = Some(widget.clone());
     while let Some(widget) = current {
-        if widget.has_css_class("tree-preview-text") {
-            return widget.downcast::<gtk::TextView>().ok();
+        if pred(&widget) {
+            return Some(widget);
         }
         current = widget.parent();
     }
@@ -2596,6 +2842,13 @@ fn inline_text_view(widget: &gtk::Widget) -> Option<gtk::TextView> {
 /// the scrollbar and a little padding.
 fn thumbnail_content_width(panel: PanelConfig) -> i32 {
     (panel.width as i32 - 2 * panel.margin as i32 - 24).max(64)
+}
+
+/// The pixel width a row's inline preview may use: the column width minus the
+/// row's indent and its icon. Shared so a still frame and a playing GIF frame
+/// are decoded to the same cap.
+fn preview_available_width(row_indent: i32, icon_size: i32, content_width: i32) -> i32 {
+    content_width - (row_indent + icon_size + 6) - 6
 }
 
 /// Target (width, height) for a thumbnail: scaled to `available` width while
@@ -2609,6 +2862,41 @@ fn thumbnail_size(texture: &gdk::Texture, available: i32) -> (i32, i32) {
     }
     let height = (natural_h as i64 * available as i64 / natural_w as i64).max(1) as i32;
     (available, height)
+}
+
+/// How many decoded textures / parsed documents to keep before dropping the
+/// cache. Comfortably above what a viewport shows; the point is only to stop an
+/// unbounded session from growing forever.
+const PREVIEW_CACHE_CAP: usize = 256;
+/// Detected preview kinds are tiny, so they get a larger ceiling.
+const PREVIEW_KIND_CAP: usize = 8192;
+
+/// Downscale `pixbuf` so its longest side is at most `target`, preserving the
+/// aspect ratio. Returns it unchanged when it already fits, so a small image is
+/// never enlarged.
+fn downscale_pixbuf(pixbuf: gdk::gdk_pixbuf::Pixbuf, target: i32) -> gdk::gdk_pixbuf::Pixbuf {
+    let (w, h) = (pixbuf.width(), pixbuf.height());
+    let (nw, nh) = downscale_dims(w, h, target);
+    if (nw, nh) == (w, h) {
+        return pixbuf;
+    }
+    pixbuf
+        .scale_simple(nw, nh, gdk::gdk_pixbuf::InterpType::Bilinear)
+        .unwrap_or(pixbuf)
+}
+
+/// The size a `w`×`h` image shrinks to so its longest side is at most `target`,
+/// preserving the aspect ratio and never enlarging.
+fn downscale_dims(w: i32, h: i32, target: i32) -> (i32, i32) {
+    let target = target.max(1);
+    if w <= target && h <= target {
+        return (w, h);
+    }
+    let scale = (target as f64 / w as f64).min(target as f64 / h as f64);
+    (
+        (w as f64 * scale).round().max(1.0) as i32,
+        (h as f64 * scale).round().max(1.0) as i32,
+    )
 }
 
 /// A thumbnail `GtkPicture` sized to `width`/`height`, aligned under the row's
@@ -2931,7 +3219,7 @@ impl Tree {
         self.selected = Vec::new();
         self.renaming = None;
         self.renaming_state.set(false);
-        self.rename_entry = None;
+        *self.mirror.rename_entry.borrow_mut() = None;
         self.menu_target = None;
         self.thumbnails.clear();
         self.preview_kinds.clear();
@@ -2968,6 +3256,8 @@ impl Tree {
         } else {
             self.rows.clear();
         }
+        // The model changed: republish it to the view on the next widget pass.
+        self.rows_dirty = true;
     }
 
     /// Align the set of watched directories with the model's expanded+loaded
@@ -3079,11 +3369,12 @@ impl Tree {
     /// file. Shared by the immediate press path and the deferred
     /// [`TreeMsg::RowRelease`] path.
     fn press_default(&mut self, path: &Path, is_dir: bool, sender: &ComponentSender<Self>) {
-        // Record the press for double-click detection (files only — see below).
-        // It lives here because the click gesture is recreated with the rows.
+        // Record the press for double-click detection. It is recorded for every
+        // row but only *used* for files (directories toggle on every press), and
+        // it lives on the model because the row widgets are recycled.
         let now = std::time::Instant::now();
         let is_double = self.last_press.as_ref().is_some_and(|(last, at)| {
-            last == path && now.duration_since(*at) < Duration::from_millis(400)
+            last == path && now.duration_since(*at) < DOUBLE_CLICK_WINDOW
         });
         self.last_press = Some((path.to_path_buf(), now));
 
@@ -3287,6 +3578,85 @@ impl Tree {
         self.audio.retain(|path, _| visible.contains(path));
     }
 
+    /// Publish the pieces the row factory reads (cursor, selection, rename
+    /// state, icon size). Called before every widget pass, so a rebind that
+    /// happens at any scroll sees the current state.
+    fn sync_mirror(&self) {
+        *self.mirror.cursor_path.borrow_mut() = self.cursor_path();
+        *self.mirror.selected.borrow_mut() = self.selected.clone();
+        *self.mirror.renaming.borrow_mut() = self.renaming.clone();
+        self.mirror.icon_size.set(self.config.icon_size as i32);
+        if self.renaming.is_none() {
+            self.renaming_state.set(false);
+            *self.mirror.rename_entry.borrow_mut() = None;
+        }
+    }
+
+    /// Attach inline previews to the rows currently on screen, and drop the ones
+    /// that scrolled away (which also returns their media). Runs after layout —
+    /// from the idle turn scheduled by `update_with_view` and on every scroll —
+    /// because a virtualised list only has widgets for the visible rows.
+    fn sync_previews(&mut self, sender: &ComponentSender<Self>) {
+        let realized: Vec<(PathBuf, gtk::Box, VisibleRow)> = self
+            .mirror
+            .realized
+            .borrow()
+            .iter()
+            .map(|(path, entry)| (path.clone(), entry.container.clone(), entry.row.clone()))
+            .collect();
+        let mut wanted: HashSet<PathBuf> = HashSet::new();
+        for (path, container, row) in realized {
+            // The realised row is the one currently bound, so it is always part
+            // of the model; only the preview decision needs checking.
+            if !self.wants_preview(&row) {
+                self.detach_preview(&path);
+                continue;
+            }
+            wanted.insert(path.clone());
+            if let Some(preview) = self.mirror.previews.borrow().get(&path).cloned() {
+                if preview.parent().is_none() {
+                    container.append(&preview);
+                }
+                continue;
+            }
+            let row_indent = row.depth as i32 * 16 + 4;
+            let holder = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            self.append_preview(&path, row_indent, &holder, sender);
+            // A file with no inline preview (unsupported kind, unreadable) built
+            // nothing: do not cache an empty holder.
+            if holder.first_child().is_some() {
+                container.append(&holder);
+                self.mirror
+                    .previews
+                    .borrow_mut()
+                    .insert(path.clone(), holder.upcast());
+            }
+        }
+        let stale: Vec<PathBuf> = self
+            .mirror
+            .previews
+            .borrow()
+            .keys()
+            .filter(|path| !wanted.contains(*path))
+            .cloned()
+            .collect();
+        for path in stale {
+            self.detach_preview(&path);
+        }
+        self.retain_visible_media(&wanted);
+    }
+
+    /// Remove `path`'s inline preview (detaching it from its row if attached)
+    /// and forget it, which returns its media to the pipeline pool.
+    fn detach_preview(&mut self, path: &Path) {
+        if let Some(preview) = self.mirror.previews.borrow_mut().remove(path)
+            && let Some(parent) = preview.parent()
+            && let Ok(container) = parent.downcast::<gtk::Box>()
+        {
+            container.remove(&preview);
+        }
+    }
+
     /// Whether `row` should render an inline preview: a file that was turned on
     /// directly, or that sits under a directory that was. Whether the file is
     /// previewable at all is resolved later, from the detection cache.
@@ -3309,28 +3679,57 @@ impl Tree {
             return *kind;
         }
         let kind = preview::detect(path);
+        if self.preview_kinds.len() >= PREVIEW_KIND_CAP {
+            self.preview_kinds.clear();
+        }
         self.preview_kinds.insert(path.to_path_buf(), kind);
         kind
     }
 
     /// The still texture for `path` — an image, or a GIF's first frame —
-    /// decoded and cached on first use.
-    fn static_texture(&mut self, path: &Path, kind: PreviewKind) -> Option<gdk::Texture> {
+    /// decoded to `target` px and cached on first use.
+    ///
+    /// The decode is capped at the display size rather than the image's native
+    /// size: a 4000×3000 JPEG is ~35 MB as a full-resolution `GdkTexture`, and a
+    /// folder of them (every file under a directory with thumbnails turned on)
+    /// would balloon the panel. Scaling on load keeps each cached texture a few
+    /// hundred KB; only the transient decode is full-size.
+    fn static_texture(
+        &mut self,
+        path: &Path,
+        kind: PreviewKind,
+        target: i32,
+    ) -> Option<gdk::Texture> {
         if let Some(texture) = self.thumb_cache.get(path) {
             return Some(texture.clone());
         }
         let texture = match kind {
-            PreviewKind::Image => gdk::Texture::from_filename(path).ok()?,
+            PreviewKind::Image => {
+                let pixbuf = gdk::gdk_pixbuf::Pixbuf::from_file(path).ok()?;
+                gdk::Texture::for_pixbuf(&downscale_pixbuf(pixbuf, target))
+            }
             PreviewKind::Gif => {
                 let animation = gdk::gdk_pixbuf::PixbufAnimation::from_file(path).ok()?;
                 let pixbuf = animation.static_image()?;
-                gdk::Texture::for_pixbuf(&pixbuf)
+                gdk::Texture::for_pixbuf(&downscale_pixbuf(pixbuf, target))
             }
             // Everything else renders through its own widget, not a texture.
             _ => return None,
         };
-        self.thumb_cache.insert(path.to_path_buf(), texture.clone());
+        self.cache_texture(path, texture.clone());
         Some(texture)
+    }
+
+    /// Insert a decoded texture, keeping the cache bounded. The cap is far above
+    /// the handful of thumbnails a viewport shows at once; clearing at the limit
+    /// (rather than evicting one) is enough to stop a long browsing session from
+    /// growing without bound, and the widgets keep their own references, so
+    /// nothing on screen disappears.
+    fn cache_texture(&mut self, path: &Path, texture: gdk::Texture) {
+        if self.thumb_cache.len() >= PREVIEW_CACHE_CAP {
+            self.thumb_cache.clear();
+        }
+        self.thumb_cache.insert(path.to_path_buf(), texture);
     }
 
     /// The cached, looping media stream for a video thumbnail. It starts paused
@@ -3377,9 +3776,23 @@ impl Tree {
                 return;
             };
             let iter = animation.iter(Some(SystemTime::now()));
+            // Match the width the still frame is decoded to (`append_preview`),
+            // so the playing frames are not cached larger than the still.
+            let target = self
+                .rows
+                .iter()
+                .find(|row| row.path == path)
+                .map(|row| {
+                    preview_available_width(
+                        row.depth as i32 * 16 + 4,
+                        self.config.icon_size as i32,
+                        self.content_width,
+                    )
+                })
+                .unwrap_or_else(|| self.content_width.max(64));
             self.gif_anims
                 .borrow_mut()
-                .insert(path.to_path_buf(), GifAnim { iter });
+                .insert(path.to_path_buf(), GifAnim { iter, target });
             self.playing.insert(path.to_path_buf());
             self.ensure_gif_ticker();
         }
@@ -3406,7 +3819,7 @@ impl Tree {
             for (path, anim) in anims.iter_mut() {
                 let _ = anim.iter.advance(now);
                 if let Some(picture) = widgets.get(path) {
-                    let pixbuf = anim.iter.pixbuf();
+                    let pixbuf = downscale_pixbuf(anim.iter.pixbuf(), anim.target);
                     picture.set_paintable(Some(&gdk::Texture::for_pixbuf(&pixbuf)));
                 }
             }
@@ -3475,7 +3888,11 @@ impl Tree {
         };
         let label_start = row_indent + self.config.icon_size as i32 + 6;
         if kind.is_media() {
-            let available = self.content_width - label_start - 6;
+            let available = preview_available_width(
+                row_indent,
+                self.config.icon_size as i32,
+                self.content_width,
+            );
             self.append_media(path, kind, label_start, available, container, sender);
         } else {
             self.append_document(path, kind, label_start, container);
@@ -3494,7 +3911,7 @@ impl Tree {
     ) {
         match kind {
             PreviewKind::Image => {
-                if let Some(texture) = self.static_texture(path, kind) {
+                if let Some(texture) = self.static_texture(path, kind, available) {
                     let (width, height) = thumbnail_size(&texture, available);
                     container.append(&thumbnail_picture(&texture, label_start, width, height));
                 }
@@ -3503,12 +3920,11 @@ impl Tree {
                 // While playing, show the current frame; otherwise the first.
                 let playing = self.playing.contains(path);
                 let texture = if playing {
-                    self.gif_anims
-                        .borrow()
-                        .get(path)
-                        .map(|anim| gdk::Texture::for_pixbuf(&anim.iter.pixbuf()))
+                    self.gif_anims.borrow().get(path).map(|anim| {
+                        gdk::Texture::for_pixbuf(&downscale_pixbuf(anim.iter.pixbuf(), available))
+                    })
                 } else {
-                    self.static_texture(path, kind)
+                    self.static_texture(path, kind, available)
                 };
                 if let Some(texture) = texture {
                     let (width, height) = thumbnail_size(&texture, available);
@@ -3583,6 +3999,9 @@ impl Tree {
     ) {
         if !self.documents.contains_key(path) {
             let data = preview::load_document(path, kind);
+            if self.documents.len() >= PREVIEW_CACHE_CAP {
+                self.documents.clear();
+            }
             self.documents.insert(path.to_path_buf(), data);
         }
         let Some(Some(data)) = self.documents.get(path) else {
@@ -3624,55 +4043,25 @@ impl Tree {
     }
 
     fn confirm_trash(&mut self, paths: Vec<PathBuf>, sender: ComponentSender<Self>) {
-        let message = match paths.as_slice() {
-            [single] => {
-                let name = single
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| single.display().to_string());
-                format!("Move \u{201c}{name}\u{201d} to trash?")
-            }
-            many => format!("Move {} items to trash?", many.len()),
-        };
-        let dialog = gtk::AlertDialog::builder()
-            .modal(true)
-            .message(message)
-            .detail("The panel cannot restore trashed items.")
-            .buttons(["Cancel", "Trash"])
-            .cancel_button(0)
-            .default_button(1)
-            .build();
-        dialog.choose(Some(&self.parent), None::<&gio::Cancellable>, move |res| {
-            if matches!(res, Ok(1)) {
-                sender.input(TreeMsg::ConfirmTrash(paths));
-            }
-        });
+        let message = format!("Move {} to trash?", paths_subject(&paths));
+        confirm_dialog(
+            &self.parent,
+            &message,
+            "The panel cannot restore trashed items.",
+            "Trash",
+            move || sender.input(TreeMsg::ConfirmTrash(paths)),
+        );
     }
 
     fn confirm_permanent_delete(&mut self, paths: Vec<PathBuf>, sender: ComponentSender<Self>) {
-        let message = match paths.as_slice() {
-            [single] => {
-                let name = single
-                    .file_name()
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| single.display().to_string());
-                format!("Permanently delete \u{201c}{name}\u{201d}?")
-            }
-            many => format!("Permanently delete {} items?", many.len()),
-        };
-        let dialog = gtk::AlertDialog::builder()
-            .modal(true)
-            .message(message)
-            .detail("This cannot be undone. Files will not go to the trash.")
-            .buttons(["Cancel", "Delete Permanently"])
-            .cancel_button(0)
-            .default_button(1)
-            .build();
-        dialog.choose(Some(&self.parent), None::<&gio::Cancellable>, move |res| {
-            if matches!(res, Ok(1)) {
-                sender.input(TreeMsg::ConfirmPermanentDelete(paths));
-            }
-        });
+        let message = format!("Permanently delete {}?", paths_subject(&paths));
+        confirm_dialog(
+            &self.parent,
+            &message,
+            "This cannot be undone. Files will not go to the trash.",
+            "Delete Permanently",
+            move || sender.input(TreeMsg::ConfirmPermanentDelete(paths)),
+        );
     }
 
     fn open_menu(&mut self, path: &Path) {
@@ -3688,8 +4077,19 @@ impl Tree {
         if let Some(previous) = self.popover.take() {
             previous.unparent();
         }
+        // Anchor at the top of the clicked row, in scrolled coordinates. The row
+        // is on screen (the user just clicked it), so it is realised.
+        let at = self
+            .mirror
+            .realized
+            .borrow()
+            .get(path)
+            .map(|entry| entry.container.clone())
+            .and_then(|container| container.compute_bounds(&self.scrolled))
+            .map(|bounds| (bounds.x() as f64, bounds.y() as f64))
+            .unwrap_or((0.0, 0.0));
         self.menu_target = Some(path.to_path_buf());
-        self.menu_point = None;
+        self.menu_point = Some(at);
     }
 
     /// Open the context menu for `path` anchored at the click point `at` (in
@@ -3951,7 +4351,9 @@ impl Tree {
                 });
                 self.renaming = Some(new_path.clone());
                 self.renaming_state.set(true);
+                self.rebind = true;
                 self.select(&new_path);
+                self.scroll_to = self.cursor;
             }
             Err(err) => self.status(format!("Could not create: {err}"), sender),
         }
@@ -3962,7 +4364,9 @@ impl Tree {
     /// the Enter activation and a genuine focus-leave.
     fn commit_rename(&mut self, sender: &ComponentSender<Self>) {
         let text = self
+            .mirror
             .rename_entry
+            .borrow()
             .as_ref()
             .map(|e| e.text().to_string())
             .unwrap_or_default();
@@ -3970,7 +4374,10 @@ impl Tree {
             return;
         };
         self.renaming_state.set(false);
-        self.rename_entry = None;
+        *self.mirror.rename_entry.borrow_mut() = None;
+        // Rebind so the entry is replaced by the label even when the name is
+        // unchanged (the file op below also republishes the model when it runs).
+        self.rebind = true;
         let trimmed = text.trim().to_string();
         let unchanged = old
             .file_name()
@@ -4406,6 +4813,19 @@ fn spawn_command(cmd: &[String]) -> Result<(), std::io::Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn downscale_dims_caps_the_longest_side_without_enlarging() {
+        // Landscape and portrait both cap the longest side, keeping aspect.
+        assert_eq!(downscale_dims(4000, 3000, 300), (300, 225));
+        assert_eq!(downscale_dims(3000, 4000, 300), (225, 300));
+        // Already small enough: untouched (never enlarged).
+        assert_eq!(downscale_dims(100, 50, 300), (100, 50));
+        assert_eq!(downscale_dims(300, 300, 300), (300, 300));
+        // Degenerate targets still produce at least 1px.
+        assert_eq!(downscale_dims(4000, 4000, 1), (1, 1));
+        assert_eq!(downscale_dims(4000, 4000, 0), (1, 1));
+    }
 
     #[test]
     fn preview_menu_label_reflects_the_file_kind() {

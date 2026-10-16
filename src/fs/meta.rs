@@ -156,10 +156,6 @@ pub struct FileMeta {
     /// Resolved user/group names, or the numeric id when unresolvable.
     pub owner: String,
     pub group: String,
-    pub owner_name: Option<String>,
-    pub group_name: Option<String>,
-    pub nlink: u64,
-    pub inode: u64,
     pub mime_type: Option<String>,
     pub type_description: Option<String>,
     pub accessed: Option<SystemTime>,
@@ -168,11 +164,6 @@ pub struct FileMeta {
 }
 
 impl FileMeta {
-    /// The name shown in dialog titles and headers.
-    pub fn display_name(&self) -> String {
-        self.name.clone()
-    }
-
     /// The `stat` size, or — for a directory — the number of entries in it.
     /// Counting is best-effort; an unreadable directory yields `None`.
     pub fn item_count(&self) -> Option<u64> {
@@ -232,12 +223,8 @@ pub fn read_meta(path: &Path) -> io::Result<FileMeta> {
         permissions: Permissions::from_mode(mode),
         uid,
         gid,
-        owner: owner_name.clone().unwrap_or_else(|| uid.to_string()),
-        group: group_name.clone().unwrap_or_else(|| gid.to_string()),
-        owner_name,
-        group_name,
-        nlink: meta.nlink(),
-        inode: meta.ino(),
+        owner: owner_name.unwrap_or_else(|| uid.to_string()),
+        group: group_name.unwrap_or_else(|| gid.to_string()),
         mime_type,
         type_description,
         accessed: meta.accessed().ok(),

@@ -868,6 +868,25 @@ launched panel (or split) takes arrow keys, Enter, and hotkeys immediately,
 with no click needed. Focus follows body switches too: opening a bookmark hands
 the keyboard to the tree, and toggling back to bookmarks hands it to the list.
 
+## Performance
+
+The panel is built to stay light while resident. Three things in particular keep
+its memory down:
+
+- **Software rendering by default.** Unless `GSK_RENDERER` is already set in the
+  environment, the panel asks GTK for the cairo (CPU) renderer. On
+  NVIDIA/hybrid systems GTK otherwise picks the Vulkan renderer, which loads the
+  vendor Vulkan drivers plus `libLLVM` — tens of MB of resident memory for a UI
+  that is almost entirely text. To opt back into GPU rendering, set the env var
+  yourself (e.g. `GSK_RENDERER=gl ts`, or in your session environment).
+- **Thumbnails are decoded at display size**, not the image's native size, so a
+  folder of large photos does not cache full-resolution textures.
+- **The tree is virtualised.** A `GtkListView` builds widgets only for the rows
+  on screen, so a directory with tens of thousands of entries no longer spends
+  hundreds of MB on a widget tree per entry (a 20 000-entry directory went from
+  ~600 MB to ~100 MB resident). Sorting, filtering and lazy expansion are
+  unaffected.
+
 ## Building
 
 ```

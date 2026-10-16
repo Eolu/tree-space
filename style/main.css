@@ -346,10 +346,11 @@ popover.hamburger-popover > arrow {
 
 /* ── tree ─────────────────────────────────────────────────────────────────── */
 /* Make the scrolled window and its viewport/list adopt the panel background so
-   the theme's light-gray `@theme_bg_color` never shows through. */
+   the theme's light-gray `@theme_bg_color` never shows through. The tree is a
+   `GtkListView`, whose CSS node is `listview`. */
 .tree-scroll,
 .tree-scroll viewport,
-.tree-scroll list {
+.tree-scroll listview {
     background-color: @tn_bg;
 }
 
