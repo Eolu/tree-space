@@ -27,6 +27,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
     of MB on rows that were not even visible. A 20 000-entry directory went from
     ~600 MB to ~100 MB resident. Sorting, filtering and lazy expansion are
     unaffected.
+- `install.sh` installs the binaries with `cargo install` (into cargo's bin
+  directory) instead of copying them under the prefix. The copy it made sat
+  earlier on `PATH` than `~/.cargo/bin`, so it shadowed `cargo install` and went
+  stale — a panel launched from it kept older behaviour.
+
+### Fixed
+
+- The context menu dismisses when an item is chosen (it could be left open after
+  acting on it), and no longer flashes as it opens.
+- The panel no longer panics — aborting the process — when a pane was closed or
+  moved while a preview-sync callback was still queued.
+- The panel gives the keyboard back as soon as the pointer leaves it, including
+  when a context menu closes past the panel edge. The claim could previously
+  stick, so keys meant for the window you switched to kept going to the panel (a
+  `Super+V` paste helper, for example) until the panel was hidden and shown.
+- Pasting files copied in another app works when the clipboard offers only
+  `text/uri-list`: the panel detected that format but then read the clipboard as
+  `text/plain`, so it reported "Clipboard has no files to paste" even with files
+  on the clipboard. That message also clears itself after a few seconds instead
+  of lingering until the next folder change.
 
 ## [0.2.0] - 2026-10-06
 

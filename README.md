@@ -107,13 +107,15 @@ desktop entries and packaging). The system libraries below must be present.
 ```bash
 git clone https://github.com/Eolu/tree-space
 cd tree-space
-./install.sh              # build + install to ~/.local
+./install.sh              # install binaries + desktop integration
 ```
 
-`./install.sh` builds the release binary and installs it, the desktop entry,
-the icon and the folder/file MIME handler under `~/.local`. `./uninstall.sh`
-undoes it. Run `./install.sh --help` for the options (`--prefix DIR`,
-`--no-build`, `--no-desktop`); `--no-desktop` installs the binary only.
+`./install.sh` installs the binaries with `cargo install`, so they land in
+cargo's bin directory (`~/.cargo/bin`) — the same copy `cargo install tree-space`
+writes, so the two never diverge — and installs the desktop entry, the icon and
+the folder/file MIME handler under `~/.local`. `./uninstall.sh` undoes it. Run
+`./install.sh --help` for the options (`--prefix DIR`, `--no-build`,
+`--no-desktop`); `--no-desktop` installs the binaries only.
 
 ### Build dependencies
 

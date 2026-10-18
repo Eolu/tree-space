@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 #
-# Undo ./install.sh: remove the tree-space binaries, desktop entry, icon and
-# D-Bus service, and restore Nautilus as the folder/file handler if it is
-# installed.
+# Undo ./install.sh: uninstall the binaries (`cargo uninstall tree-space`) and
+# remove the desktop entry, icon and D-Bus service, restoring Nautilus as the
+# folder/file handler if it is installed.
 #
 # Usage:
 #   ./uninstall.sh [--prefix DIR] [--no-desktop]
@@ -29,7 +29,7 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         -h|--help)
-            sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -39,7 +39,13 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-echo "Removing binaries from ${prefix}/bin..."
+echo "Uninstalling the binaries..."
+if command -v cargo >/dev/null 2>&1; then
+    # Removes both `tree-space` and `ts`: cargo records both for the package.
+    cargo uninstall tree-space >/dev/null 2>&1 || true
+fi
+# Installs made before the binaries moved to cargo's bin directory left copies
+# under the prefix; remove those too.
 rm -f "${prefix}/bin/tree-space" "${prefix}/bin/ts"
 
 if [ "$desktop" -eq 1 ]; then

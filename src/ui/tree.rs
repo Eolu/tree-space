@@ -4746,20 +4746,53 @@ fn read_clipboard_files(done: impl FnOnce(Vec<PathBuf>, bool) + 'static) {
     };
     let clipboard = display.clipboard();
     let formats = clipboard.formats();
-    let has_uri = formats.contain_mime_type(URI_LIST_MIME);
-    let has_gnome = formats.contain_mime_type(GNOME_CLIP_MIME);
-    if !has_uri && !has_gnome {
+    // Prefer the GNOME format, which carries the copy/cut verb; fall back to
+    // the portable uri-list, which always means "copy".
+    let mime = if formats.contain_mime_type(GNOME_CLIP_MIME) {
+        GNOME_CLIP_MIME
+    } else if formats.contain_mime_type(URI_LIST_MIME) {
+        URI_LIST_MIME
+    } else {
         done(Vec::new(), false);
         return;
+    };
+    // Read the payload in the format just detected. `read_text_async` asks for
+    // `text/plain`, which a file-list clipboard need not offer — tree-space's
+    // own copy advertises only `text/uri-list` and
+    // `x-special/gnome-copied-files` — so that read could come back empty and
+    // the paste would report "no files to paste" even though files were there.
+    clipboard.read_async(
+        &[mime],
+        glib::Priority::DEFAULT,
+        gio::Cancellable::NONE,
+        move |result| {
+            let text = result
+                .ok()
+                .and_then(|(stream, _mime)| stream_to_string(&stream))
+                .unwrap_or_default();
+            let verb = clipboard_verb(&text);
+            done(
+                parse_clipboard_uris(&text, verb.is_some()),
+                verb == Some(true),
+            );
+        },
+    );
+}
+
+/// Drain a clipboard payload stream into a string. The payload is a short list
+/// of URIs (already in memory, or a small pipe), so reading it to the end on
+/// the main loop does not block meaningfully.
+fn stream_to_string(stream: &gio::InputStream) -> Option<String> {
+    let mut bytes = Vec::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        match stream.read(&mut buf, gio::Cancellable::NONE) {
+            Ok(0) => break,
+            Ok(n) => bytes.extend_from_slice(&buf[..n]),
+            Err(_) => return None,
+        }
     }
-    clipboard.read_text_async(gio::Cancellable::NONE, move |result| {
-        let text = result.ok().flatten().unwrap_or_default();
-        let verb = clipboard_verb(&text);
-        done(
-            parse_clipboard_uris(&text, verb.is_some()),
-            verb == Some(true),
-        );
-    });
+    String::from_utf8(bytes).ok()
 }
 
 /// The copy/cut verb on the first line of an `x-special/gnome-copied-files`
@@ -4942,6 +4975,19 @@ mod tests {
         // A plain uri-list has no verb.
         assert_eq!(clipboard_verb("file:///home/u/x\n"), None);
         assert_eq!(clipboard_verb(""), None);
+    }
+
+    #[test]
+    fn stream_to_string_drains_a_clipboard_payload() {
+        let bytes = glib::Bytes::from_static(b"file:///tmp/a.txt\r\nfile:///tmp/b.txt\r\n");
+        let stream = gio::MemoryInputStream::from_bytes(&bytes);
+        let text = stream_to_string(stream.upcast_ref()).unwrap_or_default();
+        assert_eq!(text, "file:///tmp/a.txt\r\nfile:///tmp/b.txt\r\n");
+        // And the payload decodes to the paths the paste would use.
+        assert_eq!(
+            parse_clipboard_uris(&text, false),
+            vec![PathBuf::from("/tmp/a.txt"), PathBuf::from("/tmp/b.txt")]
+        );
     }
 
     #[test]

@@ -415,6 +415,8 @@ pub enum AppMsg {
     OpenFolderPicked { id: u64, path: Option<PathBuf> },
     /// A new `tree-space` invocation was forwarded by the instance socket.
     LaunchRequest { command: Command },
+    /// Clear the status line, if it still shows the message with this serial.
+    ClearStatus(u64),
     /// Hyprland reported a new active workspace (from the IPC event stream).
     ActiveWorkspace(String),
     /// Split pane `id`'s dock, seeding the new pane from `id`'s root.
@@ -478,6 +480,9 @@ pub struct AppInit {
 pub struct App {
     config: Config,
     status: String,
+    /// Bumped whenever `status` is set, so a pending auto-clear only clears the
+    /// message it was scheduled for, not a newer one.
+    status_serial: u64,
     window: gtk::Window,
     file_dialog: gtk::FileDialog,
     /// All dock windows. Index 0 is the primary dock (the root window).
@@ -676,6 +681,7 @@ impl SimpleComponent for App {
         let mut model = App {
             config,
             status,
+            status_serial: 0,
             window: root.clone(),
             file_dialog: gtk::FileDialog::new(),
             docks: vec![Dock {
@@ -779,6 +785,11 @@ impl SimpleComponent for App {
 
     fn update(&mut self, msg: Self::Input, sender: ComponentSender<Self>) {
         match msg {
+            AppMsg::ClearStatus(serial) => {
+                if self.status_serial == serial {
+                    self.status.clear();
+                }
+            }
             AppMsg::PaneToolbar { id, out } => match out {
                 ToolbarOutput::OpenFolder => {
                     self.set_active(id);
@@ -806,7 +817,7 @@ impl SimpleComponent for App {
             AppMsg::PaneTree { id, out } => match out {
                 TreeOutput::Status(message) => {
                     self.set_active(id);
-                    self.status = message;
+                    self.set_status(message, &sender);
                 }
                 TreeOutput::OpenFolderRequested => {
                     self.set_active(id);
@@ -1076,6 +1087,19 @@ impl SimpleComponent for App {
 }
 
 impl App {
+    /// Show `message` in the status line, clearing it again after a few seconds
+    /// so a stale message (e.g. "Clipboard has no files to paste") cannot
+    /// linger and be mistaken for feedback on a later action.
+    fn set_status(&mut self, message: String, sender: &ComponentSender<Self>) {
+        self.status = message;
+        self.status_serial = self.status_serial.wrapping_add(1);
+        let serial = self.status_serial;
+        let sender = sender.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_secs(6), move || {
+            sender.input(AppMsg::ClearStatus(serial));
+        });
+    }
+
     /// Apply a forwarded launch request.
     fn handle_launch(&mut self, command: Command, sender: &ComponentSender<Self>) {
         // `--key`: run a configured shortcut against the active pane as if it
@@ -2962,40 +2986,63 @@ fn init_layer_window(
     window.set_margin(Edge::Left, margin);
     window.set_margin(Edge::Right, margin);
 
-    // Keyboard focus is `OnDemand`: the compositor grants it when the layer is
-    // mapped (so launching or showing the panel focuses it) and while the
-    // pointer moves over it, and the claim is released the moment the pointer
-    // leaves.
+    // Keyboard focus is `OnDemand`: the compositor hands the panel the keyboard
+    // while the pointer is over it, and the claim has to be dropped again the
+    // moment the pointer leaves.
     //
-    // Releasing on pointer-leave matters because a Hyprland layer surface that
-    // *keeps* keyboard focus does not update the compositor's notion of the
-    // focused window (`hyprctl activewindow` still reports the previous one).
-    // A click only triggers a refocus when the clicked window differs from that
-    // focused window (`CInputManager::processMouseDownNormal`:
-    // `focusState()->window() != w`), so a panel that holds the claim makes
-    // clicking the previously-focused window a no-op — keyboard focus never
-    // returns to it. Dropping the claim kicks the layer from the seat, so the
-    // next click refocuses the window normally.
-    window.set_keyboard_mode(KeyboardMode::OnDemand);
+    // Dropping it matters because a Hyprland layer surface that *keeps* keyboard
+    // focus does not update the compositor's notion of the focused window
+    // (`hyprctl activewindow` still reports the previous one). A click only
+    // triggers a refocus when the clicked window differs from that focused
+    // window (`CInputManager::processMouseDownNormal`: `focusState()->window()
+    // != w`), so a panel that holds the claim makes clicking the
+    // previously-focused window a no-op — keyboard focus never returns to it,
+    // and keys keep going to the panel instead (a Super+V paste helper that
+    // types into the focused surface lands on the panel, for example).
+    //
+    // Releasing it is subtle: a context menu is a *child surface*, so opening one
+    // delivers a pointer-leave for the panel even though the pointer is still on
+    // the menu — and menus extend past the panel edge, so when one closes with
+    // the pointer outside the panel no further leave ever arrives. A one-shot
+    // leave handler cannot cover that, so reconcile on a short timer: hold the
+    // claim only while the pointer is on the panel or a popover is open.
+    let pointer_inside = Rc::new(Cell::new(false));
+    let claimed = Rc::new(Cell::new(false));
+
     let motion = gtk::EventControllerMotion::new();
     {
         let kb_window = window.clone();
-        motion.connect_enter(move |_, _, _| kb_window.set_keyboard_mode(KeyboardMode::OnDemand));
-    }
-    {
-        let kb_window = window.clone();
-        motion.connect_leave(move |_| {
-            // A row/menu popover is a child surface, so opening it fires a
-            // pointer-leave for the panel even though the user has not left it.
-            // Keep the keyboard claim in that case; the compositor returns
-            // focus to the panel when the popover closes.
-            if has_visible_popover(kb_window.upcast_ref()) {
-                return;
+        let pointer_inside = pointer_inside.clone();
+        let claimed = claimed.clone();
+        motion.connect_enter(move |_, _, _| {
+            pointer_inside.set(true);
+            if !claimed.replace(true) {
+                kb_window.set_keyboard_mode(KeyboardMode::OnDemand);
             }
-            kb_window.set_keyboard_mode(KeyboardMode::None);
         });
     }
+    {
+        let pointer_inside = pointer_inside.clone();
+        motion.connect_leave(move |_| pointer_inside.set(false));
+    }
     window.add_controller(motion);
+
+    let weak = window.downgrade();
+    glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
+        let Some(kb_window) = weak.upgrade() else {
+            return glib::ControlFlow::Break;
+        };
+        let hold = pointer_inside.get() || has_visible_popover(kb_window.upcast_ref());
+        if hold != claimed.get() {
+            claimed.set(hold);
+            kb_window.set_keyboard_mode(if hold {
+                KeyboardMode::OnDemand
+            } else {
+                KeyboardMode::None
+            });
+        }
+        glib::ControlFlow::Continue
+    });
 }
 
 /// Fall back to a plain, decorated, freely-floating window when the compositor

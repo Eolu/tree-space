@@ -1,15 +1,22 @@
 #!/usr/bin/env bash
 #
-# Install tree-space into a user prefix (~/.local by default) and register it
-# with the desktop: application entry, icon, MIME handler for folders, and the
-# freedesktop FileManager1 D-Bus service. Run ./uninstall.sh to undo it.
+# Install tree-space for the current user.
+#
+# The binaries are installed with `cargo install`, so they live in cargo's bin
+# directory (~/.cargo/bin) — the same copy `cargo install tree-space` and a
+# later `cargo install --path .` write. Nothing installs a second copy, so
+# there is only ever one binary to keep current.
+#
+# The desktop integration (application entry, icon, folder/file MIME handler
+# and the freedesktop FileManager1 D-Bus service) is installed under a prefix,
+# ~/.local by default. Run ./uninstall.sh to undo it.
 #
 # Usage:
 #   ./install.sh [--prefix DIR] [--no-build] [--no-desktop]
 #
-#   --prefix DIR   install under DIR (default: ~/.local)
-#   --no-build     do not run `cargo build`; install the existing release binary
-#   --no-desktop   install the binary only; skip desktop/MIME/D-Bus integration
+#   --prefix DIR   install the desktop integration under DIR (default: ~/.local)
+#   --no-build     skip the binary install; do the desktop integration only
+#   --no-desktop   install the binaries only; skip desktop/MIME/D-Bus integration
 #
 # Environment:
 #   CARGO_FLAGS    extra flags for cargo (e.g. "--no-default-features" to drop
@@ -39,7 +46,7 @@ while [ $# -gt 0 ]; do
             shift
             ;;
         -h|--help)
-            sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'
+            sed -n '2,23p' "$0" | sed 's/^# \{0,1\}//'
             exit 0
             ;;
         *)
@@ -50,23 +57,18 @@ while [ $# -gt 0 ]; do
 done
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-bin_dir="${prefix}/bin"
+cargo_bin="${CARGO_HOME:-${HOME}/.cargo}/bin"
 
 if [ "$build" -eq 1 ]; then
-    echo "Building (cargo build --release --locked ${CARGO_FLAGS:-})..."
+    echo "Building and installing the binaries with cargo (into ${cargo_bin})..."
+    # `cargo install` is the single owner of the binaries: it puts `tree-space`
+    # and `ts` in cargo's bin directory, exactly where `cargo install tree-space`
+    # and later `cargo install --path .` put them. Installing a copy under the
+    # prefix instead would sit earlier on PATH (e.g. ~/.local/bin before
+    # ~/.cargo/bin) and go stale the moment the project was rebuilt.
     # shellcheck disable=SC2086
-    cargo build --release --locked ${CARGO_FLAGS:-} --manifest-path "${here}/Cargo.toml"
+    cargo install --path "${here}" --locked --force ${CARGO_FLAGS:-}
 fi
-
-src_bin="${here}/target/release/tree-space"
-if [ ! -x "$src_bin" ]; then
-    echo "error: ${src_bin} not found; run without --no-build" >&2
-    exit 1
-fi
-
-echo "Installing binaries to ${bin_dir}..."
-install -Dm755 "$src_bin" "${bin_dir}/tree-space"
-install -Dm755 "${here}/target/release/ts" "${bin_dir}/ts"
 
 if [ "$desktop" -eq 1 ]; then
     app_dir="${prefix}/share/applications"
@@ -101,12 +103,12 @@ Installed.
 EOF
 
 case ":${PATH}:" in
-    *":${bin_dir}:"*) ;;
+    *":${cargo_bin}:"*) ;;
     *)
         cat <<EOF
 
-Note: ${bin_dir} is not on your PATH. Add it, e.g.:
-    echo 'export PATH="${bin_dir}:\$PATH"' >> ~/.bashrc
+Note: ${cargo_bin} is not on your PATH. Add it, e.g.:
+    echo 'export PATH="${cargo_bin}:\$PATH"' >> ~/.bashrc
 EOF
         ;;
 esac
