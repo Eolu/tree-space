@@ -883,9 +883,9 @@ impl Component for Tree {
                 list_item.set_activatable(false);
                 list_item.set_selectable(false);
 
-                // Drop target: a directory row takes the drop itself; a file
-                // row forwards to the tree root, matching the old behaviour
-                // where file rows had no target of their own.
+                // Drop target: only a directory row is a destination. A file
+                // row rejects in-tree drags (see the handler) so a drop cannot
+                // silently relocate rows to the tree root.
                 let drop = gtk::DropTarget::new(
                     gdk::FileList::static_type(),
                     gdk::DragAction::MOVE | gdk::DragAction::COPY,
@@ -921,10 +921,22 @@ impl Component for Tree {
                                     sources,
                                     copy,
                                 });
+                                true
                             }
-                            _ => sender.input(TreeMsg::DropIntoRoot { sources, copy }),
+                            // A file row is not a destination. An in-tree drag
+                            // does nothing here instead of falling back to the
+                            // tree root: dropping rows onto the listing of their
+                            // own directory (or onto any file) used to move them
+                            // to the root, which is how a click that drifted into
+                            // a drag relocated files.
+                            _ if drag_active.get() => false,
+                            // Files dragged in from another application still
+                            // land in the open directory.
+                            _ => {
+                                sender.input(TreeMsg::DropIntoRoot { sources, copy });
+                                true
+                            }
                         }
-                        true
                     });
                 }
                 container.add_controller(drop);
@@ -1093,22 +1105,29 @@ impl Component for Tree {
                 });
         }
 
-        // Drops that land on empty space below the rows (or bubble up from a
-        // non-directory row, which has no drop target of its own) resolve to
-        // the tree's current root. Attached once here — unlike the per-row
-        // drop targets rebuilt with their rows, `list` itself persists across
-        // rebuilds, so adding this in `rebuild` would pile up duplicates.
+        // Drops that land on empty space below the rows resolve to the tree's
+        // current root — the natural target for files dragged in from another
+        // application. An in-tree drag does *not*: moving rows to the root by
+        // dropping them on the blank space (or on a file row, which has no drop
+        // target of its own) is exactly the accidental relocation this avoids;
+        // only folder rows accept in-tree drops. Attached once here — unlike the
+        // per-row drop targets rebuilt with their rows, `list` itself persists
+        // across rebuilds, so adding this in `rebuild` would pile up duplicates.
         let root_drop = gtk::DropTarget::new(
             gdk::FileList::static_type(),
             gdk::DragAction::MOVE | gdk::DragAction::COPY,
         );
         let root_drop_sender = sender.clone();
+        let root_drop_drag = drag_active.clone();
         root_drop.connect_drop(move |target, value, _x, _y| {
             let Ok(list) = value.get::<gdk::FileList>() else {
                 return false;
             };
             let sources: Vec<PathBuf> = list.files().iter().filter_map(gio::File::path).collect();
             if sources.is_empty() {
+                return false;
+            }
+            if root_drop_drag.get() {
                 return false;
             }
             let copy = target

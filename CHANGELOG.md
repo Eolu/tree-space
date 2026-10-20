@@ -47,6 +47,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `text/plain`, so it reported "Clipboard has no files to paste" even with files
   on the clipboard. That message also clears itself after a few seconds instead
   of lingering until the next folder change.
+- An in-tree drag only relocates rows onto a **folder** row. Dropping them on a
+  file row, or on the blank space below the list, no longer falls back to the
+  tree root — which silently moved files out of their directory when a click
+  drifted into a drag. Files dragged in from another application still land in
+  the open folder.
 
 ## [0.2.0] - 2026-10-06
 
