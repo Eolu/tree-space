@@ -643,6 +643,28 @@ fn item_row(list_item: &gtk::ListItem) -> Option<VisibleRow> {
     Some(boxed.borrow::<VisibleRow>().clone())
 }
 
+/// Where the cursor should point after `rows` was refreshed.
+///
+/// The cursor is stored as an index, but the row set changes outside the
+/// selection machinery too: a watcher event inserts or removes a row above it,
+/// collapsing a directory drops the rows under it, a sort change reorders
+/// everything, a filter hides rows. Keep the cursor on the path it named; when
+/// that row is gone, stay at the same place on screen rather than dropping the
+/// cursor or jumping to the top.
+fn reanchored_cursor(
+    rows: &[VisibleRow],
+    cursor_path: Option<&Path>,
+    cursor_index: Option<usize>,
+) -> Option<usize> {
+    if rows.is_empty() {
+        return None;
+    }
+    if let Some(index) = cursor_path.and_then(|path| rows.iter().position(|row| row.path == path)) {
+        return Some(index);
+    }
+    cursor_index.map(|index| index.min(rows.len() - 1))
+}
+
 /// Rendered state of the tree component.
 pub struct Tree {
     tree: Option<TreeModel>,
@@ -3270,11 +3292,23 @@ impl Tree {
     }
 
     fn refresh_rows(&mut self) {
+        // `cursor` is an index into `rows`, but the row set also changes from
+        // outside the selection machinery: a watcher event inserts or removes a
+        // row above the cursor, collapsing a directory drops the rows under it,
+        // a sort change reorders everything, a filter hides rows. Re-anchor the
+        // cursor to the path it named, so it keeps pointing at the row the user
+        // selected instead of silently drifting onto a neighbour. A drifting
+        // cursor made shortcuts act on a different row than the highlighted one
+        // — `Ctrl+t` toggled thumbnails for some other directory while the
+        // highlight stayed put.
+        let cursor_path = self.cursor_path();
+        let cursor_index = self.cursor;
         if let Some(tree) = self.tree.as_ref() {
             tree.visible_rows_into(&mut self.rows);
         } else {
             self.rows.clear();
         }
+        self.cursor = reanchored_cursor(&self.rows, cursor_path.as_deref(), cursor_index);
         // The model changed: republish it to the view on the next widget pass.
         self.rows_dirty = true;
     }
@@ -4957,6 +4991,48 @@ mod tests {
             has_children: false,
             matches: false,
         }
+    }
+
+    #[test]
+    fn cursor_follows_its_row_when_the_row_set_changes() {
+        // A watcher event inserts a row above the cursor (the case that made
+        // `Ctrl+t` toggle thumbnails for the wrong directory): the index moves,
+        // the path must not.
+        let before = [row("/r/big"), row("/r/other")];
+        assert_eq!(before[0].path, PathBuf::from("/r/big"));
+        let after = vec![row("/r/000"), row("/r/big"), row("/r/other")];
+        let cursor = reanchored_cursor(&after, Some(Path::new("/r/big")), Some(0));
+        assert_eq!(cursor, Some(1));
+        assert_eq!(after[cursor.unwrap()].path, PathBuf::from("/r/big"));
+
+        // Re-sorting keeps it on the same directory too.
+        let sorted = vec![row("/r/000"), row("/r/other"), row("/r/big")];
+        assert_eq!(
+            reanchored_cursor(&sorted, Some(Path::new("/r/big")), Some(1)),
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn cursor_stays_in_place_when_its_row_disappears() {
+        // The cursor row was removed (deleted, collapsed away): stay at the
+        // same index — the row that took its place — instead of jumping to the
+        // top or dropping the cursor.
+        let after = vec![row("/r/a"), row("/r/b"), row("/r/c")];
+        assert_eq!(
+            reanchored_cursor(&after, Some(Path::new("/r/gone")), Some(1)),
+            Some(1)
+        );
+        // Past the end of a shorter list: clamp to the last row.
+        let short = vec![row("/r/a")];
+        assert_eq!(reanchored_cursor(&short, None, Some(7)), Some(0));
+        // Nothing selected stays nothing selected.
+        assert_eq!(reanchored_cursor(&after, None, None), None);
+        // An empty list has no cursor at all.
+        assert_eq!(
+            reanchored_cursor(&[], Some(Path::new("/r/a")), Some(0)),
+            None
+        );
     }
 
     #[test]

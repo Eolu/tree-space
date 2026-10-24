@@ -38,6 +38,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   acting on it), and no longer flashes as it opens.
 - The panel no longer panics — aborting the process — when a pane was closed or
   moved while a preview-sync callback was still queued.
+- The keyboard cursor stays on the row it names when the row set changes under
+  it (a filesystem-watcher event inserting or removing a row above it, a sort
+  change, a filter, a directory collapsing). It is an index into the visible
+  rows, so it used to drift onto a neighbour while the highlight — kept by path
+  — stayed put, which made shortcuts act on the wrong row: `Ctrl+t` on a
+  highlighted directory could toggle thumbnails for a different directory (or
+  for a file), so its own previews never appeared. The context menu was
+  unaffected because it targets the clicked row explicitly.
 - The panel gives the keyboard back as soon as the pointer leaves it, including
   when a context menu closes past the panel edge. The claim could previously
   stick, so keys meant for the window you switched to kept going to the panel (a
