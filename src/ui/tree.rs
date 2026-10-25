@@ -2057,14 +2057,26 @@ fn resolve_key(key: gdk::Key, state: gdk::ModifierType, keys: &[KeyBinding]) -> 
     // Everything else comes from the configured accelerators
     // (cut/copy/paste/rename/delete/new tab/...), fired against the row under
     // the keyboard cursor.
-    keys.iter()
-        .find(|binding| {
-            key.to_lower() == binding.key.to_lower()
-                && accel_mods(state) == accel_mods(binding.mods)
-        })
-        .map(|binding| TreeMsg::RunShortcut {
+    if let Some(binding) = keys.iter().find(|binding| {
+        key.to_lower() == binding.key.to_lower() && accel_mods(state) == accel_mods(binding.mods)
+    }) {
+        return Some(TreeMsg::RunShortcut {
             target: binding.target.clone(),
-        })
+        });
+    }
+
+    // A pane action added after a config was written has no menu entry to carry
+    // its shortcut, so the newest one keeps a built-in fallback. A configured
+    // binding above always wins, so it stays rebindable.
+    if key.to_lower() == Key::f
+        && accel_mods(state)
+            == accel_mods(gdk::ModifierType::CONTROL_MASK | gdk::ModifierType::SHIFT_MASK)
+    {
+        return Some(TreeMsg::RunShortcut {
+            target: ShortcutTarget::Builtin(crate::config::BuiltinAction::TogglePanelMode),
+        });
+    }
+    None
 }
 
 fn handle_key(
@@ -2693,6 +2705,7 @@ fn builtin_message(action: BuiltinAction, path: &Path) -> TreeMsg {
         | BuiltinAction::Back
         | BuiltinAction::Forward
         | BuiltinAction::Collapse
+        | BuiltinAction::TogglePanelMode
         | BuiltinAction::ClosePane
         | BuiltinAction::ToggleBookmarks
         | BuiltinAction::MoveToPreviousWorkspace

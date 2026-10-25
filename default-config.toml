@@ -16,6 +16,9 @@ startup = "bookmarks"
 [panel]
 side = "left"        # screen edge to dock to: "left" | "right"
 layer = "bottom"     # stacking layer: "background" | "bottom" | "top" | "overlay"
+mode = "docked"      # "docked" to the screen edge, or "window" as a normal window.
+                     # Toggle either way at runtime with Ctrl+Shift+f (or the
+                     # "Toggle Window Mode" pane-menu action).
 width = 300          # panel width in px (clamped to 160–2000)
 margin = 0           # gap from the screen edge in px (clamped to 0–200)
 nav_toolbar = false  # show a nav toolbar (up, back, forward) below the path bar
@@ -256,6 +259,8 @@ items = [
     { action = "Move to Workspace", workspace = "2", shortcut = "Ctrl+Alt+2", hidden = true },
 
     "---",
+    # Dock the panel to the screen edge, or leave it as an ordinary window.
+    { action = "Toggle Window Mode", shortcut = "Ctrl+Shift+f" },
     "Collapse",
     { action = "Bookmarks", shortcut = "Ctrl+b" },
     { action = "Close Pane", shortcut = "Ctrl+w" },

@@ -181,6 +181,7 @@ are clamped.
 [panel]
 side = "left"      # which edge to dock to: "left" | "right"
 layer = "bottom"   # stacking layer: "background" | "bottom" | "top" | "overlay"
+mode = "docked"    # "docked" to the edge, or "window" as an ordinary window
 width = 300        # width in px
 margin = 0         # gap from the screen edge in px
 nav_toolbar = false # show a nav toolbar (up, back, forward) below the path bar
@@ -203,6 +204,37 @@ back, forward) directly below the path bar. They mirror the corresponding
 `[pane_menu]` actions, and each button's enabled state follows the pane (Up
 only when there is a parent directory and the tree is showing; Back/Forward
 only when history exists that way). It is off by default.
+
+### Docked or a window
+
+A panel is either docked to a screen edge or an ordinary window. `[panel]
+mode` picks how it starts (`"docked"` by default); `Ctrl+Shift+f` — the
+`"Toggle Window Mode"` pane action, rebindable in `[pane_menu]` — toggles the
+focused panel at any time. An undocked panel keeps its panes and docks again
+the same way. On a compositor without `wlr-layer-shell` both spell a normal
+window, and toggling reports that docking is unavailable.
+
+A pane can also be dragged to its home by the grip at the left of its path bar:
+
+- release over the outer band of a screen edge to dock it to that edge (the
+  target panel is outlined);
+- release over the middle of the screen to undock it into its own window;
+- release over the edge it already lives on to leave it alone;
+- release outside every screen to cancel.
+
+A small label follows the pointer and names the outcome — `Dock left panel`,
+`Undock`, `No change`, or `Cancel` — in its own colour. A drag can only *start*
+from a docked panel: Wayland does not tell a client where its window is, so an
+undocked panel is re-docked with the toggle rather than by dragging it back.
+
+> On Hyprland an ordinary window is tiled like any other. To keep an undocked
+> panel floating at a sensible size, add a window rule for its class (`ts`;
+> check with `hyprctl clients`):
+>
+> ```conf
+> windowrule = float, class:^(ts)$
+> windowrule = size 340 720, class:^(ts)$
+> ```
 
 Three things are worth calling out:
 
@@ -395,6 +427,7 @@ different menu; the first binding for a key wins.
 | Reverse Sort Order | `Ctrl+Shift+r` |
 | Back / Forward / Up One Level (pane) | `Alt+Left` / `Alt+Right` / `Alt+Up` |
 | Bookmarks (pane) | `Ctrl+b` |
+| Toggle Window Mode (pane) | `Ctrl+Shift+f` |
 | Close Pane (pane) | `Ctrl+w` |
 
 A plain-string built-in uses its default shortcut; the table form
@@ -422,6 +455,7 @@ The plain-string spelling is also the menu label.
 - `"Edit Bookmark"` / `"Delete Bookmark"` — bookmark-only: rename/re-point or remove the entry from a bookmark's menu. See [Bookmark menus](#bookmark-menus).
 - `"New Bookmark"` / `"New Bookmark Folder"` — bookmarks view: create a bookmark or an (empty) folder from the hamburger or the blank-area menu.
 - `"Bookmarks"` — pane-level: show the [bookmarks](#bookmarks) view in this pane. See [Bookmarks](#bookmarks).
+- `"Toggle Window Mode"` — pane-level: dock this panel to its screen edge, or leave it as an ordinary window. See [Docked or a window](#docked-or-a-window).
 - `"Move to Trash"` / `"Delete Permanently"`.
 
 The panel/split actions (`"In new panel"`, `"In opposite panel"`, `"Open in Split

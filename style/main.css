@@ -136,9 +136,43 @@
     outline-offset: -1px;
 }
 
+/* The pane would undock into its own window if the drag ended here. */
+.pane-undocking {
+    outline: 2px solid @tn_red;
+    outline-offset: -2px;
+}
+
 .pane-drop-target {
     outline: 2px solid @tn_blue;
     outline-offset: -2px;
+}
+
+/* ── pane-drag badge ─────────────────────────────────────────────────────── */
+/* The label that follows the pointer during a pane move, naming the outcome. */
+.drag-badge {
+    background-color: alpha(@tn_bg, 0.94);
+    color: @tn_fg_bright;
+    border: 1px solid @tn_blue;
+    border-radius: 6px;
+    padding: 4px 10px;
+    font-size: 12px;
+}
+
+/* Docking to a side, undocking into a window, and doing nothing each get their
+   own colour, so the outcome is readable without the status line. */
+.drag-badge-dock {
+    border-color: @tn_blue;
+    color: @tn_blue;
+}
+
+.drag-badge-undock {
+    border-color: @tn_red;
+    color: @tn_red;
+}
+
+.drag-badge-none {
+    border-color: @tn_muted;
+    color: @tn_fg_dim;
 }
 
 /* ── status bar ───────────────────────────────────────────────────────────── */

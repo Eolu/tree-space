@@ -6,6 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Panels can be undocked into ordinary windows. `[panel] mode = "window"` starts
+  that way (the default stays `"docked"`), and `Ctrl+Shift+f` — the
+  `"Toggle Window Mode"` pane action, rebindable in `[pane_menu]` — toggles the
+  focused panel at any time. An undocked panel keeps its panes and docks again
+  the same way.
+- Dragging a pane by its toolbar grip chooses where it lands: an outer band of a
+  screen edge docks it there, the middle of the screen undocks it into its own
+  window, and its current edge leaves it alone. A label follows the pointer and
+  names the outcome ("Dock left panel", "Undock", "No change", "Cancel"), the
+  target panel is outlined, and the dragged pane is outlined when it would
+  float.
+
 ### Changed
 
 - Memory use is substantially lower:

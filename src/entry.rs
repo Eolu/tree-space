@@ -141,7 +141,10 @@ pub fn run() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let app = RelmApp::from_app(app)
-        .visible_on_activate(!command.hidden)
+        // The panel shows its own windows (one per dock) once the component is
+        // built: the relm4 root window is either the primary dock or, in window
+        // mode, a parked shell that must never be presented.
+        .visible_on_activate(false)
         .with_args(vec!["ts".to_owned()]);
     app.run::<App>(AppInit { command, listener });
 

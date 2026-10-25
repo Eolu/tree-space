@@ -51,7 +51,7 @@ use relm4::prelude::*;
 use crate::cmd::{Command, WidthArg};
 use crate::config::{
     Bookmark, BuiltinAction, Config, ContextAction, PANEL_MAX_WIDTH, PANEL_MIN_WIDTH, PanelConfig,
-    PanelLayer, PanelSide, SessionState, ShortcutTarget, StartupRoot, WorkspaceMove,
+    PanelLayer, PanelMode, PanelSide, SessionState, ShortcutTarget, StartupRoot, WorkspaceMove,
     bookmark_file_path, load_stylesheet, save_bookmarks_to_path,
 };
 use crate::fs::SortKey;
@@ -262,6 +262,12 @@ impl Pane {
 /// share a side on another monitor when a pane is dragged there.
 struct Dock {
     side: PanelSide,
+    /// True when this panel is an ordinary window instead of an edge dock.
+    floating: bool,
+    /// The docked layer surface, parked while `floating` so the panel can return
+    /// to it. Only the primary dock (the relm4 root window) keeps one: every
+    /// other docked window is recreated on demand.
+    layer_window: Option<gtk::Window>,
     /// The monitor the surface landed on, resolved once it is mapped. `None`
     /// until then (and when the compositor exposes no monitor information).
     monitor: Option<gdk::Monitor>,
@@ -514,6 +520,13 @@ pub struct App {
     bookmarks: Vec<Bookmark>,
     /// The pane-move drag in flight, if any.
     pane_drag: Option<PaneDrag>,
+    /// A pane detached from its dock by a move, waiting to be attached to the
+    /// destination. Kept here so `detach_pane`/`attach_pane` can share the
+    /// bookkeeping without moving `Pane` through a message.
+    pending_pane: Option<Pane>,
+    /// The pointer-following label shown during a pane drag (created on first
+    /// use; layer-shell compositors only).
+    drag_badge: Option<DragBadge>,
     /// Monotonic id for the debounced width save: a scheduled save only writes
     /// if it is still the latest (no `SourceId` juggling — removing a one-shot
     /// source that has already fired panics).
@@ -686,6 +699,8 @@ impl SimpleComponent for App {
             file_dialog: gtk::FileDialog::new(),
             docks: vec![Dock {
                 side: primary_side,
+                floating: false,
+                layer_window: None,
                 monitor: None,
                 window: root.clone(),
                 container: pane_container.clone(),
@@ -702,6 +717,8 @@ impl SimpleComponent for App {
             last_root: session.last_root.clone(),
             bookmarks,
             pane_drag: None,
+            pending_pane: None,
+            drag_badge: None,
             save_generation: Rc::new(Cell::new(0)),
             sender: sender.clone(),
         };
@@ -746,6 +763,13 @@ impl SimpleComponent for App {
 
         let widgets = view_output!();
 
+        // `[panel] mode = "window"` starts the primary panel undocked. The root
+        // is still initialised as a layer surface above, so docking it again
+        // later only has to move the frame back into it.
+        if model.config.panel.mode == PanelMode::Window && layer_shell_available() {
+            model.set_dock_floating(0, true, &sender);
+        }
+
         // A mapped surface takes keyboard focus, so launching the panel leaves
         // the keyboard on the first row without a click (the compositor grants
         // the layer's keyboard on map; this focuses the row within it).
@@ -761,6 +785,10 @@ impl SimpleComponent for App {
 
         // Populate every pane's bookmarks list now that the order is settled.
         model.refresh_all_bookmarks(&sender);
+        // relm4 no longer presents the root window (it may be a parked shell),
+        // so map the panel's own windows here: docked, one layer surface; in
+        // window mode, one toplevel. `--hidden` keeps them unmapped.
+        model.sync_dock_visibility();
 
         // Quitting while a video thumbnail is playing is a shutdown race:
         // `GtkMediaFile` renders through GStreamer's GL sink, and exiting with
@@ -894,7 +922,7 @@ impl SimpleComponent for App {
                 if let Some((di, _pi)) = self.dock_pane_of(id) {
                     let side = self.docks[di].side.opposite();
                     let monitor = self.docks[di].monitor.clone();
-                    let target = self.ensure_dock(side, monitor, false, &sender);
+                    let target = self.ensure_dock(side, monitor, false, false, &sender);
                     self.add_pane(target, Some(root), &sender);
                     // A freshly created dock starts hidden; reveal it (unless
                     // the panel is currently toggled off on this workspace).
@@ -921,10 +949,15 @@ impl SimpleComponent for App {
                     self.window.close();
                     return;
                 }
-                if self.docks[di].panes.is_empty() && di != 0 {
+                if self.docks[di].panes.is_empty() && !(di == 0 && !self.docks[di].floating) {
                     // Nothing left in this non-primary dock on any workspace.
+                    // Bypass close-request: a panel window hides instead of
+                    // destroying itself, and this one is being removed.
                     let dock = self.docks.remove(di);
-                    dock.window.close();
+                    dock.window.destroy();
+                    if let Some(layer) = dock.layer_window {
+                        layer.destroy();
+                    }
                 } else {
                     fill_pane_container(
                         &self.docks[di].container.clone(),
@@ -992,12 +1025,29 @@ impl SimpleComponent for App {
                     }
                 }
                 // Let the message above run and GStreamer wind its GL context
-                // down before the window closes and the process exits.
-                let window = self.window.clone();
+                // down before the windows close and the process exits. The root
+                // window is closed last: other panel windows may still be open
+                // (one per dock), and GtkApplication only quits once the last
+                // one is gone.
+                let root = self.window.clone();
+                let mut others: Vec<gtk::Window> = Vec::new();
+                for dock in &self.docks {
+                    for window in [Some(dock.window.clone()), dock.layer_window.clone()]
+                        .into_iter()
+                        .flatten()
+                    {
+                        if window != root && !others.contains(&window) {
+                            others.push(window);
+                        }
+                    }
+                }
                 glib::timeout_add_local_once(
                     std::time::Duration::from_millis(SHUTDOWN_GRACE_MS),
                     move || {
-                        window.close();
+                        for window in others {
+                            window.destroy();
+                        }
+                        root.close();
                     },
                 );
             }
@@ -1153,7 +1203,7 @@ impl App {
             }
             let side = command.side.unwrap_or(self.primary_side);
             let monitor = self.default_monitor();
-            let di = self.ensure_dock(side, monitor, false, sender);
+            let di = self.ensure_dock(side, monitor, false, false, sender);
             self.add_pane(di, Some(root.clone()), sender);
         }
 
@@ -1167,7 +1217,7 @@ impl App {
             }
             let side = command.side.unwrap_or(self.primary_side);
             let monitor = self.default_monitor();
-            let di = self.ensure_dock(side, monitor, false, sender);
+            let di = self.ensure_dock(side, monitor, false, false, sender);
             let id = self.add_pane(di, Some(root), sender);
             if let Some(select) = select
                 && let Some((di, pi)) = self.dock_pane_of(id)
@@ -1218,14 +1268,14 @@ impl App {
 
         if let Some(side) = plan.create {
             let monitor = self.default_monitor();
-            self.ensure_dock(side, monitor, plan.seed, sender);
+            self.ensure_dock(side, monitor, false, plan.seed, sender);
         }
         for side in &plan.show {
             // Show every dock on this side (there may be more than one, one per
             // monitor), creating one on the default monitor if none exists.
             if self.dock_of_side(*side).is_none() {
                 let monitor = self.default_monitor();
-                self.ensure_dock(*side, monitor, seed_empty || !whole_panel, sender);
+                self.ensure_dock(*side, monitor, false, seed_empty || !whole_panel, sender);
             }
             let indices: Vec<usize> = self
                 .docks
@@ -1576,6 +1626,7 @@ impl App {
             BuiltinAction::Back => self.go_back(id),
             BuiltinAction::Forward => self.go_forward(id),
             BuiltinAction::Collapse => self.collapse_dock(id),
+            BuiltinAction::TogglePanelMode => self.toggle_pane_dock_mode(id, sender),
             BuiltinAction::ClosePane => sender.input(AppMsg::ClosePane { id }),
             BuiltinAction::ToggleBookmarks => self.show_bookmarks_view(id),
             BuiltinAction::NewBookmark => self.new_bookmark(id, sender),
@@ -1786,11 +1837,12 @@ impl App {
         self.docks.iter().position(|dock| dock.side == side)
     }
 
-    /// Index of the dock on `(side, monitor)`. A dock whose monitor has not
-    /// been resolved yet matches only an unresolved (`None`) query.
+    /// Index of the docked dock on `(side, monitor)`. A dock whose monitor has
+    /// not been resolved yet matches only an unresolved (`None`) query.
     fn dock_index_of(&self, side: PanelSide, monitor: Option<&gdk::Monitor>) -> Option<usize> {
         self.docks.iter().position(|dock| {
-            dock.side == side
+            !dock.floating
+                && dock.side == side
                 && match (&dock.monitor, monitor) {
                     (Some(a), Some(b)) => monitor_key(a) == monitor_key(b),
                     (None, None) => true,
@@ -1811,6 +1863,96 @@ impl App {
                     .item(0)
                     .and_downcast::<gdk::Monitor>()
             })
+    }
+
+    /// Toggle the dock holding pane `id` between an edge dock and an ordinary
+    /// window. Called from the `Toggle Window Mode` pane action/shortcut.
+    fn toggle_pane_dock_mode(&mut self, id: u64, sender: &ComponentSender<Self>) {
+        let Some((di, _)) = self.dock_pane_of(id) else {
+            return;
+        };
+        let floating = !self.docks[di].floating;
+        self.set_dock_floating(di, floating, sender);
+        if self.docks[di].floating != floating {
+            // The switch was refused (no layer-shell support, or no window to
+            // move); `set_dock_floating` has already explained why.
+            return;
+        }
+        self.status = if floating {
+            "Panel is now a window (Toggle Window Mode docks it again)".to_owned()
+        } else {
+            format!("Panel docked to the {} edge", self.docks[di].side.name())
+        };
+    }
+
+    /// Present dock `di` as an ordinary window (`floating`) or as an edge dock.
+    ///
+    /// The panel's frame (the box holding its pane stack and status bar) is
+    /// moved from one window to the other; the docked layer surface of the
+    /// primary dock is the relm4 root window, which cannot be recreated, so it
+    /// is parked hidden rather than destroyed.
+    fn set_dock_floating(&mut self, di: usize, floating: bool, sender: &ComponentSender<Self>) {
+        if self.docks.get(di).is_none() || self.docks[di].floating == floating {
+            return;
+        }
+        if !layer_shell_available() {
+            self.status =
+                "This compositor cannot dock panels, so the panel stays a window".to_owned();
+            return;
+        }
+        let side = self.docks[di].side;
+        let width = self.width_for(side);
+        let monitor = self.docks[di].monitor.clone();
+        let Some(frame) = self.docks[di].window.child() else {
+            return;
+        };
+        if floating {
+            let window =
+                build_dock_window(&self.config, side, width, true, monitor.as_ref(), sender);
+            self.docks[di].window.set_child(None::<&gtk::Widget>);
+            window.set_child(Some(&frame));
+            if self.docks[di].window == self.window {
+                // The relm4 root cannot be recreated, so keep it parked for the
+                // next dock. This is the primary dock's layer surface.
+                self.docks[di].window.set_visible(false);
+                self.docks[di].layer_window = Some(self.docks[di].window.clone());
+            } else {
+                self.docks[di].window.destroy();
+            }
+            self.docks[di].window = window.clone();
+            self.docks[di].floating = true;
+            self.watch_dock_window(di, sender);
+            window.present();
+        } else {
+            let window = match self.docks[di].layer_window.take() {
+                // The parked root still has its anchors and size; only the
+                // frame needs to move back into it.
+                Some(layer) => layer,
+                None => {
+                    build_dock_window(&self.config, side, width, false, monitor.as_ref(), sender)
+                }
+            };
+            self.docks[di].window.set_child(None::<&gtk::Widget>);
+            window.set_child(Some(&frame));
+            if self.docks[di].window != self.window {
+                self.docks[di].window.destroy();
+            }
+            self.docks[di].window = window.clone();
+            self.docks[di].floating = false;
+            if window != self.window {
+                // The parked root was wired up in `init`; a fresh layer window
+                // needs the same map handling.
+                self.watch_dock_window(di, sender);
+            }
+            window.present();
+        }
+        self.sync_dock_visibility();
+        if let Some(id) = self.docks[di]
+            .active_pane
+            .or_else(|| self.last_active_pane_id(di))
+        {
+            self.focus_pane_later(id);
+        }
     }
 
     /// Hide the entire dock that holds pane `id` (the toolbar "Collapse"
@@ -2016,7 +2158,11 @@ impl App {
             ..self.config.panel
         };
         for dock in self.docks.iter().filter(|dock| dock.side == side) {
-            apply_window_width(&dock.window, width);
+            // A plain window is resized by the compositor, not by the panel's
+            // width controls; only the docked layer surface follows `width`.
+            if !dock.floating {
+                apply_window_width(&dock.window, width);
+            }
             for pane in &dock.panes {
                 pane.tree.emit(TreeMsg::SetPanel(panel));
             }
@@ -2071,17 +2217,20 @@ impl App {
         );
     }
 
-    /// Return the index of the dock on `(side, monitor)`, creating it (with a
-    /// seeded pane from `[startup]`) when missing. `monitor` is the monitor the
-    /// new dock should dock to; `None` lets the compositor pick.
+    /// Return the index of the docked dock on `(side, monitor)`, creating it
+    /// (with a seeded pane from `[startup]`) when missing. `monitor` is the
+    /// monitor the new dock should dock to; `None` lets the compositor pick.
     fn ensure_dock(
         &mut self,
         side: PanelSide,
         monitor: Option<gdk::Monitor>,
+        floating: bool,
         seed: bool,
         sender: &ComponentSender<Self>,
     ) -> usize {
-        if let Some(di) = self.dock_index_of(side, monitor.as_ref()) {
+        // A floating panel has no side identity to look up: every one is its own
+        // window (they are created per undock, not merged).
+        if !floating && let Some(di) = self.dock_index_of(side, monitor.as_ref()) {
             if seed && self.docks[di].panes.is_empty() {
                 // The dock exists but was emptied; give it a pane again.
                 let startup = self.config.startup.clone();
@@ -2091,14 +2240,15 @@ impl App {
             }
             return di;
         }
-        let config = &self.config;
         let width = self.width_for(side);
-        let window = gtk::Window::new();
-        init_layer_window(&window, config, side, width, monitor.as_ref());
-        window.set_default_size(width as i32, 520);
-        if layer_shell_available() {
-            attach_resize_controls(&window, side, sender);
-        }
+        let window = build_dock_window(
+            &self.config,
+            side,
+            width,
+            floating,
+            monitor.as_ref(),
+            sender,
+        );
         // The window's child is the box holding the pane stack.
         let outer = gtk::Box::new(gtk::Orientation::Vertical, 0);
         outer.set_vexpand(true);
@@ -2110,6 +2260,8 @@ impl App {
         let di = self.docks.len();
         self.docks.push(Dock {
             side,
+            floating,
+            layer_window: None,
             monitor,
             window,
             container,
@@ -2118,15 +2270,7 @@ impl App {
         });
         // As with the primary dock, resolve the monitor and hand focus to this
         // dock's pane once its surface is mapped (grab_focus before that no-ops).
-        {
-            let sender = sender.clone();
-            let window = self.docks[di].window.clone();
-            window.connect_map(move |_| {
-                let sender = sender.clone();
-                sender.input(AppMsg::ResolveDockMonitor { di });
-                glib::idle_add_local_once(move || sender.input(AppMsg::FocusVisible));
-            });
-        }
+        self.watch_dock_window(di, sender);
         if seed {
             let startup = self.config.startup.clone();
             if let Some(root) = default_root(&startup) {
@@ -2137,6 +2281,18 @@ impl App {
             }
         }
         di
+    }
+
+    /// Watch a freshly built dock window: resolve its monitor and hand keyboard
+    /// focus to its pane once the surface is mapped (a grab before that no-ops).
+    fn watch_dock_window(&mut self, di: usize, sender: &ComponentSender<Self>) {
+        let sender = sender.clone();
+        let window = self.docks[di].window.clone();
+        window.connect_map(move |_| {
+            let sender = sender.clone();
+            sender.input(AppMsg::ResolveDockMonitor { di });
+            glib::idle_add_local_once(move || sender.input(AppMsg::FocusVisible));
+        });
     }
 
     /// Append a pane showing `root` to dock `di`, returning its id. A `None`
@@ -2219,9 +2375,9 @@ impl App {
     }
 
     /// The `(side, monitor)` under an absolute screen point, or `None` when the
-    /// point is outside every monitor. The side is the nearer edge of the
-    /// monitor under the pointer.
-    fn point_target(&self, point: (f64, f64)) -> Option<(PanelSide, gdk::Monitor)> {
+    /// point is outside every monitor. The outer band of a monitor docks to the
+    /// nearer edge; the rest of it undocks the pane.
+    fn point_target(&self, point: (f64, f64)) -> Option<DragTarget> {
         let (x, y) = point;
         let monitors = gdk::Display::default()?.monitors();
         for i in 0..monitors.n_items() {
@@ -2232,12 +2388,11 @@ impl App {
             let (x0, y0) = (g.x() as f64, g.y() as f64);
             let (w, h) = (g.width() as f64, g.height() as f64);
             if x >= x0 && x < x0 + w && y >= y0 && y < y0 + h {
-                let side = if x < x0 + w / 2.0 {
-                    PanelSide::Left
-                } else {
-                    PanelSide::Right
-                };
-                return Some((side, monitor));
+                return Some(match drag_zone(x - x0, w) {
+                    Some(PanelSide::Left) => DragTarget::Dock(PanelSide::Left, monitor),
+                    Some(PanelSide::Right) => DragTarget::Dock(PanelSide::Right, monitor),
+                    None => DragTarget::Undock(monitor),
+                });
             }
         }
         None
@@ -2249,6 +2404,13 @@ impl App {
         let Some((di, pi)) = self.dock_pane_of(id) else {
             return;
         };
+        if self.docks[di].floating {
+            // A toplevel's position is the compositor's business — Wayland does
+            // not tell a client where its window is — so a screen-absolute drop
+            // target cannot be derived from a drag that starts inside one.
+            self.status = "Use Toggle Window Mode (Ctrl+Shift+f) to dock this panel".to_owned();
+            return;
+        }
         // Compute the grip's top-left within the pane's current window. Doing
         // this here (rather than in the gesture closure) keeps it correct after
         // the pane has been moved to a different dock/window.
@@ -2270,11 +2432,11 @@ impl App {
             base,
             highlighted: None,
         });
-        self.status = "Drag the pane to the edge of a screen to move it".to_owned();
+        self.status = "Drag to a screen edge to dock, or to the middle to undock".to_owned();
     }
 
-    /// Update the drop target for a drag in progress: highlight the target dock
-    /// and describe it in the status line.
+    /// Update the drop target for a drag in progress: highlight the target dock,
+    /// label the outcome under the pointer, and describe it in the status line.
     fn update_pane_drag(&mut self, id: u64, offset: (f64, f64)) {
         let Some(drag) = self.pane_drag.as_ref() else {
             return;
@@ -2284,9 +2446,13 @@ impl App {
         }
         let point = (drag.base.0 + offset.0, drag.base.1 + offset.1);
         let target = self.point_target(point);
-        let highlight = target
-            .as_ref()
-            .and_then(|(side, monitor)| self.dock_index_of(*side, Some(monitor)));
+        let Some((source_di, source_pi)) = self.dock_pane_of(id) else {
+            return;
+        };
+        let highlight = match &target {
+            Some(DragTarget::Dock(side, monitor)) => self.dock_index_of(*side, Some(monitor)),
+            _ => None,
+        };
         if let Some(drag) = self.pane_drag.as_mut()
             && drag.highlighted != highlight
         {
@@ -2302,18 +2468,73 @@ impl App {
             }
             drag.highlighted = highlight;
         }
-        self.status = match target {
-            Some((side, monitor)) => format!(
-                "Drop to move the pane to the {} panel on {}",
-                side.name(),
-                monitor_label(&monitor)
+        // Whether the pane would leave this dock: dock it elsewhere, or float
+        // it. Staying put is the third, visually quiet outcome.
+        let same_dock = highlight == Some(source_di);
+        let undock = matches!(target, Some(DragTarget::Undock(_)));
+        let pane = &self.docks[source_di].panes[source_pi];
+        if undock {
+            pane.widget.add_css_class("pane-undocking");
+        } else {
+            pane.widget.remove_css_class("pane-undocking");
+        }
+        let (status, badge, kind) = match &target {
+            Some(DragTarget::Dock(side, _)) if same_dock => (
+                "No change: the pane stays in this panel".to_owned(),
+                "No change".to_owned(),
+                "drag-badge-none",
             ),
-            None => "Drag the pane to the edge of a screen to move it".to_owned(),
+            Some(DragTarget::Dock(side, monitor)) => (
+                format!(
+                    "Drop to move the pane to the {} panel on {}",
+                    side.name(),
+                    monitor_label(monitor)
+                ),
+                format!("Dock {} panel", side.name()),
+                "drag-badge-dock",
+            ),
+            Some(DragTarget::Undock(_)) => (
+                "Drop to undock the pane into its own window".to_owned(),
+                "Undock".to_owned(),
+                "drag-badge-undock",
+            ),
+            None => (
+                "Release to cancel: outside every screen".to_owned(),
+                "Cancel".to_owned(),
+                "drag-badge-none",
+            ),
         };
+        self.status = status;
+        let monitor = match &target {
+            Some(DragTarget::Dock(_, monitor)) | Some(DragTarget::Undock(monitor)) => {
+                Some(monitor.clone())
+            }
+            None => None,
+        };
+        self.show_drag_badge(&badge, kind, point, monitor.as_ref());
     }
 
-    /// Finish a pane drag: move the pane to the target under the pointer, or
-    /// cancel when it was dropped outside every monitor.
+    /// Show (or hide) the pointer-following drag label.
+    fn show_drag_badge(
+        &mut self,
+        text: &str,
+        kind: &str,
+        point: (f64, f64),
+        monitor: Option<&gdk::Monitor>,
+    ) {
+        let Some(monitor) = monitor.filter(|_| layer_shell_available()) else {
+            if let Some(badge) = &self.drag_badge {
+                badge.hide();
+            }
+            return;
+        };
+        let badge = self.drag_badge.get_or_insert_with(DragBadge::new);
+        badge.show(text, kind, point, monitor);
+    }
+
+    /// Finish a pane drag: dock the pane at the target under the pointer, give
+    /// it its own window in the middle of the screen, or cancel when it was
+    /// dropped outside every monitor.
     fn end_pane_drag(&mut self, id: u64, offset: (f64, f64), sender: &ComponentSender<Self>) {
         let Some(drag) = self.pane_drag.take() else {
             return;
@@ -2326,17 +2547,40 @@ impl App {
             self.docks[di].panes[pi]
                 .widget
                 .remove_css_class("pane-moving");
+            self.docks[di].panes[pi]
+                .widget
+                .remove_css_class("pane-undocking");
         }
         if let Some(di) = drag.highlighted
             && let Some(dock) = self.docks.get(di)
         {
             dock.window.remove_css_class("pane-drop-target");
         }
+        if let Some(badge) = &self.drag_badge {
+            badge.hide();
+        }
         let point = (drag.base.0 + offset.0, drag.base.1 + offset.1);
         match self.point_target(point) {
-            Some((side, monitor)) => self.move_pane_to(id, side, monitor, sender),
+            Some(DragTarget::Dock(side, monitor)) => {
+                self.move_pane_to(id, side, monitor, sender);
+            }
+            Some(DragTarget::Undock(_)) => self.undock_pane(id, sender),
             None => self.status.clear(),
         }
+    }
+
+    /// Give pane `id` its own undocked window, emptying (or closing) the dock it
+    /// came from exactly as a move to another side would.
+    fn undock_pane(&mut self, id: u64, sender: &ComponentSender<Self>) {
+        let Some((sdi, spi)) = self.dock_pane_of(id) else {
+            return;
+        };
+        let side = self.docks[sdi].side;
+        let monitor = self.docks[sdi].monitor.clone();
+        self.detach_pane(id, sdi, spi);
+        let tdi = self.ensure_dock(side, monitor, true, false, sender);
+        self.attach_pane(id, tdi, sender);
+        self.status = "Pane undocked into its own window".to_owned();
     }
 
     /// Move pane `id` into the dock on `(side, monitor)`, creating that dock if
@@ -2355,26 +2599,44 @@ impl App {
             self.status.clear();
             return;
         }
+        self.detach_pane(id, sdi, spi);
+        let tdi = self.ensure_dock(side, Some(monitor), false, false, sender);
+        self.attach_pane(id, tdi, sender);
+        self.status = format!("Moved pane to the {} panel", side.name());
+    }
+
+    /// Remove pane `id` from dock `sdi` at `spi`, closing the dock when it was
+    /// the last pane there, and park it in `pending_pane` for [`Self::attach_pane`].
+    fn detach_pane(&mut self, id: u64, sdi: usize, spi: usize) {
         let pane = self.docks[sdi].panes.remove(spi);
         remove_from_parent(pane.widget.upcast_ref());
         if self.docks[sdi].active_pane == Some(id) {
             self.docks[sdi].active_pane = self.docks[sdi].panes.last().map(|p| p.id);
         }
         if self.docks[sdi].panes.is_empty() {
-            if sdi == 0 {
-                // The primary dock is the relm4 root window; hide it rather
+            if sdi == 0 && !self.docks[sdi].floating {
+                // The primary dock's window is the relm4 root; hide it rather
                 // than destroy the app (see `ClosePane`).
                 self.docks[sdi].window.set_visible(false);
             } else {
                 let dock = self.docks.remove(sdi);
-                dock.window.close();
+                dock.window.destroy();
             }
         } else {
             let container = self.docks[sdi].container.clone();
             fill_pane_container(&container, &self.docks[sdi].panes, &self.active_workspace);
         }
-        let tdi = self.ensure_dock(side, Some(monitor), false, sender);
-        pane.tree.emit(TreeMsg::SetSide(side));
+        self.pending_pane = Some(pane);
+    }
+
+    /// Attach the parked pane to dock `tdi`, then reveal and focus it.
+    fn attach_pane(&mut self, id: u64, tdi: usize, sender: &ComponentSender<Self>) {
+        let Some(pane) = self.pending_pane.take() else {
+            return;
+        };
+        // The tree's panel side drives labels ("In right panel") and preview
+        // widths, so it follows the dock the pane now lives in.
+        pane.tree.emit(TreeMsg::SetSide(self.docks[tdi].side));
         self.docks[tdi].panes.push(pane);
         self.docks[tdi].active_pane = Some(id);
         let container = self.docks[tdi].container.clone();
@@ -2382,7 +2644,6 @@ impl App {
         self.sync_dock_visibility();
         self.refresh_all_bookmarks(sender);
         self.focus_pane_later(id);
-        self.status = format!("Moved pane to the {} panel", side.name());
     }
 }
 
@@ -2840,6 +3101,9 @@ const PANED_CENTER_DELAY_MS: u64 = 100;
 /// letting GStreamer release its GL context before the process exits.
 const SHUTDOWN_GRACE_MS: u64 = 150;
 
+/// Default height of an undocked panel window.
+const WINDOW_HEIGHT: i32 = 720;
+
 /// Resize a dock window's layer surface to `width`.
 fn apply_window_width(window: &gtk::Window, width: u32) {
     let (_, height) = window.default_size();
@@ -3063,6 +3327,140 @@ fn configure_plain_window(window: &gtk::Window, width: u32) {
     window.set_size_request(width as i32, -1);
 }
 
+/// Build a dock window: a layer surface anchored to `side`, or an ordinary
+/// toplevel when the panel is undocked (or the compositor cannot dock at all).
+fn build_dock_window(
+    config: &Config,
+    side: PanelSide,
+    width: u32,
+    floating: bool,
+    monitor: Option<&gdk::Monitor>,
+    sender: &ComponentSender<App>,
+) -> gtk::Window {
+    let window = gtk::Window::new();
+    if !floating && layer_shell_available() {
+        init_layer_window(&window, config, side, width, monitor);
+        window.set_default_size(width as i32, 520);
+        attach_resize_controls(&window, side, sender);
+        return window;
+    }
+    if floating {
+        window.set_title(Some("tree-space"));
+        window.set_default_size(width as i32, WINDOW_HEIGHT);
+    } else {
+        configure_plain_window(&window, width);
+    }
+    // Closing a panel window hides it instead of destroying it: the dock keeps
+    // its panes, and showing the panel brings it back. The app itself destroys
+    // dock windows explicitly (bypassing `close-request`) when a dock is emptied.
+    let hidden = window.clone();
+    window.connect_close_request(move |_| {
+        hidden.set_visible(false);
+        glib::Propagation::Stop
+    });
+    window
+}
+
+/// Where a pane drag in flight would leave the pane.
+#[derive(Debug, Clone)]
+enum DragTarget {
+    /// Dock it to `side` on `monitor`, joining (or creating) that edge dock.
+    Dock(PanelSide, gdk::Monitor),
+    /// Away from every screen edge: give the pane its own window.
+    Undock(gdk::Monitor),
+}
+
+/// The screen-edge band that docks a dragged pane. The middle of the monitor
+/// undocks it instead, so the three outcomes (dock elsewhere, undock, no change)
+/// are all reachable from one gesture.
+fn drag_edge_band(monitor_width: i32) -> f64 {
+    (monitor_width as f64 * 0.22).clamp(140.0, 480.0)
+}
+
+/// The edge a drag point at `x` (monitor-relative) would dock to, or `None` when
+/// it is in the middle of the monitor — the undock zone.
+fn drag_zone(x: f64, monitor_width: f64) -> Option<PanelSide> {
+    let band = drag_edge_band(monitor_width as i32);
+    if x < band {
+        Some(PanelSide::Left)
+    } else if x >= monitor_width - band {
+        Some(PanelSide::Right)
+    } else {
+        None
+    }
+}
+
+/// The layer namespace of the drag badge (distinct from the panel's, so the two
+/// are easy to tell apart in compositor diagnostics).
+const DRAG_BADGE_NAMESPACE: &str = "tree-space-drag";
+
+/// A small label that follows the pointer during a pane drag and says where the
+/// pane will land ("Dock left panel", "Undock", "No change").
+///
+/// It is its own layer surface because the panel cannot draw outside its own
+/// window: the drop point is usually halfway across the screen. It takes no
+/// keyboard focus and is only mapped while a drag is in flight.
+struct DragBadge {
+    window: gtk::Window,
+    label: gtk::Label,
+    /// The monitor the surface currently sits on, so crossing monitors re-homes
+    /// it only when it actually changes.
+    monitor: Cell<Option<String>>,
+}
+
+impl DragBadge {
+    fn new() -> Self {
+        let window = gtk::Window::new();
+        window.init_layer_shell();
+        window.set_namespace(Some(DRAG_BADGE_NAMESPACE));
+        window.set_layer(Layer::Overlay);
+        // Anchor top-left and position with margins: the badge is a fixed-size
+        // label, so the anchors only provide a coordinate origin.
+        window.set_anchor(Edge::Top, true);
+        window.set_anchor(Edge::Left, true);
+        window.set_exclusive_zone(0);
+        window.set_keyboard_mode(KeyboardMode::None);
+        window.set_can_target(false);
+        let label = gtk::Label::new(None);
+        label.add_css_class("drag-badge");
+        window.set_child(Some(&label));
+        Self {
+            window,
+            label,
+            monitor: Cell::new(None),
+        }
+    }
+
+    /// Show `text` in style `kind` at `point` (absolute screen coordinates).
+    fn show(&self, text: &str, kind: &str, point: (f64, f64), monitor: &gdk::Monitor) {
+        let key = monitor_key(monitor);
+        let changed = self.monitor.take().as_deref() != Some(key.as_str());
+        self.monitor.set(Some(key));
+        if changed {
+            // A mapped layer surface can be re-homed, but hiding first avoids a
+            // frame drawn on the old output.
+            self.window.set_visible(false);
+            self.window.set_monitor(Some(monitor));
+        }
+        let g = monitor.geometry();
+        let offset = 18.0;
+        let x = (point.0 - g.x() as f64 + offset).max(0.0) as i32;
+        let y = (point.1 - g.y() as f64 + offset).max(0.0) as i32;
+        self.window.set_margin(Edge::Left, x);
+        self.window.set_margin(Edge::Top, y);
+        self.label.set_text(text);
+        for class in ["drag-badge-dock", "drag-badge-undock", "drag-badge-none"] {
+            self.label.remove_css_class(class);
+        }
+        self.label.add_css_class(kind);
+        self.window.set_visible(true);
+    }
+
+    fn hide(&self) {
+        self.window.set_visible(false);
+    }
+}
+
 /// Whether any visible [`gtk::Popover`] is open under `widget` (walking the
 /// widget tree). Used to keep keyboard focus on the panel while its menu is up.
 fn has_visible_popover(widget: &gtk::Widget) -> bool {
@@ -3193,6 +3591,34 @@ mod adjust_path_tests {
         assert_eq!(adjust_path_after_removal(&[1, 2], &[1]), vec![1]);
         // Diverge at the second level: only that index shifts.
         assert_eq!(adjust_path_after_removal(&[1, 0], &[1, 2]), vec![1, 1]);
+    }
+}
+
+#[cfg(test)]
+mod drag_zone_tests {
+    use super::*;
+
+    #[test]
+    fn edges_dock_and_the_middle_undocks() {
+        // 5120 px wide: the band is clamped to 480 px at each edge.
+        let w = 5120.0;
+        assert_eq!(drag_zone(10.0, w), Some(PanelSide::Left));
+        assert_eq!(drag_zone(479.0, w), Some(PanelSide::Left));
+        assert_eq!(drag_zone(480.0, w), None);
+        assert_eq!(drag_zone(w / 2.0, w), None);
+        assert_eq!(drag_zone(w - 481.0, w), None);
+        assert_eq!(drag_zone(w - 480.0, w), Some(PanelSide::Right));
+        assert_eq!(drag_zone(w - 1.0, w), Some(PanelSide::Right));
+    }
+
+    #[test]
+    fn the_band_has_a_floor_on_narrow_monitors() {
+        // 600 px wide: 22% would be 132 px, below the 140 px floor.
+        let w = 600.0;
+        assert_eq!(drag_zone(139.0, w), Some(PanelSide::Left));
+        assert_eq!(drag_zone(140.0, w), None);
+        assert_eq!(drag_zone(w - 141.0, w), None);
+        assert_eq!(drag_zone(w - 140.0, w), Some(PanelSide::Right));
     }
 }
 

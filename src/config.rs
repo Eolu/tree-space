@@ -242,6 +242,31 @@ impl PanelSide {
     }
 }
 
+/// How a panel is presented.
+///
+/// `Docked` is the wlr-layer-shell surface anchored to a screen edge that
+/// reserves space. `Window` makes it an ordinary toplevel window, which the
+/// compositor places and decorates like any other window (and which cannot
+/// reserve space). On a compositor without layer-shell support both spell a
+/// plain window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PanelMode {
+    #[default]
+    Docked,
+    Window,
+}
+
+impl PanelMode {
+    /// The lowercase word used in the config file and status messages.
+    pub fn name(&self) -> &'static str {
+        match self {
+            PanelMode::Docked => "docked",
+            PanelMode::Window => "window",
+        }
+    }
+}
+
 /// The wlr-layer-shell layer the panel lives in. `Bottom` keeps it behind
 /// normal windows (the Ormachy/Hyprland "stays out of the way" mode).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
@@ -307,6 +332,9 @@ fn default_panel_side() -> PanelSide {
 fn default_panel_layer() -> PanelLayer {
     builtin().panel.layer
 }
+fn default_panel_mode() -> PanelMode {
+    builtin().panel.mode
+}
 fn default_panel_width() -> u32 {
     builtin().panel.width
 }
@@ -353,6 +381,9 @@ pub struct PanelConfig {
     pub side: PanelSide,
     #[serde(default = "default_panel_layer")]
     pub layer: PanelLayer,
+    /// How panels start: docked to the edge, or as ordinary windows.
+    #[serde(default = "default_panel_mode")]
+    pub mode: PanelMode,
     /// Panel width in pixels.
     #[serde(default = "default_panel_width")]
     pub width: u32,
@@ -726,6 +757,9 @@ pub enum BuiltinAction {
     Forward,
     /// Pane-level: hide this pane's whole side.
     Collapse,
+    /// Pane-level: toggle this panel between docked to the edge and an ordinary
+    /// window.
+    TogglePanelMode,
     /// Pane-level: close this pane.
     ClosePane,
     /// Pane-level: show or hide the bookmarks section in this dock.
@@ -788,6 +822,7 @@ impl BuiltinAction {
             BuiltinAction::Back => "Back",
             BuiltinAction::Forward => "Forward",
             BuiltinAction::Collapse => "Collapse",
+            BuiltinAction::TogglePanelMode => "Toggle Window Mode",
             BuiltinAction::ClosePane => "Close Pane",
             BuiltinAction::ToggleBookmarks => "Bookmarks",
             BuiltinAction::MoveToPreviousWorkspace => "Move to Previous Workspace",
@@ -827,6 +862,7 @@ impl BuiltinAction {
             BuiltinAction::Back => Some("Alt+Left"),
             BuiltinAction::Forward => Some("Alt+Right"),
             BuiltinAction::ClosePane => Some("Ctrl+w"),
+            BuiltinAction::TogglePanelMode => Some("Ctrl+Shift+f"),
             BuiltinAction::ToggleBookmarks => Some("Ctrl+b"),
             _ => None,
         }
@@ -880,6 +916,7 @@ impl BuiltinAction {
                 | BuiltinAction::Back
                 | BuiltinAction::Forward
                 | BuiltinAction::Collapse
+                | BuiltinAction::TogglePanelMode
                 | BuiltinAction::ClosePane
                 | BuiltinAction::ToggleBookmarks
                 | BuiltinAction::MoveToPreviousWorkspace
@@ -951,6 +988,7 @@ impl BuiltinAction {
             Self::Back,
             Self::Forward,
             Self::Collapse,
+            Self::TogglePanelMode,
             Self::ClosePane,
             Self::ToggleBookmarks,
             Self::MoveToPreviousWorkspace,
