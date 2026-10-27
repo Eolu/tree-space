@@ -7,6 +7,7 @@
 //! the model can be unit-tested against an in-memory filesystem and driven by
 //! the real `std::fs` reader in production ([`StdDirSource`]).
 
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fs;
 use std::io;
@@ -118,8 +119,8 @@ impl SortKey {
 /// Sorting rules applied to every directory listing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SortOptions {
-    /// Directories before files; names always sorted alphabetically
-    /// (case-insensitively).
+    /// Directories before files; names are compared naturally, so digit runs
+    /// sort by value (`image9` before `image10`) and text case-insensitively.
     pub dirs_first: bool,
     /// Primary ordering key.
     pub key: SortKey,
@@ -146,13 +147,98 @@ fn type_key(name: &str) -> String {
     }
 }
 
+/// Compare two names the way a person reads them: runs of digits compare by
+/// numeric value (`chapter9` before `chapter10`, `v1.2` before `v1.10`), while
+/// text runs compare case-insensitively. Equal text reports `Equal`; callers
+/// add an exact-case tie-break so the order is still deterministic.
+///
+/// Numbers are never parsed, so a 40-digit run cannot overflow: significant
+/// lengths are compared first, then the digits.
+fn natural_cmp(a: &str, b: &str) -> Ordering {
+    let (a_bytes, b_bytes) = (a.as_bytes(), b.as_bytes());
+    let (mut i, mut j) = (0, 0);
+    loop {
+        if i == a_bytes.len() || j == b_bytes.len() {
+            // One name is a prefix of the other: the shorter sorts first.
+            return (a_bytes.len() - i).cmp(&(b_bytes.len() - j));
+        }
+        match (a_bytes[i].is_ascii_digit(), b_bytes[j].is_ascii_digit()) {
+            (true, true) => {
+                let a_end = digit_run_end(a_bytes, i);
+                let b_end = digit_run_end(b_bytes, j);
+                let ord = cmp_digits(&a[i..a_end], &b[j..b_end]);
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+                i = a_end;
+                j = b_end;
+            }
+            (false, false) => {
+                let a_end = text_run_end(a_bytes, i);
+                let b_end = text_run_end(b_bytes, j);
+                let ord = cmp_text_ci(&a[i..a_end], &b[j..b_end]);
+                if ord != Ordering::Equal {
+                    return ord;
+                }
+                i = a_end;
+                j = b_end;
+            }
+            // A digit run abuts a text run (`img1` vs `img-1`): order by the
+            // raw bytes. Any stable rule is fine here, and this keeps the
+            // comparator total.
+            (true, false) | (false, true) => return a_bytes[i].cmp(&b_bytes[j]),
+        }
+    }
+}
+
+/// End of the digit run starting at `start`.
+fn digit_run_end(bytes: &[u8], start: usize) -> usize {
+    bytes[start..]
+        .iter()
+        .position(|byte| !byte.is_ascii_digit())
+        .map_or(bytes.len(), |offset| start + offset)
+}
+
+/// End of the text run starting at `start` (up to the next digit).
+fn text_run_end(bytes: &[u8], start: usize) -> usize {
+    bytes[start..]
+        .iter()
+        .position(u8::is_ascii_digit)
+        .map_or(bytes.len(), |offset| start + offset)
+}
+
+/// Compare two digit runs by value, without parsing them. Equal values put the
+/// run with fewer leading zeros first, so `2` sorts before `02`.
+fn cmp_digits(a: &str, b: &str) -> Ordering {
+    let a_value = a.trim_start_matches('0');
+    let b_value = b.trim_start_matches('0');
+    a_value
+        .len()
+        .cmp(&b_value.len())
+        .then_with(|| a_value.cmp(b_value))
+        .then_with(|| a.len().cmp(&b.len()))
+}
+
+/// Compare two text runs case-insensitively, without allocating.
+fn cmp_text_ci(a: &str, b: &str) -> Ordering {
+    let mut a_chars = a.chars().flat_map(char::to_lowercase);
+    let mut b_chars = b.chars().flat_map(char::to_lowercase);
+    loop {
+        match (a_chars.next(), b_chars.next()) {
+            (Some(x), Some(y)) if x == y => continue,
+            (Some(x), Some(y)) => return x.cmp(&y),
+            (Some(_), None) => return Ordering::Greater,
+            (None, Some(_)) => return Ordering::Less,
+            (None, None) => return Ordering::Equal,
+        }
+    }
+}
+
 /// Compare two entries under the given rules. Directories always float to the
 /// top when `dirs_first` is set (regardless of key or direction); the primary
 /// `key` then orders within a group, with a lowercase-name tie-break for
 /// stability.
-fn compare_entries(a: &EntryInfo, b: &EntryInfo, opts: SortOptions) -> std::cmp::Ordering {
-    use std::cmp::Ordering;
-
+fn compare_entries(a: &EntryInfo, b: &EntryInfo, opts: SortOptions) -> Ordering {
     if opts.dirs_first {
         match (a.is_dir, b.is_dir) {
             (true, false) => return Ordering::Less,
@@ -164,24 +250,16 @@ fn compare_entries(a: &EntryInfo, b: &EntryInfo, opts: SortOptions) -> std::cmp:
     // Primary key. For Name, direction is applied normally; Size/Modified/
     // Type fall back to ascending name when the primary values tie.
     let primary = match opts.key {
-        SortKey::Name => a
-            .name
-            .to_lowercase()
-            .cmp(&b.name.to_lowercase())
-            .then_with(|| a.name.cmp(&b.name)),
+        SortKey::Name => natural_cmp(&a.name, &b.name).then_with(|| a.name.cmp(&b.name)),
         SortKey::Size => a.size.cmp(&b.size),
         SortKey::Modified => a.modified.cmp(&b.modified),
         SortKey::Type => type_key(&a.name)
             .cmp(&type_key(&b.name))
-            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase())),
+            .then_with(|| natural_cmp(&a.name, &b.name)),
     };
 
     if primary == Ordering::Equal && opts.key != SortKey::Name {
-        let tie = a
-            .name
-            .to_lowercase()
-            .cmp(&b.name.to_lowercase())
-            .then_with(|| a.name.cmp(&b.name));
+        let tie = natural_cmp(&a.name, &b.name).then_with(|| a.name.cmp(&b.name));
         return if opts.ascending { tie } else { tie.reverse() };
     }
 
@@ -794,6 +872,66 @@ mod tests {
             row_names(&model.visible_rows()),
             vec!["GAMMA", "Alpha", "alpha", "beta"]
         );
+    }
+
+    #[test]
+    fn name_sort_compares_digit_runs_by_value() {
+        let mut fs = MemFs::default();
+        fs.dir(
+            "/r",
+            vec![
+                ("img10.png", false, false),
+                ("img2.png", false, false),
+                ("img1.png", false, false),
+                ("img02.png", false, false),
+                ("chapter", false, false),
+            ],
+        );
+        let mut model = TreeModel::new("/r".into(), SortOptions::default(), false);
+        model.expand(Path::new("/r"), &fs).unwrap();
+        assert_eq!(
+            row_names(&model.visible_rows()),
+            vec!["chapter", "img1.png", "img2.png", "img02.png", "img10.png"]
+        );
+
+        // Descending flips the whole order, digits included.
+        let mut model = TreeModel::new(
+            "/r".into(),
+            SortOptions {
+                ascending: false,
+                ..SortOptions::default()
+            },
+            false,
+        );
+        model.expand(Path::new("/r"), &fs).unwrap();
+        assert_eq!(
+            row_names(&model.visible_rows()),
+            vec!["img10.png", "img02.png", "img2.png", "img1.png", "chapter"]
+        );
+    }
+
+    #[test]
+    fn natural_comparison_is_numeric_and_case_insensitive() {
+        let sorted = ["a", "A1", "a2", "a02", "a10", "a100", "b1"];
+        for pair in sorted.windows(2) {
+            assert!(
+                natural_cmp(pair[0], pair[1]).is_lt(),
+                "{} should sort before {}",
+                pair[0],
+                pair[1]
+            );
+        }
+        // Text compares case-insensitively; equal text reports Equal, and the
+        // caller's exact-case tie-break makes the final order deterministic.
+        assert_eq!(natural_cmp("Report", "report"), Ordering::Equal);
+        // Equal numeric values put the run with fewer leading zeros first.
+        assert!(natural_cmp("v1.2", "v1.02").is_lt());
+        // A prefix sorts before the longer name.
+        assert!(natural_cmp("a", "a1").is_lt());
+        // Digit runs are never parsed, so long numbers cannot overflow.
+        assert!(natural_cmp("f99999999999999999999", "f100000000000000000000").is_lt());
+        // A digit abutting text still yields a total order.
+        assert_ne!(natural_cmp("a1", "a-1"), Ordering::Equal);
     }
 
     #[test]

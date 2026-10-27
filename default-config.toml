@@ -90,6 +90,7 @@ blank = [
 [tree]
 dirs_first = true     # list directories above files
 sort_key = "name"     # primary sort: "name" | "size" | "modified" | "type"
+                      # names sort naturally: "image9" comes before "image10"
 sort_ascending = true # sort ascending (A→Z) rather than descending
 show_hidden = false   # shww dotfiles by default
 font_size = 13        # row label size in pt (clamped to 6–40)

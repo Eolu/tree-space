@@ -429,6 +429,24 @@ popover.hamburger-popover > arrow {
     color: @tn_fg_bright;
 }
 
+/* A path with a permanent delete running in the background: struck through and
+   dimmed until the worker finishes (then the row disappears, or comes back to
+   normal if the delete failed). */
+.tree-row-deleting label {
+    text-decoration-line: line-through;
+    color: @tn_fg_dim;
+}
+
+.tree-row-deleting image {
+    opacity: 0.4;
+}
+
+/* Keep the row readable while it is struck out but still selected. */
+.tree-row-deleting.tree-row-selected label,
+.tree-row-deleting.tree-row-selected image {
+    color: @tn_fg;
+}
+
 .tree-rename-entry {
     min-height: 22px;
     padding: 1px 4px;

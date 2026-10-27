@@ -9,6 +9,8 @@
 //!   permission math, owner/group resolution and image dimensions.
 //! * [`watcher`] — a `notify` (inotify) wrapper that translates raw
 //!   filesystem events into the model's [`Change`] vocabulary.
+//! * [`pending`] — the process-wide list of paths a background worker is deleting,
+//!   so no pane reads, writes or transforms a half-removed tree.
 //!
 //! Nothing in this module requires a graphical environment; it is exercised by
 //! `cargo test` on CI and developer machines alike.
@@ -16,6 +18,7 @@
 pub mod meta;
 pub mod model;
 pub mod ops;
+pub mod pending;
 pub mod watcher;
 
 pub use model::{

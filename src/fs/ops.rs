@@ -25,6 +25,9 @@ pub enum OpsError {
     NotADirectory(String),
     /// Trashing failed for another reason.
     Trash(String),
+    /// The path no longer names the entry that was confirmed for deletion (it
+    /// was removed and re-created, or replaced, in the meantime).
+    Replaced(PathBuf),
 }
 
 impl std::fmt::Display for OpsError {
@@ -35,6 +38,11 @@ impl std::fmt::Display for OpsError {
             OpsError::NotFound(name) => write!(f, "no such file or directory: {name}"),
             OpsError::NotADirectory(name) => write!(f, "not a directory: {name}"),
             OpsError::Trash(reason) => write!(f, "could not move to trash: {reason}"),
+            OpsError::Replaced(path) => write!(
+                f,
+                "'{}' changed since it was selected, so nothing was deleted",
+                path.display()
+            ),
         }
     }
 }
@@ -138,6 +146,62 @@ mod libc_syscall {
 
 fn is_exdev(err: &io::Error) -> bool {
     err.raw_os_error() == Some(EXDEV)
+}
+
+/// Identity of one filesystem entry: the device and inode of the entry itself,
+/// never the target of a symlink.
+///
+/// Permanent deletion runs on a background thread, so the name the user
+/// confirmed can be removed and re-created (by another program, a synced
+/// folder, a script) before the worker gets to it. Comparing identities lets the
+/// worker refuse to delete a replacement; deleting by name alone would destroy
+/// something the user never selected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntryId {
+    dev: u64,
+    ino: u64,
+}
+
+/// The identity `path` names right now, without following a final symlink.
+pub fn entry_id(path: &Path) -> io::Result<EntryId> {
+    let meta = fs::symlink_metadata(path)?;
+    Ok(entry_id_of(&meta))
+}
+
+#[cfg(unix)]
+fn entry_id_of(meta: &fs::Metadata) -> EntryId {
+    use std::os::unix::fs::MetadataExt;
+
+    EntryId {
+        dev: meta.dev(),
+        ino: meta.ino(),
+    }
+}
+
+/// Platforms without inode numbers get a constant identity, so only the
+/// existence check applies there.
+#[cfg(not(unix))]
+fn entry_id_of(_meta: &fs::Metadata) -> EntryId {
+    EntryId { dev: 0, ino: 0 }
+}
+
+/// Permanently delete `path` — unlink a file or symlink, recursively remove a
+/// directory — but only while it is still the entry `expected` describes.
+///
+/// There is no undo. The identity check is the safety property that makes a
+/// *background* delete acceptable: the worker removes exactly the entry that was
+/// confirmed, not whatever now answers to that name. Recursion never follows
+/// symlinks.
+pub fn delete_if_unchanged(path: &Path, expected: EntryId) -> Result<(), OpsError> {
+    match entry_id(path) {
+        Ok(actual) if actual == expected => {}
+        Ok(_) => return Err(OpsError::Replaced(path.to_path_buf())),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => {
+            return Err(OpsError::NotFound(path.display().to_string()));
+        }
+        Err(err) => return Err(OpsError::from(err)),
+    }
+    remove_path(path)
 }
 
 /// Where the destination of an operation lands in the trash.
@@ -297,16 +361,6 @@ impl FileOps {
         Ok(())
     }
 
-    /// Permanently delete each path — unlinks files, recursively removes
-    /// directories. Bypasses the trash entirely; there is no undo. Stops at
-    /// the first failure (paths already removed stay removed).
-    pub fn delete_permanently(&self, paths: &[PathBuf]) -> Result<(), OpsError> {
-        for path in paths {
-            self.remove_path(path)?;
-        }
-        Ok(())
-    }
-
     // -- internals -----------------------------------------------------------
 
     /// Move `from` onto `dest`, falling back to copy+remove across devices.
@@ -325,7 +379,7 @@ impl FileOps {
         match rename(from, dest) {
             Err(err) if is_exdev(&err) => {
                 self.copy_path(from, dest)?;
-                self.remove_path(from)?;
+                remove_path(from)?;
                 Ok(())
             }
             Err(err) => Err(OpsError::from(err)),
@@ -357,18 +411,6 @@ impl FileOps {
         Ok(())
     }
 
-    /// Remove a single path (unlink file / remove empty dir). Directories with
-    /// children are removed recursively.
-    fn remove_path(&self, path: &Path) -> Result<(), OpsError> {
-        let meta = fs::symlink_metadata(path)?;
-        if meta.is_dir() {
-            fs::remove_dir_all(path)?;
-        } else {
-            fs::remove_file(path)?;
-        }
-        Ok(())
-    }
-
     /// Pick a non-existing file name: `name`, `name (1)`, `name (2)`, ...
     /// The counter is inserted before the final extension when one exists.
     fn unique_dest(&self, dir: &Path, name: &std::ffi::OsStr) -> PathBuf {
@@ -393,6 +435,19 @@ impl Default for FileOps {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Remove a single path: unlink a file or symlink, or remove a directory and
+/// everything inside it. Never follows a symlink (a link is removed, not its
+/// target) and never descends into one while recursing.
+fn remove_path(path: &Path) -> Result<(), OpsError> {
+    let meta = fs::symlink_metadata(path)?;
+    if meta.is_dir() {
+        fs::remove_dir_all(path)?;
+    } else {
+        fs::remove_file(path)?;
+    }
+    Ok(())
 }
 
 /// Split `name` into stem and extension (with leading dot). Dotfiles like
@@ -608,6 +663,57 @@ mod tests {
             ops.move_(&missing, dir.path()),
             Err(OpsError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn delete_if_unchanged_removes_a_tree() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("tree");
+        fs::create_dir_all(target.join("sub")).unwrap();
+        write(&target.join("sub"), "child.txt", "data");
+        let id = entry_id(&target).unwrap();
+        delete_if_unchanged(&target, id).unwrap();
+        assert!(!target.exists(), "the whole tree is gone");
+    }
+
+    #[test]
+    fn delete_if_unchanged_refuses_a_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = write(dir.path(), "note.txt", "original");
+        let id = entry_id(&target).unwrap();
+        // Another program replaces the entry between confirmation and the
+        // worker running: the replacement must survive.
+        fs::remove_file(&target).unwrap();
+        fs::write(&target, "replacement").unwrap();
+        let err = delete_if_unchanged(&target, id).unwrap_err();
+        assert!(matches!(err, OpsError::Replaced(_)), "{err}");
+        assert_eq!(fs::read_to_string(&target).unwrap(), "replacement");
+    }
+
+    #[test]
+    fn delete_if_unchanged_reports_a_missing_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = write(dir.path(), "gone.txt", "x");
+        let id = entry_id(&target).unwrap();
+        fs::remove_file(&target).unwrap();
+        assert!(matches!(
+            delete_if_unchanged(&target, id),
+            Err(OpsError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn delete_if_unchanged_removes_a_symlink_not_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let kept = write(target_dir.path(), "keep.txt", "keep me");
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(target_dir.path(), &link).unwrap();
+
+        let id = entry_id(&link).unwrap();
+        delete_if_unchanged(&link, id).unwrap();
+        assert!(!link.exists(), "the link is gone");
+        assert!(kept.is_file(), "the target directory is untouched");
     }
 
     #[test]

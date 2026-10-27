@@ -16,9 +16,10 @@
 //!
 //! While the path entry is edited it shows a dropdown of directory completions
 //! for the typed text ([`suggestions`] lists the matching subdirectories of the
-//! typed directory, non-recursively). ↑/↓ move the highlight, Enter opens the
-//! highlighted one (the first by default, or the typed path when the dropdown is
-//! closed), and clicking a row opens it too.
+//! typed directory, non-recursively, preceded by the typed directory itself when
+//! it exists). ↑/↓ move the highlight, Enter opens the highlighted one (the typed
+//! directory by default, so a bare `/` opens the root rather than `/bin`), and
+//! clicking a row opens it too.
 //!
 //! The dropdown is a plain child of the pane overlay, *not* a `GtkPopover`:
 //! a popover gets its own Wayland surface and would steal the keyboard from the
@@ -301,7 +302,9 @@ fn attach_completion(
                         let path = items.borrow()[selected.get()].clone();
                         activate(&key_entry, &dropdown, &suppress, &sender, path);
                     } else {
-                        let path = PathBuf::from(key_entry.text().to_string());
+                        // No dropdown (nothing matched): fall back to the typed
+                        // path, if it exists.
+                        let path = PathBuf::from(expand_tilde(&key_entry.text()));
                         if path.is_dir() {
                             activate(&key_entry, &dropdown, &suppress, &sender, path);
                         }
@@ -409,37 +412,51 @@ fn activate(
     let _ = sender.output(ToolbarOutput::NavigateTo(path));
 }
 
-/// Directory completions for the typed `text`, non-recursively: the directories
-/// inside the typed path's parent whose name starts with the typed final
-/// component. A leading `~` expands to `$HOME`; a trailing `/` lists everything
-/// in that directory. Results are name-sorted and capped at [`MAX_SUGGESTIONS`].
-fn suggestions(text: &str) -> Vec<PathBuf> {
-    if text.is_empty() {
-        return Vec::new();
-    }
-    let expanded = match text.strip_prefix('~') {
+/// Expand a leading `~` to `$HOME`. Leaves the text alone when `HOME` is unset.
+fn expand_tilde(text: &str) -> String {
+    match text.strip_prefix('~') {
         Some(rest) => match std::env::var("HOME") {
             Ok(home) => format!("{home}{rest}"),
             Err(_) => text.to_string(),
         },
         None => text.to_string(),
-    };
+    }
+}
+
+/// Directory completions for the typed `text`, non-recursively: the typed
+/// directory itself (when it exists) followed by the directories inside its
+/// parent whose name starts with the typed final component. Putting the typed
+/// path first is what makes Enter on a bare `/` open the root instead of the
+/// first subdirectory; it is also the row the highlight starts on. A leading `~`
+/// expands to `$HOME`; a trailing `/` lists everything in that directory.
+/// Subdirectory matches are name-sorted and capped at [`MAX_SUGGESTIONS`].
+fn suggestions(text: &str) -> Vec<PathBuf> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let expanded = expand_tilde(text);
+    let typed = PathBuf::from(&expanded);
 
     // `parent` keeps the typed directory (with its trailing separator) so
     // suggestions read back as an extension of what was typed.
     let (parent, prefix) = match expanded.rsplit_once('/') {
         Some((head, name)) => (format!("{head}/"), name.to_string()),
-        None => (String::new(), expanded),
+        None => (String::new(), expanded.clone()),
     };
     let dir = if parent.is_empty() {
         PathBuf::from(".")
     } else {
         PathBuf::from(&parent)
     };
-    let Ok(entries) = std::fs::read_dir(&dir) else {
-        return Vec::new();
-    };
 
+    let mut found = Vec::new();
+    if typed.is_dir() {
+        found.push(typed);
+    }
+
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return found;
+    };
     let show_hidden = prefix.starts_with('.');
     let mut names: Vec<String> = entries
         .filter_map(Result::ok)
@@ -450,10 +467,15 @@ fn suggestions(text: &str) -> Vec<PathBuf> {
         .collect();
     names.sort();
     names.truncate(MAX_SUGGESTIONS);
-    names
-        .into_iter()
-        .map(|name| PathBuf::from(format!("{parent}{name}")))
-        .collect()
+    // The typed path itself, when it exists, is already the first entry.
+    let first = found.first().cloned();
+    found.extend(
+        names
+            .into_iter()
+            .map(|name| PathBuf::from(format!("{parent}{name}")))
+            .filter(|path| first.as_ref() != Some(path)),
+    );
+    found
 }
 
 /// Build the hamburger popover from a configured menu (the pane menu or the
@@ -694,7 +716,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn trailing_slash_lists_subdirectories() {
+    fn trailing_slash_lists_subdirectories_after_the_typed_directory() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::create_dir(dir.path().join("alpha")).unwrap();
         std::fs::create_dir(dir.path().join("beta")).unwrap();
@@ -704,9 +726,26 @@ mod tests {
         let got = suggestions(&query);
         assert_eq!(
             got,
-            vec![dir.path().join("alpha"), dir.path().join("beta")],
-            "only directories, name-sorted"
+            vec![
+                dir.path().to_path_buf(),
+                dir.path().join("alpha"),
+                dir.path().join("beta"),
+            ],
+            "the typed directory first, then its subdirectories, name-sorted"
         );
+    }
+
+    #[test]
+    fn typed_directory_is_reachable_even_when_it_has_subdirectories() {
+        // Typing `/` used to offer only its subdirectories, so Enter opened
+        // `/bin`: the typed path itself must be the default row.
+        let typed = suggestions("/");
+        assert_eq!(typed.first(), Some(&PathBuf::from("/")));
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("alpha")).unwrap();
+        let query = format!("{}/alpha", dir.path().display());
+        assert_eq!(suggestions(&query), vec![dir.path().join("alpha")]);
     }
 
     #[test]
@@ -734,10 +773,16 @@ mod tests {
         std::fs::create_dir(dir.path().join("visible")).unwrap();
 
         let all = suggestions(&format!("{}/", dir.path().display()));
-        assert_eq!(all, vec![dir.path().join("visible")]);
+        assert_eq!(
+            all,
+            vec![dir.path().to_path_buf(), dir.path().join("visible")]
+        );
 
         let hidden = suggestions(&format!("{}/.", dir.path().display()));
-        assert_eq!(hidden, vec![dir.path().join(".config")]);
+        assert_eq!(
+            hidden,
+            vec![dir.path().to_path_buf(), dir.path().join(".config")]
+        );
     }
 
     #[test]
@@ -747,7 +792,8 @@ mod tests {
             std::fs::create_dir(dir.path().join(format!("dir{i:03}"))).unwrap();
         }
         let got = suggestions(&format!("{}/", dir.path().display()));
-        assert_eq!(got.len(), MAX_SUGGESTIONS);
+        // The typed directory itself, plus at most MAX_SUGGESTIONS matches.
+        assert_eq!(got.len(), MAX_SUGGESTIONS + 1);
     }
 
     #[test]

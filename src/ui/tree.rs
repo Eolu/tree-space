@@ -30,7 +30,8 @@ use crate::config::{
 };
 use crate::fs::meta::format_size;
 use crate::fs::model::{Change, SortKey, StdDirSource, TreeModel, VisibleRow};
-use crate::fs::ops::FileOps;
+use crate::fs::ops::{self, EntryId, FileOps};
+use crate::fs::pending;
 use crate::fs::watcher::{RecommendedWatcher, RecursiveMode, Watcher, spawn as spawn_watcher};
 use crate::highlight::{self, Span, TokenClass};
 use crate::preview::{
@@ -406,8 +407,16 @@ pub enum TreeMsg {
     PermanentDelete(PathBuf),
     /// Permanently delete the current selection (Shift+Delete).
     PermanentDeleteSelected,
-    /// Actually perform the permanent delete after the user confirmed the dialog.
+    /// Perform the confirmed permanent delete. Each entry is marked and struck
+    /// out immediately, then removed on a background thread so a large tree
+    /// cannot freeze the panel; every entry reports back separately.
     ConfirmPermanentDelete(Vec<PathBuf>),
+    /// One background permanent delete finished: the row path (as the tree names
+    /// it) and the failure, when it did not succeed.
+    PermanentDeleteFinished {
+        path: PathBuf,
+        error: Option<String>,
+    },
     /// Run a configured custom command against `path` (via `{path}`/`{dir}`
     /// substitution in the config template).
     RunCommand {
@@ -748,6 +757,13 @@ pub struct Tree {
 
     pending: Vec<Change>,
     flush_source: Option<glib::SourceId>,
+    /// Background permanent deletes still running in this pane. A multi-item
+    /// delete reports one summary when the last one finishes, so the counters
+    /// (and the names, for that summary) accumulate until it drains.
+    delete_pending: usize,
+    delete_ok: usize,
+    delete_failed: usize,
+    delete_names: Vec<PathBuf>,
     _watcher: Option<RecommendedWatcher>,
     /// Directories currently registered with `_watcher` (kept in sync with the
     /// model's expanded+loaded set, so the watch joins are lazy and cheap).
@@ -1234,6 +1250,10 @@ impl Component for Tree {
             clipboard: None,
             pending: Vec::new(),
             flush_source: None,
+            delete_pending: 0,
+            delete_ok: 0,
+            delete_failed: 0,
+            delete_names: Vec::new(),
             _watcher: None,
             watched: HashSet::new(),
             popover: None,
@@ -1626,6 +1646,9 @@ impl Tree {
                 }
             }
             TreeMsg::RenameAt(path) => {
+                if self.refuse_if_deleting(&path, &sender) {
+                    return;
+                }
                 self.select(&path);
                 self.renaming = Some(path);
                 self.renaming_state.set(true);
@@ -1655,15 +1678,55 @@ impl Tree {
                     self.renaming = None;
                     self.renaming_state.set(false);
                 }
-                match self.ops.delete_permanently(&paths) {
-                    Ok(()) => {
-                        for path in paths {
-                            self.apply_change(Change::Removed { path });
+                self.start_permanent_delete(paths, &sender);
+            }
+            TreeMsg::PermanentDeleteFinished { path, error } => {
+                self.delete_pending = self.delete_pending.saturating_sub(1);
+                match error {
+                    Some(error) => {
+                        self.delete_failed += 1;
+                        self.status(
+                            format!("Could not delete {}: {error}", path.display()),
+                            &sender,
+                        );
+                        // Events under a pending path are suppressed while the
+                        // worker runs, so re-read what is left after a partial
+                        // delete rather than leaving its rows behind.
+                        self.apply_change(Change::Modified { path: path.clone() });
+                    }
+                    None => {
+                        self.delete_ok += 1;
+                        // Drop the row and anything selected inside it (a
+                        // directory and its children can both be selected).
+                        self.selected
+                            .retain(|selected| !selected.starts_with(&path));
+                        if self
+                            .anchor
+                            .as_deref()
+                            .is_some_and(|anchor| anchor.starts_with(&path))
+                        {
+                            self.anchor = None;
                         }
-                        self.selected.clear();
+                        // Media and preview caches for the removed tree would
+                        // otherwise keep textures and players alive.
+                        self.clear_thumbnails_under(&path);
+                        self.apply_change(Change::Removed { path: path.clone() });
                         self.cursor_snap();
                     }
-                    Err(err) => self.status(err.to_string(), &sender),
+                }
+                // The strike-out follows the delete registry: on success the row
+                // is gone, on failure it must come back to normal, so re-bind
+                // whichever rows are on screen.
+                self.rebind = true;
+                if self.delete_pending == 0 {
+                    let ok = std::mem::take(&mut self.delete_ok);
+                    let failed = std::mem::take(&mut self.delete_failed);
+                    let names = std::mem::take(&mut self.delete_names);
+                    // A failed delete already put its reason on the status bar;
+                    // do not replace it with a count.
+                    if failed == 0 && ok > 0 {
+                        self.status(format!("Deleted {}.", paths_subject(&names)), &sender);
+                    }
                 }
             }
             TreeMsg::ConfirmTrash(paths) => {
@@ -1686,15 +1749,20 @@ impl Tree {
                     Err(err) => self.status(err.to_string(), &sender),
                 }
             }
-            TreeMsg::Duplicate(path) => match self.ops.duplicate(&path) {
-                Ok(new_path) => {
-                    self.apply_change(Change::Created {
-                        path: new_path.clone(),
-                    });
-                    self.select(&new_path);
+            TreeMsg::Duplicate(path) => {
+                if self.refuse_if_deleting(&path, &sender) {
+                    return;
                 }
-                Err(err) => self.status(format!("Could not duplicate: {err}"), &sender),
-            },
+                match self.ops.duplicate(&path) {
+                    Ok(new_path) => {
+                        self.apply_change(Change::Created {
+                            path: new_path.clone(),
+                        });
+                        self.select(&new_path);
+                    }
+                    Err(err) => self.status(format!("Could not duplicate: {err}"), &sender),
+                }
+            }
             TreeMsg::RequestDuplicateCursor => {
                 if let Some(path) = self.cursor_path() {
                     sender.input(TreeMsg::Duplicate(path));
@@ -1799,16 +1867,21 @@ impl Tree {
                     );
                 }
             }
-            TreeMsg::RenameTo { path, name } => match self.ops.rename(&path, &name) {
-                Ok(new_path) => {
-                    self.apply_change(Change::Renamed {
-                        from: path,
-                        to: new_path.clone(),
-                    });
-                    self.select(&new_path);
+            TreeMsg::RenameTo { path, name } => {
+                if self.refuse_if_deleting(&path, &sender) {
+                    return;
                 }
-                Err(err) => self.status(format!("Could not rename: {err}"), &sender),
-            },
+                match self.ops.rename(&path, &name) {
+                    Ok(new_path) => {
+                        self.apply_change(Change::Renamed {
+                            from: path,
+                            to: new_path.clone(),
+                        });
+                        self.select(&new_path);
+                    }
+                    Err(err) => self.status(format!("Could not rename: {err}"), &sender),
+                }
+            }
             TreeMsg::ToggleThumbnail(path) => {
                 if self.thumbnails.contains(&path) {
                     // Toggled off: drop the preview(s) and their textures.
@@ -1869,6 +1942,12 @@ impl Tree {
 
             TreeMsg::Copy => {
                 let paths = self.selected_for_clipboard();
+                if paths.iter().any(|path| pending::is_deleting(path)) {
+                    // Copying a tree that is being removed would produce a
+                    // partial copy of it.
+                    self.status("That item is being deleted.".to_string(), &sender);
+                    return;
+                }
                 if !paths.is_empty() {
                     set_clipboard_files(&paths, false);
                     self.clipboard = Some(Clipboard {
@@ -1880,6 +1959,10 @@ impl Tree {
             }
             TreeMsg::Cut => {
                 let paths = self.selected_for_clipboard();
+                if paths.iter().any(|path| pending::is_deleting(path)) {
+                    self.status("That item is being deleted.".to_string(), &sender);
+                    return;
+                }
                 if !paths.is_empty() {
                     set_clipboard_files(&paths, true);
                     self.clipboard = Some(Clipboard {
@@ -1900,6 +1983,24 @@ impl Tree {
             TreeMsg::ToggleSortDirection => self.toggle_sort_direction(&sender),
 
             TreeMsg::FsChange(change) => {
+                // A background delete reports its own progress: every entry it
+                // removes would otherwise arrive here as an event, and each flush
+                // would re-read (and re-sort) the shrinking directory for as long
+                // as the delete runs. The rows are struck out meanwhile and
+                // disappear when the worker reports completion.
+                let suppressed = match &change {
+                    Change::Created { path }
+                    | Change::Removed { path }
+                    | Change::Modified { path } => pending::is_deleting(path),
+                    Change::Renamed { from, to } => {
+                        pending::is_deleting(from) || pending::is_deleting(to)
+                    }
+                    // A rescan means the event queue overflowed: never drop it.
+                    Change::Rescan => false,
+                };
+                if suppressed {
+                    return;
+                }
                 // Consolidate bursts into a single re-render.
                 self.pending.push(change);
                 if self.flush_source.is_none() {
@@ -2174,6 +2275,12 @@ fn bind_row(
     }
     container.remove_css_class("tree-row-selected");
     container.remove_css_class("tree-row-match");
+    container.remove_css_class("tree-row-deleting");
+    // A path with a background permanent delete running: struck through until
+    // the row disappears (or the delete fails and the mark is released).
+    if pending::is_deleting(&row.path) {
+        container.add_css_class("tree-row-deleting");
+    }
 
     let row_indent = row.depth as i32 * 16 + 4;
     let hbox = gtk::Box::new(gtk::Orientation::Horizontal, 6);
@@ -2588,6 +2695,64 @@ fn close_enclosing_popovers(widget: &gtk::Widget) {
         }
         current = widget.parent();
     }
+}
+
+/// One entry queued for a background permanent delete.
+struct DeleteJob {
+    /// The path as the tree names it (the rows and the selection use this one).
+    row: PathBuf,
+    /// The path actually removed: `row` with its parent canonicalized, so `..`
+    /// or a symlinked parent cannot point the delete somewhere else.
+    target: PathBuf,
+    /// Identity of `target` when the user confirmed the delete.
+    id: EntryId,
+    /// Keeps the path marked as being deleted until this job finishes.
+    guard: pending::DeleteGuard,
+}
+
+impl DeleteJob {
+    /// Remove the entry. The mark is released before the result is reported, so
+    /// a failure puts the row back to normal.
+    fn run(self) -> Result<(), String> {
+        let result = match ops::delete_if_unchanged(&self.target, self.id) {
+            Ok(()) => Ok(()),
+            // Already gone: that is the goal state, and nothing else was touched.
+            Err(ops::OpsError::NotFound(_)) => Ok(()),
+            Err(err) => Err(err.to_string()),
+        };
+        drop(self.guard);
+        result
+    }
+}
+
+/// Resolve one confirmed path into a [`DeleteJob`], or explain why it cannot be
+/// deleted.
+///
+/// The final component is kept as a *name* while the parent is canonicalized: a
+/// symlink row is deleted as a link, never as its target.
+fn prepare_delete(row: &Path) -> Result<DeleteJob, String> {
+    let Some(name) = row.file_name() else {
+        return Err(format!(
+            "Refusing to delete {}: it has no file name",
+            row.display()
+        ));
+    };
+    let parent = match row.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let parent = parent
+        .canonicalize()
+        .map_err(|err| format!("Could not delete {}: {err}", row.display()))?;
+    let target = parent.join(name);
+    let id = ops::entry_id(&target)
+        .map_err(|err| format!("Could not delete {}: {err}", row.display()))?;
+    Ok(DeleteJob {
+        guard: pending::begin([row.to_path_buf(), target.clone()]),
+        row: row.to_path_buf(),
+        target,
+        id,
+    })
 }
 
 /// A one- or many-path subject for a confirmation message: `“name”` for a
@@ -3523,6 +3688,9 @@ impl Tree {
 
     /// Expand or collapse `path` depending on its current state.
     fn toggle_dir(&mut self, path: &Path, sender: &ComponentSender<Self>) {
+        if self.refuse_if_deleting(path, sender) {
+            return;
+        }
         let expanded = self.tree.as_ref().is_some_and(|t| t.is_expanded(path));
         if expanded {
             self.collapse_dir(path);
@@ -4085,6 +4253,9 @@ impl Tree {
     }
 
     fn expand_dir(&mut self, path: &Path, sender: &ComponentSender<Self>) {
+        if self.refuse_if_deleting(path, sender) {
+            return;
+        }
         let Some(tree) = self.tree.as_mut() else {
             return;
         };
@@ -4095,6 +4266,9 @@ impl Tree {
     }
 
     fn activate(&mut self, path: &Path, sender: &ComponentSender<Self>) {
+        if self.refuse_if_deleting(path, sender) {
+            return;
+        }
         let Some(index) = self.rows.iter().position(|r| r.path == path) else {
             return;
         };
@@ -4109,6 +4283,10 @@ impl Tree {
     }
 
     fn confirm_trash(&mut self, paths: Vec<PathBuf>, sender: ComponentSender<Self>) {
+        if paths.iter().any(|path| pending::is_deleting(path)) {
+            self.status("That item is being deleted.".to_string(), &sender);
+            return;
+        }
         let message = format!("Move {} to trash?", paths_subject(&paths));
         confirm_dialog(
             &self.parent,
@@ -4120,6 +4298,13 @@ impl Tree {
     }
 
     fn confirm_permanent_delete(&mut self, paths: Vec<PathBuf>, sender: ComponentSender<Self>) {
+        if paths.iter().any(|path| pending::is_deleting(path)) {
+            self.status(
+                "Some of the selected items are already being deleted.".to_string(),
+                &sender,
+            );
+            return;
+        }
         let message = format!("Permanently delete {}?", paths_subject(&paths));
         confirm_dialog(
             &self.parent,
@@ -4128,6 +4313,86 @@ impl Tree {
             "Delete Permanently",
             move || sender.input(TreeMsg::ConfirmPermanentDelete(paths)),
         );
+    }
+
+    /// Queue a confirmed permanent delete.
+    ///
+    /// Each path is resolved and identified here, on the main thread, against
+    /// exactly what the user is looking at: its parent is canonicalized (so `..`
+    /// or a symlinked parent cannot point the delete elsewhere) and its
+    /// device/inode pair is recorded. The entries are marked as deleting at once
+    /// — the rows strike out and every operation on them is refused, in every
+    /// pane — and then removed by a background thread, so a tree with hundreds
+    /// of thousands of files no longer freezes the panel.
+    fn start_permanent_delete(&mut self, paths: Vec<PathBuf>, sender: &ComponentSender<Self>) {
+        let mut jobs = Vec::new();
+        let mut refused = 0usize;
+        let mut first_error: Option<String> = None;
+        for path in paths {
+            // Already queued (a second request, or a path inside one): never
+            // queue a delete twice, the first worker may be halfway through.
+            if pending::is_deleting(&path) {
+                refused += 1;
+                first_error
+                    .get_or_insert_with(|| format!("{} is already being deleted", path.display()));
+                continue;
+            }
+            match prepare_delete(&path) {
+                Ok(job) => jobs.push(job),
+                Err(error) => {
+                    refused += 1;
+                    first_error.get_or_insert(error);
+                }
+            }
+        }
+        if let Some(error) = first_error {
+            let message = if refused == 1 {
+                error
+            } else {
+                format!("{error} (and {} other(s) not queued)", refused - 1)
+            };
+            self.status(message, sender);
+        }
+        if jobs.is_empty() {
+            return;
+        }
+
+        self.delete_pending += jobs.len();
+        self.delete_names
+            .extend(jobs.iter().map(|job| job.row.clone()));
+        let subject = paths_subject(&self.delete_names);
+        self.status(format!("Deleting {subject}…"), sender);
+        // Marked above, so this re-binds the rows already on screen as struck
+        // out without republishing the model.
+        self.rebind = true;
+
+        let sender = sender.input_sender().clone();
+        std::thread::spawn(move || {
+            for job in jobs {
+                let path = job.row.clone();
+                let error = job.run().err();
+                // `send`, not `input`: the pane may be closed while the delete
+                // runs, and `input` panics on a dead runtime — inside a worker
+                // thread that would abort the process.
+                let _ = sender.send(TreeMsg::PermanentDeleteFinished { path, error });
+            }
+        });
+    }
+
+    /// Refuse to touch `path` while a background worker is deleting it (or a
+    /// directory that contains it), reporting why. Returns `true` when the
+    /// action must be skipped: the tree under such a path is being removed piece
+    /// by piece, so reading it yields a partial copy, writing into it loses the
+    /// data moments later, and renaming or trashing it races the worker.
+    fn refuse_if_deleting(&mut self, path: &Path, sender: &ComponentSender<Self>) -> bool {
+        if pending::is_deleting(path) {
+            self.status(
+                format!("{} is being deleted.", paths_subject(&[path.to_path_buf()])),
+                sender,
+            );
+            return true;
+        }
+        false
     }
 
     fn open_menu(&mut self, path: &Path) {
@@ -4179,6 +4444,9 @@ impl Tree {
         let Some(dir) = self.target_dir() else {
             return;
         };
+        if self.refuse_if_deleting(&dir, sender) {
+            return;
+        }
         let mut count = 0usize;
         let mut failed: Option<String> = None;
         for src in clip.paths {
@@ -4239,6 +4507,9 @@ impl Tree {
         let Some(dir) = self.target_dir() else {
             return;
         };
+        if self.refuse_if_deleting(&dir, sender) {
+            return;
+        }
         if paths.is_empty() {
             self.status("Clipboard has no files to paste".to_string(), sender);
             return;
@@ -4357,6 +4628,9 @@ impl Tree {
         copy: bool,
         sender: &ComponentSender<Self>,
     ) {
+        if self.refuse_if_deleting(target, sender) {
+            return;
+        }
         let mut count = 0usize;
         let mut failed: Option<String> = None;
         for src in sources {
@@ -4404,6 +4678,9 @@ impl Tree {
         let Some(dir) = self.target_dir() else {
             return;
         };
+        if self.refuse_if_deleting(&dir, sender) {
+            return;
+        }
         let name = fresh_name(&dir, if is_dir { "new folder" } else { "new file" });
         let result = if is_dir {
             self.ops.create_dir(&dir, &name)
@@ -4450,6 +4727,9 @@ impl Tree {
             .map(|n| n.to_string_lossy() == trimmed.as_str())
             .unwrap_or(false);
         if trimmed.is_empty() || unchanged {
+            return;
+        }
+        if self.refuse_if_deleting(&old, sender) {
             return;
         }
         match self.ops.rename(&old, &trimmed) {
@@ -5236,5 +5516,41 @@ mod tests {
         );
         // Non-searchable characters are ignored.
         assert_eq!(ta.push('\u{1}', t0), None);
+    }
+
+    #[test]
+    fn prepare_delete_keeps_the_final_component_while_canonicalizing_the_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("folder");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("inside.txt"), b"x").unwrap();
+
+        let job = prepare_delete(&target).unwrap();
+        assert_eq!(job.row, target);
+        assert_eq!(
+            job.target,
+            dir.path().canonicalize().unwrap().join("folder")
+        );
+        assert_eq!(job.id, ops::entry_id(&target).unwrap());
+        assert!(pending::is_deleting(&target), "queued paths are marked");
+        assert!(pending::is_deleting(&target.join("inside.txt")));
+    }
+
+    #[test]
+    fn prepare_delete_deletes_a_symlink_not_its_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let job = prepare_delete(&link).unwrap();
+        assert_eq!(job.target, dir.path().canonicalize().unwrap().join("link"));
+        assert_eq!(job.id, ops::entry_id(&link).unwrap());
+    }
+
+    #[test]
+    fn prepare_delete_refuses_a_path_without_a_file_name() {
+        assert!(prepare_delete(Path::new("/")).is_err());
     }
 }

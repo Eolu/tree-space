@@ -22,8 +22,9 @@ configuration that most of them do not offer.
 **Full file management.** Create, rename, duplicate, and delete files and
 folders. Cut/copy/paste internally and to and from the system clipboard. Move
 files to the trash (through GIO, so it is recoverable) or delete them
-permanently. Create symlinks. Inspect and edit ownership and permissions. Copy
-absolute or root-relative paths.
+permanently — permanent deletes run in the background, so the row is struck
+through while it is removed and the panel stays usable. Create symlinks. Inspect
+and edit ownership and permissions. Copy absolute or root-relative paths.
 
 **Drag and drop, both directions.** Drag files out to any other application
 (editor, terminal, browser, chat client) and drop files from other applications
@@ -189,7 +190,7 @@ nav_toolbar = false # show a nav toolbar (up, back, forward) below the path bar
 [tree]
 dirs_first = true          # list directories above files
 sort_key = "name"          # "name" | "size" | "modified" | "type"
-sort_ascending = true
+sort_ascending = true      # A→Z, or by smallest/oldest first
 show_hidden = false
 font_size = 13
 icon_size = 18
@@ -198,6 +199,11 @@ confirm_drop_move = false  # ask before a drag-and-drop move
 [bookmarks]
 file = "bookmarks.toml" # the list, relative to this config (or absolute)
 ```
+
+Name sorting is natural: runs of digits compare by value, so `chapter9` comes
+before `chapter10` and `image2` before `image10`, while text compares
+case-insensitively. The same order breaks ties when sorting by size,
+modification time or type.
 
 `[panel] nav_toolbar` adds a small row of navigation buttons (up one level,
 back, forward) directly below the path bar. They mirror the corresponding

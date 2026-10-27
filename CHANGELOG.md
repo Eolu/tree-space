@@ -22,6 +22,23 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Permanent delete (Shift+Delete) runs in the background instead of blocking
+  the main loop for the whole tree. The rows being removed are struck through
+  and dimmed as soon as the confirmation is accepted, the panel stays usable
+  while the files disappear, and each row is removed when its delete finishes.
+  - Safety: every target is identified (device and inode) at confirmation time
+    and the worker refuses to delete a path that no longer names that entry, so
+    a file re-created at the same name is never destroyed; a symlink is removed
+    rather than its target, and the parent is canonicalized so `..` cannot
+    redirect the delete.
+  - While a path is being deleted, operations that would read, write or
+    transform it are refused, in every pane: paste, drop, new file/folder,
+    rename, cut/copy, duplicate, trash and opening the directory. Anything
+    dropped into a directory that finishes deleting a moment later would be lost
+    otherwise.
+  - File-watch events from a tree that is being deleted are ignored (the worker
+    reports completion), so deleting a very large expanded directory cannot
+    flood the main loop.
 - Memory use is substantially lower:
   - The panel asks GTK for the software (cairo) renderer unless `GSK_RENDERER`
     is already set in the environment. On NVIDIA/hybrid systems the default
@@ -48,6 +65,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- The path entry's completion list starts with the typed directory itself when
+  it exists, so typing `/` and pressing Enter opens the root instead of the
+  first subdirectory (`/bin`). The typed directory is the row the highlight
+  starts on, and typing a complete path now opens it rather than its first
+  name match.
+- Names sort naturally instead of character by character: runs of digits are
+  compared by value, so `chapter9` comes before `chapter10` and `image2` before
+  `image10`. Text still compares case-insensitively, and the same order breaks
+  ties when sorting by size, modification time or type.
 - The context menu dismisses when an item is chosen (it could be left open after
   acting on it), and no longer flashes as it opens.
 - The panel no longer panics — aborting the process — when a pane was closed or
